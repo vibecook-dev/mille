@@ -208,6 +208,24 @@ test('connectMilleChannel exposes only explorer frames for an Electron relay', a
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
     assert.equal(explorer.getSnapshot().roots().length, 1, 'renderer handshake completed');
+    const rootId = explorer.getSnapshot().roots()[0].id;
+    await explorer.setExpanded({ add: [rootId], remove: [] });
+    explorer.setViewport({ offset: 0, limit: 100, overscan: 8 });
+    while (
+      explorer
+        .getSnapshot()
+        .visibleRows({ offset: 0, limit: 100, expanded: new Set([rootId]) }).length < 2 &&
+      Date.now() < deadline
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.ok(
+      explorer
+        .getSnapshot()
+        .visibleRows({ offset: 0, limit: 100, expanded: new Set([rootId]) })
+        .some((row) => row.name === 'src'),
+      'lazy expansion crossed the raw channel',
+    );
     await new Promise((resolve) => setTimeout(resolve, 100));
     assert.deepEqual(leakedServiceFrames, [], 'service heartbeats stayed below the relay');
     assert.equal(opened.accepted.limits.maxFileBytes, 16 * 1024 * 1024);

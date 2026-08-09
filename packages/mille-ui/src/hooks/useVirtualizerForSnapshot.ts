@@ -41,6 +41,8 @@ export interface UseVirtualizerForSnapshotResult {
   readonly count: number;
   readonly virtualItems: readonly VirtualItem[];
   readonly totalSize: number;
+  /** Physical size of the scroll viewport along the virtualized axis. */
+  readonly viewportSize: number;
   readonly scrollOffset: number;
   scrollToIndex(index: number, opts?: { align?: 'start' | 'center' | 'end' | 'auto' }): void;
   measureElement(node: Element | null): void;
@@ -74,6 +76,8 @@ export function useVirtualizerForSnapshot(
     count,
     virtualItems: virtualizer.getVirtualItems(),
     totalSize: virtualizer.getTotalSize(),
+    viewportSize:
+      virtualizer.scrollRect?.height ?? scrollerRef.current?.clientHeight ?? 0,
     scrollOffset: virtualizer.scrollOffset ?? 0,
     scrollToIndex: (index, opts) => {
       virtualizer.scrollToIndex(index, opts);

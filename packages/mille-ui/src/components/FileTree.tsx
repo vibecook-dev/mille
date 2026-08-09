@@ -338,7 +338,7 @@ function FileTreeInner(props: FileTreeInnerProps): ReactElement {
 
   // The virtualizer needs only the authoritative count. Once it publishes its
   // mounted indexes, read exactly that structural window from the snapshot.
-  const { virtualItems, totalSize, scrollOffset, scrollToIndex } =
+  const { virtualItems, totalSize, viewportSize, scrollOffset, scrollToIndex } =
     useVirtualizerForSnapshot({
       count,
       rowHeight,
@@ -359,6 +359,16 @@ function FileTreeInner(props: FileTreeInnerProps): ReactElement {
       : (virtualItems[virtualItems.length - 1]?.index ?? mountedViewportOffset) -
         mountedViewportOffset +
         1;
+  // A partially hydrated remote snapshot can contain fewer known rows than
+  // the screen can display. Publishing only those known rows deadlocks lazy
+  // expansion: the host learns the child ids, but withholds their metadata
+  // because they fall outside the advertised one-row window. Keep rendering
+  // the authoritative mounted range while advertising enough capacity to
+  // hydrate one physical viewport (plus the UI's bounded overscan).
+  const hydrationViewportLimit = Math.max(
+    mountedViewportLimit,
+    Math.ceil(viewportSize / rowHeight) + overscan * 2,
+  );
   const visibleRows = projection.readRows(
     mountedViewportOffset,
     mountedViewportLimit,
@@ -436,15 +446,15 @@ function FileTreeInner(props: FileTreeInnerProps): ReactElement {
   useEffect(() => {
     fx.setViewport?.({
       offset: mountedViewportOffset,
-      limit: mountedViewportLimit,
-      // The virtual item range already includes UI overscan.
+      limit: hydrationViewportLimit,
+      // The published capacity already includes UI overscan.
       overscan: 0,
     });
   }, [
     fx,
     snapshot.treeVersion,
     mountedViewportOffset,
-    mountedViewportLimit,
+    hydrationViewportLimit,
   ]);
 
   const previousProjectionRef = useRef({

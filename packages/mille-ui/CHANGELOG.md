@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- **Remote lazy expansion viewport deadlock** — `FileTree` now advertises at
+  least one physical screen of hydration capacity (plus its bounded overscan),
+  even when the remote mirror initially knows only the root row. This lets the
+  host send metadata for newly discovered children instead of leaving an
+  expanded remote folder visually empty.
 - **Live-region politeness (Phase 6.3)** — polite and assertive messages now
   use two separate pre-mounted regions with matching implicit roles
   (`status` / `alert`). Assistive tech latches a region's politeness when it

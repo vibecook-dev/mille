@@ -187,6 +187,14 @@ test('root expands by default and renders children when the engine publishes the
 
   assert.equal(container.querySelectorAll('[role="treeitem"]').length, 1);
 
+  const initialViewport = fx.calls.setViewport.at(-1);
+  assert.ok(initialViewport, 'the initial hydration viewport must be published');
+  assert.equal(initialViewport.offset, 0);
+  assert.ok(
+    initialViewport.limit >= Math.ceil(400 / 22),
+    `expected a screen-sized hydration window; got ${initialViewport.limit}`,
+  );
+
   assert.ok(
     fx.calls.setExpanded.some((call) => Array.from(call.add).includes(1)),
     'expected the workspace root to be expanded automatically',
