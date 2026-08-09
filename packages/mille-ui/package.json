@@ -181,7 +181,7 @@
     "@radix-ui/react-tooltip": "^1.0.0",
     "@size-limit/preset-small-lib": "^11.0.0",
     "@tanstack/react-virtual": "^3.0.0",
-    "@types/node": "^24.0.0",
+    "@types/node": "^26.1.2",
     "@types/react": "^19.2.0",
     "happy-dom": "^15.0.0",
     "react": "^19.2.0",
