@@ -962,7 +962,7 @@ dependencies = [
 
 [[package]]
 name = "mille-bench"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "criterion",
  "mille-core",
@@ -971,7 +971,7 @@ dependencies = [
 
 [[package]]
 name = "mille-binding"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "bincode",
  "mille-core",
@@ -987,7 +987,7 @@ dependencies = [
 
 [[package]]
 name = "mille-core"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "arc-swap",
  "bincode",
