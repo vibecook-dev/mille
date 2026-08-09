@@ -1,0 +1,33 @@
+{
+  "name": "mesh-demo",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Bidirectional Electron demo for browsing Mille workspaces over a Truffle tailnet mesh.",
+  "main": "./out/main/index.mjs",
+  "type": "commonjs",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
+    "test": "electron-vite build && node ../../scripts/run-tests.mjs"
+  },
+  "dependencies": {
+    "@vibecook/mille": "workspace:*",
+    "@vibecook/mille-truffle": "workspace:*",
+    "@vibecook/mille-ui": "workspace:*",
+    "@vibecook/truffle": "^0.7.8",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.2.0",
+    "electron": "^41.2.1",
+    "electron-vite": "^5.0.0",
+    "typescript": "~6.0.0",
+    "vite": "^7.3.2"
+  }
+}

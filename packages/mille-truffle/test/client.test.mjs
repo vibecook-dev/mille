@@ -21,12 +21,14 @@ import { EventEmitter } from 'node:events';
 import {
   serveMille,
   connectMille,
+  connectMilleChannel,
   backoffDelay,
   resolveReconnect,
   shouldRetry,
   DEFAULT_RECONNECT,
   RemoteExplorerError,
 } from '../dist/index.js';
+import { connectFileExplorerChannel } from '../../mille/dist/index.js';
 
 // ─── pure policy (SPEC §18.4) ───────────────────────────────────────────
 
@@ -175,6 +177,70 @@ test('connectMille opens a workspace and exposes a live explorer', async () => {
     if (server) await server.close();
     removeTempDir(dir);
   }
+});
+
+test('connectMilleChannel exposes only explorer frames for an Electron relay', async () => {
+  const dir = tempRoot();
+  let server;
+  let opened;
+  let explorer;
+  try {
+    const mesh = loopbackMesh();
+    server = await serveMille(mesh, {
+      heartbeatMs: 25,
+      idleTimeoutMs: 1000,
+      exports: { work: { label: 'Work', roots: [dir], access: 'read-only' } },
+    });
+    opened = await connectMilleChannel(mesh, {
+      peer: 'fake',
+      exportId: 'work',
+      access: 'read-only',
+    });
+
+    const leakedServiceFrames = [];
+    const observer = opened.channel.onMessage((message) => {
+      if (message?.service === 'mille.remote') leakedServiceFrames.push(message);
+    });
+    explorer = await connectFileExplorerChannel(opened.channel);
+
+    const deadline = Date.now() + 5000;
+    while (explorer.getSnapshot().roots().length === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(explorer.getSnapshot().roots().length, 1, 'renderer handshake completed');
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.deepEqual(leakedServiceFrames, [], 'service heartbeats stayed below the relay');
+    assert.equal(opened.accepted.limits.maxFileBytes, 16 * 1024 * 1024);
+    observer.dispose();
+  } finally {
+    if (explorer) await explorer.dispose();
+    else opened?.close('test cleanup');
+    if (server) await server.close();
+    removeTempDir(dir);
+  }
+});
+
+test('connectMilleChannel aborts while waiting for the export handshake', async () => {
+  const mesh = loopbackMesh();
+  const controller = new AbortController();
+  const opening = connectMilleChannel(mesh, {
+    peer: 'fake',
+    exportId: 'work',
+    signal: controller.signal,
+    openTimeoutMs: 10_000,
+  });
+  setTimeout(() => controller.abort(), 10);
+
+  await assert.rejects(opening, (error) => {
+    assert.ok(error instanceof RemoteExplorerError);
+    assert.equal(error.code, 'OFFLINE');
+    return true;
+  });
+  assert.equal(
+    mesh.sockets.at(-1).client.writableEnded,
+    true,
+    'the aborted transport was gracefully ended',
+  );
 });
 
 test('a denied open rejects connectMille and does not retry', async () => {

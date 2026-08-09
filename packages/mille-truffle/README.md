@@ -66,6 +66,16 @@ Listen for `identityReset` if you persist `EntryId`s. It fires when the peer
 comes back to a *different* host instance, which means every id you hold now
 means nothing — resolve paths again instead.
 
+### Electron renderer relay
+
+`connectMilleChannel()` performs the same authenticated export handshake but
+returns the transport-neutral explorer channel before constructing a client.
+Service heartbeats are answered and filtered inside the returned connection,
+so an Electron UtilityProcess can relay its messages to a `MessagePortMain`.
+The isolated renderer then calls `connectFileExplorer()` on the transferred
+DOM `MessagePort`; neither the Truffle mesh nor a native filesystem object has
+to cross the preload boundary. See [`apps/mesh-demo`](../../apps/mesh-demo).
+
 ## Security
 
 Read this part.
@@ -101,6 +111,9 @@ Other properties worth knowing:
   decorations — because those change what every other session sees.
 - **Symlinks are not followed** on a remote export; `followSymlinks` must be
   `false` and defaults to it.
+- **`maxFileBytes` is enforced host-side** for every remote `readFile`,
+  `readText`, and `writeFile`; oversized operations fail with `EFBIG` without
+  closing the session.
 - Roots are canonicalized once at startup. Clients name an export, never a
   path.
 

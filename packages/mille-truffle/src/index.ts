@@ -5,10 +5,12 @@
 export { serveMille } from './server.js';
 export type { MeshLike, MeshNetLike, MeshServerLike, TruffleSocketLike } from './server.js';
 
-export { connectMille } from './client.js';
+export { connectMille, connectMilleChannel } from './client.js';
 export type {
+  ConnectMilleChannelOptions,
   ConnectMilleOptions,
   MeshConnectLike,
+  MilleChannelConnection,
   RemoteConnectionEvent,
   RemoteFileExplorer,
   RemoteIdentityResetEvent,

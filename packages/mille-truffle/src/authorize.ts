@@ -79,6 +79,9 @@ export async function authorizePeer(input: AuthorizeInput): Promise<AuthorizeOut
  * an export cannot opt in — that would need per-session engine state that
  * does not exist yet.
  */
-export function sessionPolicyFor(access: RemoteAccess): ExplorerSessionPolicy {
-  return { access };
+export function sessionPolicyFor(
+  access: RemoteAccess,
+  maxFileBytes?: number,
+): ExplorerSessionPolicy {
+  return maxFileBytes === undefined ? { access } : { access, maxFileBytes };
 }

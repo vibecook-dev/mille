@@ -349,7 +349,7 @@ export async function serveMille(
         peerId: peerId ?? undefined,
         peerName,
         exportId: ex.id,
-        policy: sessionPolicyFor(verdict.access),
+        policy: sessionPolicyFor(verdict.access, ex.maxFileBytes),
       });
 
       const info: RemoteSessionInfo = {

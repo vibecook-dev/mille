@@ -1228,7 +1228,7 @@ class FileExplorerHostImpl implements FileExplorerHost {
           // atomic here by construction rather than by locking.
           claimedOperationId = this.claimOperation(session, body.args);
 
-          const result = await this.dispatchMutation(body.op, body.args);
+          const result = await this.dispatchMutation(session, body.op, body.args);
           // Fan out first, reply second — and wait for the fan-out to be
           // acknowledged, not merely posted. `flushTickNow` only yields one
           // setImmediate, which is a guess about when the peer runs; it holds
@@ -1427,7 +1427,11 @@ class FileExplorerHostImpl implements FileExplorerHost {
     });
   }
 
-  private async dispatchMutation(op: string, args: Record<string, unknown>): Promise<unknown> {
+  private async dispatchMutation(
+    session: Session,
+    op: string,
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
     switch (op) {
       case 'create':
         return this.explorer.create(
@@ -1476,18 +1480,54 @@ class FileExplorerHostImpl implements FileExplorerHost {
         // it for a TypedArray; that cost roughly an order of magnitude in
         // size on both transports, and the framed codec ships a typed array
         // as a raw attachment. Clients accept both forms.
-        return this.explorer.readFile(args.id as EntryId);
+        const id = args.id as EntryId;
+        this.assertFileSizeAllowed(session, id);
+        const bytes = await this.explorer.readFile(id);
+        this.assertPayloadSizeAllowed(session, bytes.byteLength);
+        return bytes;
       }
-      case 'readText':
-        return this.explorer.readText(args.id as EntryId, args.encoding as string | undefined);
-      case 'writeFile':
+      case 'readText': {
+        const id = args.id as EntryId;
+        this.assertFileSizeAllowed(session, id);
+        const text = await this.explorer.readText(id, args.encoding as string | undefined);
+        if (typeof text === 'string') {
+          this.assertPayloadSizeAllowed(session, new TextEncoder().encode(text).byteLength);
+        }
+        return text;
+      }
+      case 'writeFile': {
+        const bytes = toBytes(args.data);
+        this.assertPayloadSizeAllowed(session, bytes.byteLength);
         return this.explorer.writeFile(
           args.id as EntryId,
-          toBytes(args.data),
+          bytes,
           args.options as { atomic?: boolean } | undefined,
         );
+      }
       default:
         throw new Error(`unknown op: ${op}`);
+    }
+  }
+
+  private assertFileSizeAllowed(session: Session, id: EntryId): void {
+    const max = session.context.policy.maxFileBytes;
+    if (max === undefined) return;
+    const entry = this.explorer.getSnapshot().getById(id);
+    if (entry !== null && entry.size > max) {
+      throw new FileSystemError(
+        'EFBIG',
+        `file is ${entry.size} bytes; remote export limit is ${max} bytes`,
+      );
+    }
+  }
+
+  private assertPayloadSizeAllowed(session: Session, size: number): void {
+    const max = session.context.policy.maxFileBytes;
+    if (max !== undefined && size > max) {
+      throw new FileSystemError(
+        'EFBIG',
+        `payload is ${size} bytes; remote export limit is ${max} bytes`,
+      );
     }
   }
 

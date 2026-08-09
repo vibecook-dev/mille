@@ -61,6 +61,22 @@ export interface ConnectMilleOptions {
   readonly retryServerShutdown?: boolean;
 }
 
+/** Options for one authenticated channel without the reconnecting facade. */
+export type ConnectMilleChannelOptions = Omit<
+  ConnectMilleOptions,
+  'reconnect' | 'retryServerShutdown'
+>;
+
+/**
+ * A negotiated remote workspace channel. The channel carries only mille
+ * explorer frames; service heartbeats are answered and filtered internally.
+ */
+export interface MilleChannelConnection {
+  readonly accepted: OpenWorkspaceAccepted;
+  readonly channel: ExplorerClientChannel;
+  close(reason?: string): void;
+}
+
 export interface RemoteConnectionEvent {
   readonly state: RemoteConnectionState;
   readonly attempt: number;
@@ -135,6 +151,70 @@ interface OpenResult {
   readonly explorer: PortFileExplorer;
 }
 
+interface OpenChannelResult {
+  readonly accepted: OpenWorkspaceAccepted;
+  readonly channel: ExplorerClientChannel;
+}
+
+function filterServiceFrames(
+  raw: ExplorerClientChannel,
+  logger: MilleRemoteLogger | undefined,
+): ExplorerClientChannel {
+  const listeners = new Set<Parameters<ExplorerClientChannel['onMessage']>[0]>();
+
+  raw.onMessage((message) => {
+    const candidate = message as unknown;
+    if (typeof candidate === 'object' && candidate !== null) {
+      const service = candidate as { service?: unknown; type?: unknown };
+      if (service.service === REMOTE_SERVICE) {
+        if (service.type === 'ping') {
+          try {
+            const ping = asService<RemotePing>(candidate);
+            raw.send({
+              service: REMOTE_SERVICE,
+              version: 1,
+              type: 'pong',
+              nonce: ping.nonce,
+              sentAtMs: ping.sentAtMs,
+            } as unknown as never);
+          } catch {
+            /* closing */
+          }
+        }
+        return;
+      }
+    }
+
+    for (const listener of [...listeners]) {
+      try {
+        listener(message);
+      } catch (error) {
+        logger?.warn?.('explorer channel listener threw', { error });
+      }
+    }
+  });
+
+  return {
+    get state() {
+      return raw.state;
+    },
+    get bufferedBytes() {
+      return raw.bufferedBytes;
+    },
+    send: (message) => raw.send(message),
+    drain: () => raw.drain(),
+    onMessage(listener) {
+      listeners.add(listener);
+      return { dispose: () => listeners.delete(listener) };
+    },
+    onClose: (listener) => raw.onClose(listener),
+    close: (reason) => raw.close(reason),
+    dispose() {
+      raw.close('disposed');
+    },
+  };
+}
+
 /**
  * Dial, run the open handshake, then hand the same channel to mille.
  *
@@ -144,11 +224,15 @@ interface OpenResult {
  */
 async function openOnce(
   mesh: MeshConnectLike,
-  options: ConnectMilleOptions,
+  options: ConnectMilleChannelOptions,
   signal: AbortSignal | undefined,
-): Promise<OpenResult> {
+): Promise<OpenChannelResult> {
   const port = options.port ?? DEFAULT_PORT;
   const timeoutMs = options.openTimeoutMs ?? DEFAULT_OPEN_TIMEOUT_MS;
+
+  if (signal?.aborted === true) {
+    throw new RemoteExplorerError('OFFLINE', 'aborted before connect');
+  }
 
   const socket = mesh.net.connect({ peer: options.peer, port });
   await new Promise<void>((resolve, reject) => {
@@ -158,6 +242,7 @@ async function openOnce(
     };
     const onError = (err: Error): void => {
       cleanup();
+      socket.destroy();
       reject(new RemoteExplorerError('TRANSPORT_ERROR', err.message, { cause: err }));
     };
     const onAbort = (): void => {
@@ -173,6 +258,7 @@ async function openOnce(
     socket.once('connect', onConnect);
     socket.once('error', onError);
     signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted === true) onAbort();
   });
 
   const channel = createFramedStreamClientChannel(socket);
@@ -227,10 +313,19 @@ async function openOnce(
       );
     });
 
+    const onAbort = (): void => {
+      finish();
+      channel.close('aborted during open');
+      reject(new RemoteExplorerError('OFFLINE', 'aborted during open'));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted === true) onAbort();
+
     function finish(): void {
       clearTimeout(timer);
       sub.dispose();
       closeSub.dispose();
+      signal?.removeEventListener('abort', onAbort);
     }
 
     channel.send({
@@ -249,27 +344,25 @@ async function openOnce(
     } as unknown as never);
   });
 
-  // Keep answering heartbeats for the life of the session.
-  channel.onMessage((raw) => {
-    if (typeof raw !== 'object' || raw === null) return;
-    const msg = raw as { service?: unknown; type?: unknown };
-    if (msg.service !== REMOTE_SERVICE || msg.type !== 'ping') return;
-    try {
-      const p = asService<RemotePing>(raw);
-      channel.send({
-        service: REMOTE_SERVICE,
-        version: 1,
-        type: 'pong',
-        nonce: p.nonce,
-        sentAtMs: p.sentAtMs,
-      } as unknown as never);
-    } catch {
-      /* closing */
-    }
-  });
+  return { accepted, channel: filterServiceFrames(channel, options.logger) };
+}
 
-  const explorer = await connectFileExplorerChannel(channel);
-  return { accepted, channel, explorer };
+/**
+ * Negotiate one remote export and return its renderer-safe explorer channel.
+ * This is the bridge used by Electron main/utility processes: they can relay
+ * the semantic messages to a MessagePort without exposing a mesh socket or
+ * Node primitives to the renderer.
+ */
+export async function connectMilleChannel(
+  mesh: MeshConnectLike,
+  options: ConnectMilleChannelOptions,
+): Promise<MilleChannelConnection> {
+  const result = await openOnce(mesh, options, options.signal);
+  return {
+    accepted: result.accepted,
+    channel: result.channel,
+    close: (reason) => result.channel.close(reason),
+  };
 }
 
 export async function connectMille(
@@ -379,7 +472,9 @@ export async function connectMille(
     if (closed) return;
     setState(attempt === 0 ? 'connecting' : 'reconnecting');
     try {
-      const result = await openOnce(mesh, options, options.signal);
+      const opened = await openOnce(mesh, options, options.signal);
+      const explorer = await connectFileExplorerChannel(opened.channel);
+      const result: OpenResult = { ...opened, explorer };
       if (closed) {
         result.channel.close('closed during connect');
         return;

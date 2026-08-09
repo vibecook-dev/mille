@@ -114,6 +114,8 @@ export type ExplorerSessionAccess = 'admin' | 'read-write' | 'read-only';
  */
 export interface ExplorerSessionPolicy {
   readonly access: ExplorerSessionAccess;
+  /** Maximum bytes a remote session may read or write in one file operation. */
+  readonly maxFileBytes?: number;
   readonly allowClientDecorations?: boolean;
   readonly allowProjectionMutation?: boolean;
   readonly allowWorkspaceRootMutation?: boolean;

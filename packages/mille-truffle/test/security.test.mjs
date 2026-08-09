@@ -15,6 +15,7 @@ import { strict as assert } from 'node:assert';
 import {
   mkdtempSync,
   mkdirSync,
+  readFileSync,
   writeFileSync,
   symlinkSync,
   realpathSync,
@@ -103,7 +104,7 @@ function sandbox() {
   return { base, root, outside };
 }
 
-async function serveRoot(root, access = 'read-write') {
+async function serveRoot(root, access = 'read-write', maxFileBytes) {
   const mesh = loopbackMesh();
   const server = await serveMille(mesh, {
     exports: {
@@ -111,6 +112,7 @@ async function serveRoot(root, access = 'read-write') {
         label: 'Guarded',
         roots: [root],
         access,
+        ...(maxFileBytes === undefined ? {} : { maxFileBytes }),
         explorer: { initialWalk: 'roots-only', watchDebounceMs: 40 },
       },
     },
@@ -395,6 +397,45 @@ test('AC-008: a read-only export refuses every write path', async () => {
     // Reads still work — read-only means read-only, not useless.
     const bytes = await s.remote.explorer.readFile(id);
     assert.equal(new TextDecoder().decode(bytes), 'fine\n');
+  } finally {
+    if (s) {
+      await s.remote.close();
+      await s.server.close();
+    }
+    removeTempDir(base);
+  }
+});
+
+test('advertised maxFileBytes is enforced for reads and writes without killing the session', async () => {
+  const { base, root } = sandbox();
+  writeFileSync(join(root, 'too-big.txt'), '0123456789');
+  let s;
+  try {
+    s = await serveRoot(root, 'read-write', 8);
+    const largeId = await waitFor(
+      () => s.remote.explorer.resolvePath('too-big.txt'),
+      'large file resolves',
+    );
+    const smallId = await waitFor(
+      () => s.remote.explorer.resolvePath('inside.txt'),
+      'small file resolves',
+    );
+
+    await assert.rejects(s.remote.explorer.readFile(largeId), (error) => error.code === 'EFBIG');
+    await assert.rejects(s.remote.explorer.readText(largeId), (error) => error.code === 'EFBIG');
+    await assert.rejects(
+      s.remote.explorer.writeFile(smallId, new TextEncoder().encode('123456789')),
+      (error) => error.code === 'EFBIG',
+    );
+    assert.equal(readFileSync(join(root, 'inside.txt'), 'utf8'), 'fine\n', 'denied write changed nothing');
+
+    await s.remote.explorer.writeFile(smallId, new TextEncoder().encode('ok'));
+    assert.equal(readFileSync(join(root, 'inside.txt'), 'utf8'), 'ok');
+    assert.equal(
+      new TextDecoder().decode(await s.remote.explorer.readFile(smallId)),
+      'ok',
+      'the same session remains usable after EFBIG',
+    );
   } finally {
     if (s) {
       await s.remote.close();
