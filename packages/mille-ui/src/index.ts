@@ -7,7 +7,7 @@
 // structural components and hooks alongside a `milleClassNames` catalog
 // — see `./headless/index.ts`.
 
-export const VERSION = '0.3.3'; // x-release-please-version
+export const VERSION = '0.3.4'; // x-release-please-version
 
 // Phase 1 — provider, context, snapshot hooks.
 export { FileTreeProvider } from './provider.js';

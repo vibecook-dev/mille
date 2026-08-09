@@ -1,5 +1,17 @@
 # mille changelog
 
+## [0.3.4](https://github.com/vibecook-dev/mille/compare/v0.3.3...v0.3.4) (2026-08-09)
+
+
+### Features
+
+* add Electron mesh file browser demo ([815e445](https://github.com/vibecook-dev/mille/commit/815e4451923a3b7d5b7177339798ea342f7fddfc))
+
+
+### Bug Fixes
+
+* **ui:** hydrate remote folder expansions ([8b0e759](https://github.com/vibecook-dev/mille/commit/8b0e7593a7583bcd3f743086a239bbf58c09a631))
+
 ## [0.3.3](https://github.com/vibecook-dev/mille/compare/v0.3.2...v0.3.3) (2026-08-03)
 
 
