@@ -50,7 +50,7 @@
     "typecheck": "pnpm -r --if-present typecheck"
   },
   "devDependencies": {
-    "@napi-rs/cli": "^3.6.2",
+    "@napi-rs/cli": "^3.7.4",
     "@types/node": "^24.0.0",
     "prettier": "^3.8.3",
     "typescript": "~6.0.0"
