@@ -88,7 +88,7 @@
     "@napi-rs/cli": "^3.6.2",
     "@types/node": "^24.0.0",
     "@types/react": "^19.2.0",
-    "fast-check": "^4.7.0",
+    "fast-check": "^4.9.0",
     "react": "^19.2.0",
     "typescript": "~6.0.0"
   },
