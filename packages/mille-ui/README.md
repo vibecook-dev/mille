@@ -255,7 +255,9 @@ surface.
 | `@vibecook/mille-ui/icons/duotone`  | Soft-duotone set (scannable, compact).  |
 | `@vibecook/mille-ui/icons/material` | Material Icon Theme bundle (publish-time). |
 | `@vibecook/mille-ui/icons/minimal`| Archival text-first set (no glyphs).    |
+| `@vibecook/mille-ui/icons/vibefield`| Category set drawn for a 12px row.     |
 | `@vibecook/mille-ui/theme/minimal.css` | Minimal paper/ink tree chrome.   |
+| `@vibecook/mille-ui/theme/vibefield.css` | Calm reading-rail tree chrome. |
 | `@vibecook/mille-ui/testing`        | `createFakeEngine` for unit tests.      |
 
 ## Icon themes
@@ -281,6 +283,27 @@ import { minimalIconTheme } from '@vibecook/mille-ui/icons/minimal';
   <FileTree fx={fx} ariaLabel="Files" iconTheme={minimalIconTheme} />
 </div>
 ```
+
+- **vibefield** — eleven category glyphs rather than one per language, drawn
+  for a 12px row: code, styling, prose, config, media, lockfile, secrets, git.
+  At that size a language badge inside a page outline turns to mush, so the
+  mark *is* the icon and the page shape is kept for prose and the unknown
+  file. Pair with the CSS theme for a calm reading rail — inset rows, a
+  hairline indent guide, and color only where a state is actually true:
+
+```tsx
+import '@vibecook/mille-ui/theme/vibefield.css';
+import { vibefieldIconTheme } from '@vibecook/mille-ui/icons/vibefield';
+
+<div data-mille-theme="vibefield">
+  <FileTree fx={fx} ariaLabel="Files" iconTheme={vibefieldIconTheme} />
+</div>
+```
+
+`data-mille-density="compact"` drops the row to 22px. The theme is
+self-contained, and every color additionally reads a `--vf-*` design token
+first, so a host that publishes those tokens re-skins the tree without a
+mille release.
 
 Any VS Code File Icon Theme–compatible object also works via `iconTheme`.
 

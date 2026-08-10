@@ -26,5 +26,9 @@ mkdirSync('dist', { recursive: true });
 writeFileSync('dist/tokens.css', combined);
 writeFileSync('tokens.css', combined);
 
+// Opt-in CSS themes ship as-is. Unlike `tokens.css` above these are authored
+// files rather than concatenations, so `.gitattributes`' working-tree LF is
+// already the whole story and there is nothing to normalize.
 mkdirSync('dist/theme', { recursive: true });
 copyFileSync('src/theme/minimal.css', 'dist/theme/minimal.css');
+copyFileSync('src/theme/vibefield.css', 'dist/theme/vibefield.css');

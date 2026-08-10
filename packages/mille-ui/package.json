@@ -48,7 +48,12 @@
       "types": "./dist/icons-minimal.d.ts",
       "import": "./dist/icons-minimal.js"
     },
+    "./icons/vibefield": {
+      "types": "./dist/icons-vibefield.d.ts",
+      "import": "./dist/icons-vibefield.js"
+    },
     "./theme/minimal.css": "./dist/theme/minimal.css",
+    "./theme/vibefield.css": "./dist/theme/vibefield.css",
     "./git": {
       "types": "./dist/git.d.ts",
       "import": "./dist/git.js"

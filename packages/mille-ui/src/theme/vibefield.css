@@ -1,0 +1,611 @@
+/*
+ * @vibecook/mille-ui — VibeField theme.
+ *
+ * A calm, near-colorless reading tree: iOS-style rows on an inset gutter, one
+ * hairline indent rail, and color reserved for states that are actually true.
+ * Built for VibeField's History room, where the tree is a 260px rail beside a
+ * transcript — a *reader* surface, so it leans on the type ramp and hairlines
+ * rather than on materials. Pairs with `@vibecook/mille-ui/icons/vibefield`.
+ *
+ * Usage:
+ *   import '@vibecook/mille-ui/theme/vibefield.css';
+ *   import { vibefieldIconTheme } from '@vibecook/mille-ui/icons/vibefield';
+ *
+ *   <div data-mille-theme="vibefield">
+ *     <FileTree fx={fx} ariaLabel="Files" iconTheme={vibefieldIconTheme} />
+ *   </div>
+ *
+ * `data-mille-density="compact"` drops the row to 22px for a long rail.
+ *
+ * TWO-WAY PALETTE, and it is the only unusual thing in this file.
+ *
+ * Every value below derives from the ~20 roots in the first block, and each of
+ * those roots is written `var(--vf-…, <published value>)`. So the theme stands
+ * alone on npm — nothing here requires a host stylesheet — while a host that
+ * already publishes VibeField's `--vf-*` design tokens drives it live, and a
+ * palette change there reaches the tree without a mille release. Neither side
+ * has to know about the other for this to work; that is the point of the
+ * fallback form. The dark block only restates the FALLBACKS, because a host
+ * supplying `--vf-*` has already flipped them itself.
+ *
+ * Layout and state rules deliberately avoid `:where()` so they outrank the
+ * shared `focus.css` selectors (`.mille-row[data-mille-selected]`, …), which
+ * are not wrapped either. Every combination that file styles is restated here,
+ * so importing `tokens.css` alongside this theme is optional: it adds mille's
+ * row-enter and repositioning motion and changes nothing else. Order between
+ * the two never matters — these rules win on specificity, not position.
+ */
+
+:where([data-mille-theme="vibefield"]) {
+  /* ── Palette roots ─────────────────────────────────────────────── */
+  --mille-vf-fg: var(--vf-foreground, #1c1c1e);
+  --mille-vf-text: var(--vf-text-primary, rgb(28 28 30 / 85%));
+  --mille-vf-text-2: var(--vf-text-secondary, rgb(28 28 30 / 70%));
+  --mille-vf-text-3: var(--vf-text-tertiary, rgb(28 28 30 / 45%));
+  --mille-vf-text-faint: var(--vf-text-faint, rgb(28 28 30 / 30%));
+  --mille-vf-hairline: var(--vf-hairline, rgb(0 0 0 / 5%));
+  --mille-vf-hairline-strong: var(--vf-hairline-strong, rgb(0 0 0 / 10%));
+  --mille-vf-solid: var(--vf-chrome-solid, #ffffff);
+  --mille-vf-surface: var(--vf-chrome-surface, rgb(255 255 255 / 90%));
+  --mille-vf-sheet: var(--vf-sheet-surface, rgb(255 255 255 / 96%));
+  --mille-vf-fill: var(--vf-fill, #f2f2f7);
+  --mille-vf-shadow: var(--vf-shadow-island, 0 8px 30px rgb(0 0 0 / 8%));
+
+  /* State colors. One meaning each; never decorative. */
+  --mille-vf-select: var(--vf-select, #4a90d9);
+  --mille-vf-green: var(--vf-green, #30d158);
+  --mille-vf-orange: var(--vf-orange, #ff9f0a);
+  --mille-vf-red: var(--vf-red, #ff453a);
+  --mille-vf-cyan: var(--vf-cyan, #5ac8fa);
+
+  /* Row hover and selection fills, one step apart. */
+  --mille-vf-step-1: color-mix(in srgb, var(--mille-vf-fg) 5%, transparent);
+  --mille-vf-step-2: color-mix(in srgb, var(--mille-vf-fg) 10%, transparent);
+
+  /* ── Geometry ──────────────────────────────────────────────────── */
+  --mille-row-height: var(--vf-tree-row-height, 26px);
+  --mille-indent-size: var(--vf-tree-indent, 14px);
+  --mille-row-padding-inline: var(--vf-tree-gutter, 8px);
+  --mille-tree-gutter-inline: var(--vf-tree-gutter, 8px);
+  --mille-vf-radius: var(--vf-radius-control, 9px);
+
+  /* ── Row fills: location is not interaction ────────────────────────
+     hover  : the first fill step
+     select : one step up — what the pointer or keyboard picked
+     active : the app's own "you are here" fill, used nowhere else here
+     The selection RING is not in this block; it is a box-shadow on the
+     focused row further down, because a ring marks interaction and a fill
+     marks location, and the tree needs to say both at once. */
+  --mille-row-bg: transparent;
+  --mille-row-bg-hover: var(--mille-vf-step-1);
+  --mille-row-bg-selected: var(--mille-vf-step-2);
+  /* mille defaults this to `--mille-accent-bg` — a solid accent bar.
+     Overridden deliberately: the accent belongs to rings here, not fills. */
+  --mille-row-bg-selected-focused: var(--mille-row-bg-selected);
+  --mille-search-selected-bg: var(--mille-row-bg-selected);
+  /* A sticky root needs the room's own material or rows read through it. */
+  --mille-sticky-root-bg: var(--mille-vf-sheet);
+
+  /* ── Interaction ───────────────────────────────────────────────── */
+  --mille-accent-bg: var(--mille-vf-select);
+  /* focus.css paints this as the selected+focused row's text color. The fill
+     is neutral here, so the text stays on the ramp — white would vanish. */
+  --mille-accent-fg: var(--mille-vf-text);
+  --mille-focus-ring: 1.5px solid var(--mille-vf-select);
+  --mille-active-entry-marker: var(--mille-vf-select);
+
+  /* ── Structure ─────────────────────────────────────────────────── */
+  --mille-indent-guide: var(--mille-vf-hairline-strong);
+  --mille-indent-guide-style: solid;
+  --mille-chevron-color: var(--mille-vf-text-3);
+  --mille-unavailable-opacity: 0.55;
+  /* Loading is not a state worth a color — it says nothing about health. */
+  --mille-loading-color: var(--mille-vf-text-3);
+
+  /* ── SCM decorations ───────────────────────────────────────────────
+     Mapped to meanings rather than to git's conventional colors.
+     `modified` is cyan, not amber: a dirty file is a live fact about the
+     tree, and orange has exactly one job in this palette — needs attention.
+     If every edited file were orange, orange would stop meaning "act". */
+  --mille-decoration-added: var(--mille-vf-green);
+  --mille-decoration-untracked: var(--mille-vf-green);
+  --mille-decoration-deleted: var(--mille-vf-red);
+  --mille-decoration-modified: var(--mille-vf-cyan);
+  --mille-decoration-renamed: var(--mille-vf-cyan);
+  /* A conflict is the one SCM state a human must resolve. That is attention. */
+  --mille-decoration-conflict: var(--mille-vf-orange);
+  --mille-decoration-ignored: var(--mille-vf-text-faint);
+  --mille-decoration-ignored-opacity: 0.55;
+
+  /* ── Diagnostics ───────────────────────────────────────────────── */
+  --mille-decoration-error: var(--mille-vf-red);
+  --mille-decoration-warning: var(--mille-vf-orange);
+  --mille-decoration-info: var(--mille-vf-cyan);
+  --mille-decoration-hint: var(--mille-vf-text-3);
+
+  /* ── Editor state. A file being open is a FACT, not a concern, so it
+     lives on the text ramp rather than taking a state color. ───────── */
+  --mille-decoration-dirty: var(--mille-vf-text-2);
+  --mille-decoration-open: var(--mille-vf-text-3);
+  --mille-decoration-active: var(--mille-vf-select);
+
+  /* ── Test status. Work in flight is the green one and a finished pass
+     goes quiet, which is the opposite of the usual all-green tree: a
+     passing test is not news, and the row that needs you should be the
+     one that stands out. ───────────────────────────────────────────── */
+  --mille-decoration-test-running: var(--mille-vf-green);
+  --mille-decoration-test-failed: var(--mille-vf-red);
+  --mille-decoration-test-errored: var(--mille-vf-orange);
+  --mille-decoration-test-passed: var(--mille-vf-text-3);
+  --mille-decoration-test-skipped: var(--mille-vf-text-faint);
+
+  /* mille asks for a `-muted` partner for every decoration, for rows that
+     are not the active one. Derived, never a second palette. */
+  --mille-decoration-added-muted: color-mix(in srgb, var(--mille-vf-green) 55%, transparent);
+  --mille-decoration-untracked-muted: color-mix(in srgb, var(--mille-vf-green) 55%, transparent);
+  --mille-decoration-deleted-muted: color-mix(in srgb, var(--mille-vf-red) 55%, transparent);
+  --mille-decoration-modified-muted: color-mix(in srgb, var(--mille-vf-cyan) 55%, transparent);
+  --mille-decoration-renamed-muted: color-mix(in srgb, var(--mille-vf-cyan) 55%, transparent);
+  --mille-decoration-conflict-muted: color-mix(in srgb, var(--mille-vf-orange) 55%, transparent);
+  --mille-decoration-ignored-muted: var(--mille-vf-text-faint);
+  --mille-decoration-error-muted: color-mix(in srgb, var(--mille-vf-red) 55%, transparent);
+  --mille-decoration-warning-muted: color-mix(in srgb, var(--mille-vf-orange) 55%, transparent);
+  --mille-decoration-info-muted: color-mix(in srgb, var(--mille-vf-cyan) 55%, transparent);
+  --mille-decoration-hint-muted: var(--mille-vf-text-faint);
+  --mille-decoration-test-running-muted: color-mix(in srgb, var(--mille-vf-green) 55%, transparent);
+  --mille-decoration-test-failed-muted: color-mix(in srgb, var(--mille-vf-red) 55%, transparent);
+  --mille-decoration-test-errored-muted: color-mix(in srgb, var(--mille-vf-orange) 55%, transparent);
+  --mille-decoration-test-passed-muted: var(--mille-vf-text-faint);
+  --mille-decoration-test-skipped-muted: var(--mille-vf-text-faint);
+  /* Badges read as labels, not status chips, so they carry no fill. */
+  --mille-decoration-badge-bg: transparent;
+
+  /* ── Rename + filter ───────────────────────────────────────────── */
+  --mille-rename-input-bg: var(--mille-vf-solid);
+  --mille-rename-input-ring: var(--mille-vf-select);
+  /* A rename error is red TEXT over a tint, never a filled alarm. */
+  --mille-rename-tooltip-bg: color-mix(in srgb, var(--mille-vf-red) 14%, var(--mille-vf-solid));
+  --mille-rename-tooltip-fg: var(--mille-vf-red);
+  --mille-filter-input-bg: var(--mille-vf-solid);
+  --mille-filter-input-border: var(--mille-vf-hairline-strong);
+  --mille-filter-toggle-border: var(--mille-vf-hairline-strong);
+  --mille-filter-toggle-active-bg: var(--mille-vf-fill);
+
+  /* ── Type ──────────────────────────────────────────────────────────
+     The system stack for names — a file NAME is a label, and only full
+     paths and ids go monospace (see the search list below). `color` here is
+     what `currentColor` resolves to for icons and chevrons, so they sit one
+     step below the name without needing a rule of their own. */
+  color: var(--mille-vf-text-2);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 12px;
+  -webkit-font-smoothing: antialiased;
+}
+
+[data-mille-theme="vibefield"][data-mille-density="compact"] {
+  --mille-row-height: var(--vf-tree-row-height-compact, 22px);
+}
+
+/*
+ * Dark. Only the FALLBACK literals move: a host that supplies `--vf-*` has
+ * already flipped its own tokens, so this block is a no-op there. The two
+ * fill steps do change for real — a 5% ink wash is invisible over a dark
+ * ground, so both steps double.
+ */
+[data-theme="dark"] [data-mille-theme="vibefield"],
+.dark [data-mille-theme="vibefield"],
+[data-mille-theme="vibefield"][data-theme="dark"],
+[data-mille-theme="vibefield"].dark {
+  --mille-vf-fg: var(--vf-foreground, #f5f5f7);
+  --mille-vf-text: var(--vf-text-primary, rgb(245 245 247 / 85%));
+  --mille-vf-text-2: var(--vf-text-secondary, rgb(245 245 247 / 70%));
+  --mille-vf-text-3: var(--vf-text-tertiary, rgb(245 245 247 / 45%));
+  --mille-vf-text-faint: var(--vf-text-faint, rgb(245 245 247 / 30%));
+  --mille-vf-hairline: var(--vf-hairline, rgb(255 255 255 / 10%));
+  --mille-vf-hairline-strong: var(--vf-hairline-strong, rgb(255 255 255 / 15%));
+  --mille-vf-solid: var(--vf-chrome-solid, #1c1c1e);
+  --mille-vf-surface: var(--vf-chrome-surface, rgb(28 28 30 / 90%));
+  --mille-vf-sheet: var(--vf-sheet-surface, rgb(28 28 30 / 96%));
+  --mille-vf-fill: var(--vf-fill, #2c2c2e);
+  --mille-vf-shadow: var(--vf-shadow-island, 0 8px 30px rgb(0 0 0 / 40%));
+
+  --mille-vf-step-1: color-mix(in srgb, var(--mille-vf-fg) 10%, transparent);
+  --mille-vf-step-2: color-mix(in srgb, var(--mille-vf-fg) 20%, transparent);
+}
+
+/* ── Tree chrome ──────────────────────────────────────────────────────
+   The gutter is padding on the scroller: rows are absolutely positioned
+   inside its content box, so they inset with it and the rounded row corners
+   have somewhere to sit. No material, no shadow — this is a reader. */
+
+[data-mille-theme="vibefield"] .mille-tree,
+[data-mille-theme="vibefield"] [role="tree"],
+[data-mille-theme="vibefield"] [data-mille-tree-state] {
+  box-sizing: border-box;
+  padding-inline: var(--mille-tree-gutter-inline);
+  padding-block: 6px;
+}
+
+/* ── Rows ───────────────────────────────────────────────────────────── */
+
+[data-mille-theme="vibefield"] .mille-row {
+  border-radius: var(--mille-vf-radius);
+  color: var(--mille-vf-text);
+  background-color: var(--mille-row-bg);
+  cursor: default;
+  transition:
+    background-color 120ms ease,
+    box-shadow 120ms ease,
+    opacity 120ms ease;
+}
+
+[data-mille-theme="vibefield"] .mille-row:hover {
+  background-color: var(--mille-row-bg-hover);
+}
+
+/* Location — the entry actually open. This fill is used nowhere else. */
+[data-mille-theme="vibefield"] .mille-row[data-mille-active="true"] {
+  border-inline-end: 0;
+  background-color: var(--mille-vf-fill);
+}
+
+/* Interaction — what the pointer or keyboard picked. */
+[data-mille-theme="vibefield"] .mille-row[data-mille-selected="true"],
+[data-mille-theme="vibefield"] .mille-row[data-mille-selected="true"][data-mille-focused="true"] {
+  color: var(--mille-vf-text);
+  background-color: var(--mille-row-bg-selected);
+}
+
+/* The ring, drawn INSIDE the row so it never grows the box. One at a time:
+   a twelve-row selection is twelve fills and this single ring on the row the
+   keyboard is on, which doubles as the keyboard focus indicator. */
+[data-mille-theme="vibefield"] .mille-row[data-mille-focused="true"],
+[data-mille-theme="vibefield"] .mille-row:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 1.5px var(--mille-vf-select);
+}
+
+/* A sticky root is a heading, not a selectable row. */
+[data-mille-theme="vibefield"] .mille-row[data-mille-sticky-root="true"] {
+  border-bottom: 0;
+  border-radius: 0;
+  font-weight: 500;
+}
+
+/* An unavailable root is unknown, not failed — muted italic, never an error.
+   Set here rather than left to focus.css so this theme stands alone. */
+[data-mille-theme="vibefield"] .mille-row[data-mille-unavailable="true"] {
+  color: var(--mille-vf-text-3);
+  cursor: default;
+  opacity: var(--mille-unavailable-opacity);
+  font-style: italic;
+}
+
+[data-mille-theme="vibefield"] .mille-row[data-mille-ignored="true"],
+[data-mille-theme="vibefield"] .mille-row[data-mille-under-library-root="true"] {
+  color: var(--mille-vf-text-3);
+  background-color: transparent;
+}
+
+/* ── The name ─────────────────────────────────────────────────────────
+   Sentence case always — never uppercase a filename; the name is data. */
+
+[data-mille-theme="vibefield"] .mille-row-name,
+[data-mille-theme="vibefield"] [data-mille-row-name] {
+  color: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  text-transform: none;
+}
+
+/* ── Chevron and icons ────────────────────────────────────────────────
+   Icons are muted by opacity rather than color so they keep inheriting the
+   row's ramp through every state with one rule instead of five. */
+
+[data-mille-theme="vibefield"] .mille-row [role="img"],
+[data-mille-theme="vibefield"] .mille-row img {
+  opacity: 0.55;
+}
+
+[data-mille-theme="vibefield"] .mille-row[data-mille-selected="true"] [role="img"],
+[data-mille-theme="vibefield"] .mille-row[data-mille-active="true"] [role="img"] {
+  opacity: 0.75;
+}
+
+[data-mille-theme="vibefield"] .mille-row [data-mille-chevron] svg {
+  /* `!important` because DisclosureChevron sets this transition as an inline
+     style, which no author rule can otherwise beat. The slower curve matches
+     the rest of the theme's motion. */
+  transition: transform 180ms cubic-bezier(0.25, 1, 0.3, 1) !important;
+}
+
+/* ── Drag, cut, drop ──────────────────────────────────────────────── */
+
+/* A dragged row is held, not gone — the same opacity a lifted card takes. */
+[data-mille-theme="vibefield"] .mille-row[data-mille-dragging="true"] {
+  opacity: 0.75;
+}
+
+/* Cut is a different claim: this row leaves on paste. */
+[data-mille-theme="vibefield"] .mille-row[data-mille-cut="true"] {
+  opacity: 0.45;
+}
+
+/* Drop INTO a folder — the interaction ring again, solid, not a dashed box. */
+[data-mille-theme="vibefield"] .mille-row[data-mille-drop-target-self="true"] {
+  outline: none;
+  background-color: var(--mille-row-bg-hover);
+  box-shadow: inset 0 0 0 1.5px var(--mille-vf-select);
+}
+
+/* Drop BETWEEN siblings. focus.css draws these too, from the same accent we
+   set above; restated so a host importing only this file still gets them. */
+[data-mille-theme="vibefield"] .mille-row[data-mille-drop-target-above="true"]::before,
+[data-mille-theme="vibefield"] .mille-row[data-mille-drop-target-below="true"]::after {
+  position: absolute;
+  right: 0;
+  left: 0;
+  height: 2px;
+  background: var(--mille-vf-select);
+  content: "";
+  pointer-events: none;
+}
+
+[data-mille-theme="vibefield"] .mille-row[data-mille-drop-target-above="true"]::before {
+  top: 0;
+}
+
+[data-mille-theme="vibefield"] .mille-row[data-mille-drop-target-below="true"]::after {
+  bottom: 0;
+}
+
+/* ── Decorations ──────────────────────────────────────────────────────
+   The COLOR arrives as an inline style from mille's own providers, written
+   as `var(--mille-decoration-modified, …)` and friends — which is why setting
+   the variables above is enough to recolor every letter and badge. Only what
+   is not already inline can be set here. */
+
+[data-mille-theme="vibefield"] .mille-decoration-letter,
+[data-mille-theme="vibefield"] .mille-decoration-badge {
+  letter-spacing: 0.04em;
+}
+
+/* ── Filter strip ─────────────────────────────────────────────────── */
+
+[data-mille-theme="vibefield"] .mille-filter-input,
+[data-mille-theme="vibefield"] [data-mille-filter-input] {
+  border-radius: var(--mille-vf-radius);
+  color: var(--mille-vf-text);
+  font-family: inherit;
+  font-size: 12px;
+}
+
+[data-mille-theme="vibefield"] [data-mille-filter-input]::placeholder {
+  color: var(--mille-vf-text-faint);
+}
+
+[data-mille-theme="vibefield"] [data-mille-filter-input]:focus {
+  border-color: color-mix(in srgb, var(--mille-vf-fg) 25%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--mille-vf-fg) 5%, transparent);
+}
+
+[data-mille-theme="vibefield"] [data-mille-filter-mode-btn] {
+  color: var(--mille-vf-text-3);
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+[data-mille-theme="vibefield"] [data-mille-filter-mode-active="true"] {
+  color: var(--mille-vf-text);
+}
+
+/* ── Search results ───────────────────────────────────────────────────
+   `data-mille-search-hit-count` and `data-mille-search-error` are markers on
+   the LIST container carrying a count and a message — data, not text nodes.
+   Styling them as text would tint the whole list, so these key off
+   `data-mille-search-state` instead. */
+
+[data-mille-theme="vibefield"] .mille-search-list[data-mille-search-state="loading"],
+[data-mille-theme="vibefield"] .mille-search-list[data-mille-search-state="empty"] {
+  color: var(--mille-vf-text-3);
+  font-size: 12px;
+}
+
+[data-mille-theme="vibefield"] .mille-search-list[data-mille-search-state="error"] {
+  color: var(--mille-vf-red);
+  font-size: 12px;
+}
+
+[data-mille-theme="vibefield"] .mille-search-option {
+  border-radius: var(--mille-vf-radius);
+  color: var(--mille-vf-text);
+}
+
+[data-mille-theme="vibefield"] .mille-search-option:hover {
+  background-color: var(--mille-row-bg-hover);
+}
+
+[data-mille-theme="vibefield"] [data-mille-search-option-selected="true"] {
+  background-color: var(--mille-row-bg-selected);
+  box-shadow: inset 0 0 0 1.5px var(--mille-vf-select);
+}
+
+[data-mille-theme="vibefield"] .mille-search-option-name {
+  font-size: 12px;
+  font-weight: 500;
+}
+
+/* Here the monospace stack IS right: the second line is a path. */
+[data-mille-theme="vibefield"] .mille-search-option-path {
+  color: var(--mille-vf-text-3);
+  font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+}
+
+[data-mille-theme="vibefield"] [data-mille-search-match] {
+  color: var(--mille-vf-text);
+  background: transparent;
+  font-weight: 600;
+}
+
+/* ── Inline rename ────────────────────────────────────────────────── */
+
+[data-mille-theme="vibefield"] .mille-rename-input {
+  min-width: 0;
+  padding: 0 4px;
+  border: 1px solid var(--mille-vf-hairline-strong);
+  border-radius: 6px;
+  outline: none;
+  color: var(--mille-vf-text);
+  background: var(--mille-rename-input-bg);
+  font: inherit;
+  font-size: 12px;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--mille-vf-select) 35%, transparent);
+}
+
+[data-mille-theme="vibefield"] .mille-rename-tooltip {
+  padding: 5px 8px;
+  border-radius: 8px;
+  color: var(--mille-rename-tooltip-fg);
+  background: var(--mille-rename-tooltip-bg);
+  box-shadow: var(--mille-vf-shadow);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+/* ── Context menu ─────────────────────────────────────────────────────
+   mille ships the menu with class names and no styling, so the whole recipe
+   lives here. It is the one part of the tree that is chrome rather than
+   reader, and the only place a material appears.
+ *
+ * These selectors are deliberately NOT scoped to the theme attribute: Radix
+ * portals the menu to `document.body`, outside the theme wrapper, so a scoped
+ * rule would never match. That also puts them outside the palette roots, so
+ * this block reads the `--vf-*` tokens directly with the same fallbacks.
+ * Submenu content carries the same class and is covered by the same rule.
+ */
+
+.mille-context-menu-content {
+  z-index: 60;
+  min-width: 200px;
+  padding: 6px;
+  border: 1px solid var(--vf-hairline, rgb(0 0 0 / 5%));
+  border-radius: 14px;
+  color: var(--vf-text-primary, rgb(28 28 30 / 85%));
+  background: var(--vf-chrome-surface, rgb(255 255 255 / 90%));
+  box-shadow: var(--vf-shadow-island, 0 8px 30px rgb(0 0 0 / 8%));
+  backdrop-filter: blur(24px);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 13px;
+}
+
+.mille-context-menu-item,
+.mille-context-menu-subtrigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  height: 30px;
+  padding: 0 10px;
+  border-radius: 8px;
+  outline: none;
+  color: var(--vf-text-primary, rgb(28 28 30 / 85%));
+  cursor: default;
+  user-select: none;
+}
+
+.mille-context-menu-item[data-highlighted],
+.mille-context-menu-subtrigger[data-highlighted],
+.mille-context-menu-subtrigger[data-state="open"] {
+  background: var(--vf-fill, #f2f2f7);
+}
+
+/* Destructive acts are red TEXT before any confirm, never a filled alarm.
+   mille carries no "destructive" flag in the DOM, so the command id is the
+   only signal: this catches the built-in `file.delete`, and a host naming a
+   destructive command something else adds its own rule. */
+.mille-context-menu-item[data-mille-command-id*="delete"],
+.mille-context-menu-item[data-mille-command-id*="remove"] {
+  color: var(--vf-red, #ff453a);
+}
+
+/* mille writes this attribute as the empty string, not "true". */
+.mille-context-menu-item[data-mille-command-disabled],
+.mille-context-menu-item[data-disabled] {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+.mille-context-menu-item-shortcut {
+  color: var(--vf-text-faint, rgb(28 28 30 / 30%));
+  font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+}
+
+.mille-context-menu-separator {
+  height: 1px;
+  margin: 5px 8px;
+  background: var(--vf-hairline-strong, rgb(0 0 0 / 10%));
+}
+
+.mille-context-menu-group + .mille-context-menu-group {
+  margin-top: 4px;
+}
+
+.mille-context-menu-empty {
+  padding: 8px 10px;
+  color: var(--vf-text-tertiary, rgb(28 28 30 / 45%));
+  font-size: 12px;
+}
+
+[data-theme="dark"] .mille-context-menu-content,
+.dark .mille-context-menu-content {
+  border-color: var(--vf-hairline, rgb(255 255 255 / 10%));
+  color: var(--vf-text-primary, rgb(245 245 247 / 85%));
+  background: var(--vf-chrome-surface, rgb(28 28 30 / 90%));
+  box-shadow: var(--vf-shadow-island, 0 8px 30px rgb(0 0 0 / 40%));
+}
+
+[data-theme="dark"] .mille-context-menu-item,
+.dark .mille-context-menu-item,
+[data-theme="dark"] .mille-context-menu-subtrigger,
+.dark .mille-context-menu-subtrigger {
+  color: var(--vf-text-primary, rgb(245 245 247 / 85%));
+}
+
+[data-theme="dark"] .mille-context-menu-item[data-highlighted],
+.dark .mille-context-menu-item[data-highlighted],
+[data-theme="dark"] .mille-context-menu-subtrigger[data-highlighted],
+.dark .mille-context-menu-subtrigger[data-highlighted] {
+  background: var(--vf-fill, #2c2c2e);
+}
+
+[data-theme="dark"] .mille-context-menu-item-shortcut,
+.dark .mille-context-menu-item-shortcut {
+  color: var(--vf-text-faint, rgb(245 245 247 / 30%));
+}
+
+[data-theme="dark"] .mille-context-menu-separator,
+.dark .mille-context-menu-separator {
+  background: var(--vf-hairline-strong, rgb(255 255 255 / 15%));
+}
+
+[data-theme="dark"] .mille-context-menu-empty,
+.dark .mille-context-menu-empty {
+  color: var(--vf-text-tertiary, rgb(245 245 247 / 45%));
+}
+
+/* ── Reduced motion ───────────────────────────────────────────────── */
+
+@media (prefers-reduced-motion: reduce) {
+  [data-mille-theme="vibefield"] .mille-row {
+    transition: none;
+  }
+
+  [data-mille-theme="vibefield"] .mille-row [data-mille-chevron] svg {
+    transition: none !important;
+  }
+}

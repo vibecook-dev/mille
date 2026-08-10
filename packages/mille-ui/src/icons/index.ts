@@ -5,6 +5,7 @@
 export { defaultIconTheme } from './default-theme.js';
 export { duotoneIconTheme } from './duotone-theme.js';
 export { minimalIconTheme } from './minimal-theme.js';
+export { vibefieldIconTheme } from './vibefield-theme.js';
 export { FileIcon, type FileIconProps } from './FileIcon.js';
 export { loadIconTheme, type LoadIconThemeOptions } from './load.js';
 export { createIconResolver } from './resolver.js';
