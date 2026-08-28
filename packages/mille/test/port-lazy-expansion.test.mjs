@@ -287,3 +287,75 @@ test('initialWalk=none leaves store empty until explicit populateFromRoots', asy
     removeTempDir(dir);
   }
 });
+
+test('expanding a folder that lazy hydration touched still walks its whole child list', async () => {
+  // Under lazy expansion a folder can hold children WITHOUT having been
+  // walked: `getByUri` hydrates one ancestor chain at a time, and the SCM
+  // decoration companion resolves every dirty path that way. Reading "has
+  // children in the store" as "was walked" froze such a folder at whatever
+  // subset the hydration happened to create — expand `packages` and you saw
+  // the one package with an edit in it, never the rest.
+  const dir = tempRoot();
+  try {
+    // packages/{design-kit,shell-ui,fieldd}; only design-kit is on the
+    // hydrated chain.
+    mkdirSync(join(dir, 'packages', 'design-kit'), { recursive: true });
+    mkdirSync(join(dir, 'packages', 'shell-ui'), { recursive: true });
+    mkdirSync(join(dir, 'packages', 'fieldd'), { recursive: true });
+    writeFileSync(join(dir, 'packages', 'design-kit', 'tokens.css'), ':root{}');
+    writeFileSync(join(dir, 'packages', 'shell-ui', 'index.ts'), 'export {};');
+    writeFileSync(join(dir, 'packages', 'fieldd', 'index.ts'), 'export {};');
+
+    const host = await createFileExplorerHost({
+      roots: [dir],
+      initialWalk: 'roots-only',
+      compactFolders: false,
+    });
+    const { port1, port2 } = new MessageChannel();
+    host.attachPort(port1);
+    const client = await connectFileExplorer(port2);
+
+    const rootId = await waitFor(() => {
+      const roots = client.getSnapshot().roots();
+      return roots.length === 1 ? roots[0].id : null;
+    });
+    client.setExpanded({ add: [rootId] });
+    const packagesId = await waitFor(() => {
+      const hostSnap = host.local.getSnapshot();
+      for (const id of hostSnap.childrenOf(rootId)) {
+        if (hostSnap.getById(id)?.name === 'packages') return id;
+      }
+      return null;
+    });
+
+    // What the SCM companion does for a dirty file: resolve its path, which
+    // hydrates the ancestor chain and nothing else.
+    await host.local.getByUri({
+      scheme: 'file',
+      path: join(dir, 'packages', 'design-kit', 'tokens.css'),
+    });
+    assert.equal(
+      host.local.getSnapshot().childrenOf(packagesId).length,
+      1,
+      'hydration left `packages` holding exactly the chain child',
+    );
+
+    client.setExpanded({ add: [packagesId] });
+    const names = await waitFor(() => {
+      const hostSnap = host.local.getSnapshot();
+      const kids = hostSnap
+        .childrenOf(packagesId)
+        .map((id) => hostSnap.getById(id)?.name)
+        .filter(Boolean);
+      return kids.length >= 3 ? new Set(kids) : null;
+    });
+    assert.ok(names.has('design-kit'), 'expand keeps the hydrated child');
+    assert.ok(names.has('shell-ui'), 'expand adds the sibling hydration never saw');
+    assert.ok(names.has('fieldd'), 'expand adds every sibling, not just the first');
+
+    await client.dispose();
+    await host.dispose();
+  } finally {
+    removeTempDir(dir);
+  }
+});

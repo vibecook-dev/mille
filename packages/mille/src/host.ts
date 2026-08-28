@@ -1015,8 +1015,17 @@ class FileExplorerHostImpl implements FileExplorerHost {
         this.prefetched.add(id);
         continue;
       }
+      // "Has children in the store" only means "was walked" when something
+      // guarantees the store was walked whole — `initialWalk: 'full'` does.
+      // Under lazy expansion it does not: `getByUri` hydrates one ancestor
+      // chain at a time (the SCM companion resolves every dirty path that
+      // way), so a folder can hold exactly the one child that happened to be
+      // on such a chain. Skipping the walk there freezes the folder at that
+      // subset — expand `packages` and you get the one dirty package, not the
+      // five that are there. One depth-1 walk per folder per session is the
+      // price of a correct child list; `prefetched` still makes it once.
       const kids = snap.childrenOf(id);
-      if (kids.length > 0) {
+      if (kids.length > 0 && this.initialWalk === 'full') {
         // Already walked; mark as covered to skip future expansions too.
         this.prefetched.add(id);
         continue;
