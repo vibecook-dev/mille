@@ -109,6 +109,7 @@ export interface AckMsg {
  * runtime-agnostic schema module. Keep these two in sync.
  */
 export interface DecorationOnWire {
+  readonly letter?: string;
   readonly badge?: string;
   readonly color?: string;
   readonly tooltip?: string;

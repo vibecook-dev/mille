@@ -201,12 +201,13 @@ test('after initial fetch, decorations appear for changed paths', async () => {
   // `provide(entry)` returns the decoration for the changed ids.
   const decA = provider.provide({ id: 3 });
   assert.ok(decA, 'src/a.ts must be decorated');
-  assert.equal(decA.badge, 'M');
+  assert.equal(decA.letter, 'M', 'a bare SCM status is a letter, not a count badge');
+  assert.equal(decA.badge, undefined, 'leaf must not also carry a badge');
   assert.ok(typeof decA.color === 'string', 'M status must have a color');
 
   const decReadme = provider.provide({ id: 5 });
   assert.ok(decReadme);
-  assert.equal(decReadme.badge, '?');
+  assert.equal(decReadme.letter, '?');
 
   // Clean paths return null.
   assert.equal(provider.provide({ id: 4 }), null, 'src/b.ts is clean');
@@ -251,7 +252,7 @@ test('client.onChange triggers a recompute', async () => {
   const provider = providers[0];
   const decB = provider.provide({ id: 4 });
   assert.ok(decB, 'src/b.ts must now be decorated');
-  assert.equal(decB.badge, 'A');
+  assert.equal(decB.letter, 'A');
 
   handle.dispose();
 });
@@ -376,7 +377,7 @@ test('propagateToParent: true → ancestors decorated with muted (M*) letter', a
 
   const leaf = provider.provide({ id: 3 });
   assert.ok(leaf);
-  assert.equal(leaf.badge, 'M', 'leaf keeps full letter');
+  assert.equal(leaf.letter, 'M', 'leaf keeps full letter');
 
   const folder = provider.provide({ id: 2 });
   assert.ok(folder, 'src folder must be decorated via propagation');
@@ -460,7 +461,7 @@ test('refresh() forces immediate re-fetch and awaits completion', async () => {
   const provider = providers[0];
   const dec = provider.provide({ id: 4 });
   assert.ok(dec, 'src/b.ts decoration must be present after refresh()');
-  assert.equal(dec.badge, 'A');
+  assert.equal(dec.letter, 'A');
 
   handle.dispose();
 });

@@ -30,6 +30,7 @@
  * bare mirror tests can run without pulling the wire schema in.
  */
 export interface DecorationOnWireLocal {
+  readonly letter?: string;
   readonly badge?: string;
   readonly color?: string;
   readonly tooltip?: string;

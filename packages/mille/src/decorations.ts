@@ -10,6 +10,14 @@
 import type { EntryId } from './client.js';
 
 export interface Decoration {
+  /**
+   * A bare status GLYPH for this row (`'M'`, `'A'`, `'D'`), rendered on the
+   * row's type ramp in a fixed-width slot so a column of them aligns.
+   * Distinct from `badge`, which is a padded pill for a COUNT — the UI
+   * styles the two differently and screen readers read a letter as
+   * "status M" and a numeric badge as "N problems".
+   */
+  readonly letter?: string;
   readonly badge?: string; // 1-2 char glyph
   readonly color?: string; // theme token
   readonly tooltip?: string;

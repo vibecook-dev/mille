@@ -217,9 +217,16 @@ export function registerGitDecorations(
     const staged = entry.staged === true;
     const color = resolveColor(entry.status, staged, false);
     const tooltip = tooltipFor(entry);
+    // A bare SCM status is a LETTER, not a badge. The two are different
+    // objects in `FileDecorations`: a letter is one status glyph on the row's
+    // type ramp (0.85em, 600, tabular, `min-width: .9em` so a column of them
+    // aligns), a badge is a padded pill for a COUNT — which is why
+    // `decorationAccessibleLabel` reads a numeric badge as "N problems" and a
+    // letter as "status M". Shipping `M` as a badge put a count's chrome and a
+    // count's screen-reader phrasing on a one-letter status.
     const decoration: Decoration = color !== undefined
-      ? { badge: entry.status, color, tooltip, propagate: propagateToParent }
-      : { badge: entry.status, tooltip, propagate: propagateToParent };
+      ? { letter: entry.status, color, tooltip, propagate: propagateToParent }
+      : { letter: entry.status, tooltip, propagate: propagateToParent };
     return decoration;
   }
 

@@ -1821,6 +1821,7 @@ function arraysEqual(a: readonly number[], b: readonly number[]): boolean {
  */
 function toWireDecoration(d: Decoration): DecorationOnWire {
   const out: { -readonly [K in keyof DecorationOnWire]: DecorationOnWire[K] } = {};
+  if (d.letter !== undefined) out.letter = d.letter;
   if (d.badge !== undefined) out.badge = d.badge;
   if (d.color !== undefined) out.color = d.color;
   if (d.tooltip !== undefined) out.tooltip = d.tooltip;
