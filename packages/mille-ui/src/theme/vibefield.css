@@ -302,13 +302,24 @@
    Icons are muted by opacity rather than color so they keep inheriting the
    row's ramp through every state with one rule instead of five. */
 
-[data-mille-theme="vibefield"] .mille-row [role="img"],
+/* `:not(.mille-decorations)` is load-bearing. `FileDecorations` puts
+   `role="img"` on its wrapper whenever it has an accessible label, so a bare
+   `[role="img"]` also catches the SCM letter and the problems badge — the two
+   things in the row whose whole job is to carry a state COLOUR. Dimming them
+   turns `--vf-cyan` into the muted variant and quietly erases the distinction
+   between "this file changed" and "something under this folder did". */
+
+[data-mille-theme="vibefield"] .mille-row [role="img"]:not(.mille-decorations),
 [data-mille-theme="vibefield"] .mille-row img {
   opacity: 0.55;
 }
 
-[data-mille-theme="vibefield"] .mille-row[data-mille-selected="true"] [role="img"],
-[data-mille-theme="vibefield"] .mille-row[data-mille-active="true"] [role="img"] {
+[data-mille-theme="vibefield"]
+  .mille-row[data-mille-selected="true"]
+  [role="img"]:not(.mille-decorations),
+[data-mille-theme="vibefield"]
+  .mille-row[data-mille-active="true"]
+  [role="img"]:not(.mille-decorations) {
   opacity: 0.75;
 }
 
@@ -365,7 +376,11 @@
    the variables above is enough to recolor every letter and badge. Only what
    is not already inline can be set here. */
 
-[data-mille-theme="vibefield"] .mille-decoration-letter,
+/* Badges only. A letter is ONE glyph in a `min-width: .9em`, centred slot —
+   that slot is what aligns a column of them, and tracking on a single glyph
+   only adds a trailing sliver that pushes the filename off the grid the
+   undecorated rows sit on. A badge is a short label (`M*`, `12`) and reads
+   better spaced. */
 [data-mille-theme="vibefield"] .mille-decoration-badge {
   letter-spacing: 0.04em;
 }

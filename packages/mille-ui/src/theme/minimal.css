@@ -328,7 +328,9 @@
 
 /* ── Icons: text-first — no file-type glyphs ────────────────────── */
 
-[data-mille-theme="minimal"] .mille-row [role="img"],
+/* Same exclusion as the VibeField theme: `FileDecorations` labels its wrapper
+   `role="img"`, and hiding icons must not also hide the SCM letter. */
+[data-mille-theme="minimal"] .mille-row [role="img"]:not(.mille-decorations),
 [data-mille-theme="minimal"] .mille-row img {
   display: none !important;
   width: 0 !important;
