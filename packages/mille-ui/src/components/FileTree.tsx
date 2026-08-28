@@ -136,6 +136,9 @@ function FileTreeBase(
 export const FileTree = forwardRef<FileTreeRef, FileTreeProps>(FileTreeBase);
 FileTree.displayName = 'FileTree';
 
+/** Fallback row height: what a tree with no theme and no `rowHeight` gets. */
+const DEFAULT_ROW_HEIGHT = 22;
+
 // ─── Inner tree — assumes provider is present ──────────────────────
 
 type FileTreeInnerProps = Omit<FileTreeProps, 'fx'> & {
@@ -144,7 +147,7 @@ type FileTreeInnerProps = Omit<FileTreeProps, 'fx'> & {
 
 function FileTreeInner(props: FileTreeInnerProps): ReactElement {
   const {
-    rowHeight = 22,
+    rowHeight: rowHeightProp,
     overscan = 20,
     iconTheme,
     emptyState,
@@ -272,6 +275,32 @@ function FileTreeInner(props: FileTreeInnerProps): ReactElement {
   const embeddedFilterInputRef = useRef<FileTreeFilterHandle | null>(null);
 
   const scrollerRef = useRef<HTMLDivElement | null>(null);
+
+  // Row height comes from the theme unless the host names one. A theme sets
+  // `--mille-row-height` (the shipped VibeField theme reads it from the host's
+  // own design token, and `data-mille-density="compact"` swaps it) — but the
+  // virtualizer needs a NUMBER, and rows carry it as an inline height, so a
+  // hardcoded default silently overrode whatever the stylesheet said. Read it
+  // once, after the scroller exists and before paint. Only on mount: this is a
+  // style recalc, and running it per render would pay for one on every scroll
+  // frame. A host that changes density at runtime passes `rowHeight` itself.
+  const [themeRowHeight, setThemeRowHeight] = useState<number | null>(null);
+  useLayoutEffect(() => {
+    if (rowHeightProp !== undefined) return;
+    const scroller = scrollerRef.current;
+    if (scroller === null) return;
+    // Through `ownerDocument`, not the global: the tree may be mounted in
+    // another window (a torn-off panel), and test DOMs do not all put
+    // `getComputedStyle` on globalThis.
+    const view = scroller.ownerDocument?.defaultView;
+    if (!view?.getComputedStyle) return;
+    const raw = view.getComputedStyle(scroller).getPropertyValue('--mille-row-height');
+    const parsed = Number.parseFloat(raw);
+    if (Number.isFinite(parsed) && parsed > 0) setThemeRowHeight(parsed);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const rowHeight = rowHeightProp ?? themeRowHeight ?? DEFAULT_ROW_HEIGHT;
+
   const initialRootIdsRef = useRef<readonly EntryId[]>(
     snapshot.roots().map((root) => root.id),
   );
