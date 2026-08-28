@@ -222,8 +222,17 @@ export class ClientMirrorSnapshot {
     // never fires — deadlock. For unwalked entries, fall back to
     // expandable kinds: real directories AND symlink-to-dir (pnpm /
     // npm workspace links — JetBrains shows these with a chevron).
+    //
+    // An EMPTY child list only means "childless" when the host actually sent
+    // it as one. `orderedChildren` is that provenance mark: an incoming child
+    // list sets it, a locally-rebuilt list clears it. A locally-rebuilt empty
+    // list is a statement about this viewport-bounded mirror, not about the
+    // filesystem, so fall through to the counts rather than hide the chevron.
     const knownChildren = this.state.children.get(id);
-    if (knownChildren !== undefined) {
+    if (
+      knownChildren !== undefined &&
+      (knownChildren.length > 0 || this.state.orderedChildren.has(id))
+    ) {
       return Array.from(knownChildren).some((childId) => {
         const child = this.state.byId.get(childId);
         return (

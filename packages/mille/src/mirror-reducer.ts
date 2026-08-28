@@ -409,7 +409,24 @@ export function applyDelta(
     }
     for (const parentId of parentsToRebuild) {
       const fresh = byParent.get(parentId) ?? [];
-      next.children.set(parentId, fresh);
+      if (fresh.length === 0) {
+        // The mirror is viewport-bounded, so "I hold none of this parent's
+        // children" is NOT the same claim as "this parent has none". The
+        // host announces `childSetChanged` for every parent whose child set
+        // moved but ships a child list only for the parents this session has
+        // EXPANDED (host.ts) — a collapsed folder that gains a child arrives
+        // here as a bare id. Writing `[]` for it would turn an unknown into
+        // an assertion: `hasChildren` reads `children` before it reaches
+        // `directChildCounts`, so the folder loses its chevron, can never be
+        // expanded, never gets `setExpanded`, and never gets walked. Deleting
+        // the key restores "unwalked", which is what the mirror actually
+        // knows, and the fallbacks below it answer correctly. A genuine
+        // emptying still lands: the host ships `directChildCounts[parent] = 0`
+        // alongside the removals.
+        next.children.delete(parentId);
+      } else {
+        next.children.set(parentId, fresh);
+      }
       next.orderedChildren.delete(parentId);
       // Arrival of a parent's children clears its pendingExpansions
       // flag — consumers stop rendering a spinner for it.

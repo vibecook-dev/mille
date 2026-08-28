@@ -256,6 +256,62 @@ test('applyDelta removes entries and purges aliased caches', () => {
   assert.equal(next.volatileSubtrees.has(1), false);
 });
 
+// ─── applyDelta: childSetChanged without a child list ──────────────
+//
+// The mirror is viewport-bounded and the host ships a child LIST only for
+// the parents this session has expanded; every other parent whose child set
+// moved arrives as a bare id in `childSetChanged`. Rebuilding such a parent
+// from the mirror's own `byId` yields `[]` — which is a fact about this
+// mirror, not about the filesystem. Writing it down as an authoritative
+// empty list is what used to strip a collapsed folder's chevron for good:
+// no chevron → no `setExpanded` → no walk → no children, forever.
+
+test('applyDelta leaves a collapsed parent unknown rather than claiming it is empty', () => {
+  const state = createMirror();
+  state.byId.set(1, entry({ id: 1, name: 'root', kind: 1 }));
+  state.byId.set(2, entry({ id: 2, parentId: 1, name: 'a', kind: 1 }));
+  state.children.set(1, [2]);
+  state.orderedChildren.add(1);
+
+  // The host says "a's child set moved" but ships no list for it — `a` is
+  // collapsed in this session, and none of its children are in the mirror.
+  const next = applyDelta(
+    state,
+    emptyDelta({ version: 2, childSetChanged: [2], directChildCounts: { 2: 3 } }),
+  );
+
+  assert.equal(next.children.has(2), false, 'unknown, not empty');
+  assert.equal(next.directChildCounts.get(2), 3, 'the authoritative count still lands');
+});
+
+test('applyDelta keeps a rebuilt non-empty child list', () => {
+  const state = createMirror();
+  state.byId.set(1, entry({ id: 1, name: 'root', kind: 1 }));
+  state.byId.set(2, entry({ id: 2, parentId: 1, name: 'a', kind: 1 }));
+  state.byId.set(3, entry({ id: 3, parentId: 2, name: 'b', kind: 1 }));
+  state.children.set(2, [3]);
+
+  const next = applyDelta(state, emptyDelta({ version: 2, childSetChanged: [2] }));
+
+  assert.deepEqual([...(next.children.get(2) ?? [])], [3]);
+});
+
+test('applyDelta honours an authoritative empty child list', () => {
+  const state = createMirror();
+  state.byId.set(1, entry({ id: 1, name: 'root', kind: 1 }));
+  state.byId.set(2, entry({ id: 2, parentId: 1, name: 'empty-dir', kind: 1 }));
+
+  // An EXPANDED folder the host walked and found empty: the list ships, so
+  // `[]` is a real claim and the mirror must record it.
+  const next = applyDelta(
+    state,
+    emptyDelta({ version: 2, childSetChanged: [2], childLists: { 2: [] } }),
+  );
+
+  assert.deepEqual([...(next.children.get(2) ?? ['unset'])], []);
+  assert.equal(next.orderedChildren.has(2), true);
+});
+
 // ─── applyDelta: directChildCounts ─────────────────────────────────
 
 test('applyDelta merges new directChildCounts keys', () => {
