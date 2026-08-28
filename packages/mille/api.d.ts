@@ -265,7 +265,6 @@ export interface ResolvedExplorerSettings {
   readonly showIgnoredFiles: boolean;
   /** Whether single-directory chains are projected as compact rows. */
   readonly compactFolders: boolean;
-  readonly compactFolders: boolean;
   readonly excludeGlobs: readonly string[];
   /**
    * Parent pattern → exact companion-name templates. Parent patterns accept
