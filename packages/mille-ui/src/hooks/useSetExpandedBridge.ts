@@ -27,13 +27,19 @@ export function useSetExpandedBridge(
 ): { readonly isPending: boolean } {
   const [isPending, startTransitionImpl] = useTransition();
   const prevRef = useRef<ReadonlySet<EntryId>>(expanded);
+  const prevFxRef = useRef<SetExpandedFx | null>(null);
   // Seed the ref on first mount so the initial expansion set is pushed
   // to the engine exactly once. Subsequent diffs run against prevRef.
   const initialisedRef = useRef(false);
 
   useEffect(() => {
-    const prev = initialisedRef.current ? prevRef.current : new Set<EntryId>();
+    // `setExpanded` is engine-local. Replacing the engine must replay the
+    // complete current set even when both engines use identical numeric ids.
+    const engineChanged = prevFxRef.current !== fx;
+    const prev =
+      initialisedRef.current && !engineChanged ? prevRef.current : new Set<EntryId>();
     initialisedRef.current = true;
+    prevFxRef.current = fx;
 
     const add: EntryId[] = [];
     const remove: EntryId[] = [];

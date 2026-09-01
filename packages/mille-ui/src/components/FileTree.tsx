@@ -145,7 +145,31 @@ type FileTreeInnerProps = Omit<FileTreeProps, 'fx'> & {
   readonly forwardedRef?: ForwardedRef<FileTreeRef>;
 };
 
+// Every FileExplorer object owns a distinct EntryId namespace and a distinct
+// stream of version counters. Keying the stateful tree below by that identity
+// makes replacing `fx` a synchronous session boundary: uncontrolled focus,
+// selection, expansion, navigation, rename, clipboard, drag, scroll, and
+// projection caches can never leak into a new engine that happens to reuse
+// the same numeric ids. Updating roots on the SAME engine keeps the key and
+// therefore retains Mille's documented same-engine state semantics.
+const engineSessionKeys = new WeakMap<object, number>();
+let nextEngineSessionKey = 1;
+
+function engineSessionKey(fx: object): number {
+  const existing = engineSessionKeys.get(fx);
+  if (existing !== undefined) return existing;
+  const key = nextEngineSessionKey;
+  nextEngineSessionKey += 1;
+  engineSessionKeys.set(fx, key);
+  return key;
+}
+
 function FileTreeInner(props: FileTreeInnerProps): ReactElement {
+  const { fx } = useFileTreeContext();
+  return <FileTreeEngineSession key={engineSessionKey(fx)} {...props} />;
+}
+
+function FileTreeEngineSession(props: FileTreeInnerProps): ReactElement {
   const {
     rowHeight: rowHeightProp,
     overscan = 20,
@@ -354,6 +378,7 @@ function FileTreeInner(props: FileTreeInnerProps): ReactElement {
     snapshot,
     expanded,
     projectionCacheRef.current,
+    fx,
   );
   useLayoutEffect(() => {
     projectionCacheRef.current = projection;

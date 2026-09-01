@@ -40,6 +40,19 @@ test('decoration-only snapshots reuse the windowed structural projection', () =>
   assert.deepEqual(counters, { count: 1, rows: 0, maxLimit: 0 });
 });
 
+test('equal versions from a different engine source never reuse a projection', () => {
+  const counters = { count: 0, rows: 0, maxLimit: 0 };
+  const expanded = new Set([1]);
+  const sourceA = {};
+  const sourceB = {};
+  const first = readTreeProjection(makeSnapshot(7, counters), expanded, null, sourceA);
+  const second = readTreeProjection(makeSnapshot(7, counters), expanded, first, sourceB);
+
+  assert.notEqual(second, first);
+  assert.equal(second.source, sourceB);
+  assert.deepEqual(counters, { count: 2, rows: 0, maxLimit: 0 });
+});
+
 test('tree-version and expansion changes refresh counts without reading rows', () => {
   const counters = { count: 0, rows: 0, maxLimit: 0 };
   const expanded = new Set([1]);

@@ -65,6 +65,7 @@ const { createRoot } = await import('react-dom/client');
 const { FileTree, FileTreeProvider } = await import('../dist/index.js');
 const { createCommandRegistry } = await import('../dist/commands.js');
 const { createFakeEngine, createFakeSnapshot } = await import('../dist/testing.js');
+const { useSetExpandedBridge } = await import('../dist/hooks/useSetExpandedBridge.js');
 
 // ─── Helpers ──────────────────────────────────────────────────────────
 
@@ -258,6 +259,121 @@ test('root expands by default and renders children when the engine publishes the
   );
 
   await act(async () => { root.unmount(); });
+  container.remove();
+});
+
+for (const composition of ['standalone', 'provider']) {
+  test(`${composition} FileTree starts a fresh UI session when fx identity changes`, async () => {
+    const fxA = createFakeEngine();
+    const fxB = createFakeEngine();
+    fxA.emitDelta(
+      createFakeSnapshot({
+        treeVersion: 1,
+        rows: [
+          makeRow({
+            id: 1,
+            parentId: null,
+            name: 'engine-a',
+            depth: 0,
+            hasChildren: true,
+            isExpanded: false,
+          }),
+          makeRow({ id: 2, parentId: 1, name: 'a-child', depth: 1, kind: 0 }),
+        ],
+      }),
+    );
+    fxB.emitDelta(
+      createFakeSnapshot({
+        treeVersion: 1,
+        rows: [
+          makeRow({
+            id: 1,
+            parentId: null,
+            name: 'engine-b',
+            depth: 0,
+            hasChildren: true,
+            isExpanded: false,
+          }),
+          makeRow({ id: 2, parentId: 1, name: 'b-child', depth: 1, kind: 0 }),
+        ],
+      }),
+    );
+
+    const { container, root } = mount();
+    const obs = makeObservers();
+    const tree = (fx) => {
+      const child = createElement(FileTree, {
+        ...(composition === 'standalone' ? { fx } : {}),
+        ariaLabel: 'Engine identity',
+        rowHeight: 22,
+        overscan: 5,
+        __testObserveElementRect: obs.observeElementRect,
+        __testObserveElementOffset: obs.observeElementOffset,
+      });
+      return composition === 'provider'
+        ? createElement(FileTreeProvider, { fx }, child)
+        : child;
+    };
+
+    await act(async () => {
+      root.render(tree(fxA));
+    });
+    assert.match(container.textContent, /engine-a/);
+    assert.ok(fxA.calls.setExpanded.some((call) => call.add.includes(1)));
+    const engineARoot = container.querySelector('[data-mille-row-id="1"]');
+    assert.ok(engineARoot);
+    await act(async () => {
+      dispatchClick(engineARoot);
+    });
+    assert.equal(engineARoot.getAttribute('aria-selected'), 'true');
+
+    await act(async () => {
+      root.render(tree(fxB));
+    });
+
+    assert.match(container.textContent, /engine-b/);
+    assert.doesNotMatch(container.textContent, /engine-a/);
+    assert.equal(
+      container.querySelector('[data-mille-row-id="1"]')?.getAttribute('aria-selected'),
+      'false',
+      'uncontrolled selection from the prior EntryId namespace must reset',
+    );
+    assert.equal(
+      fxB.calls.setExpanded.filter((call) => call.add.includes(1)).length,
+      1,
+      'the root expansion must be replayed exactly once to the new engine',
+    );
+
+    await act(async () => {
+      root.unmount();
+    });
+    container.remove();
+  });
+}
+
+test('expansion bridge replays equal ids when its engine changes', async () => {
+  const fxA = createFakeEngine();
+  const fxB = createFakeEngine();
+  const expanded = new Set([1]);
+  const Bridge = ({ fx }) => {
+    useSetExpandedBridge(fx, expanded);
+    return null;
+  };
+  const { container, root } = mount();
+
+  await act(async () => {
+    root.render(createElement(Bridge, { fx: fxA }));
+  });
+  await act(async () => {
+    root.render(createElement(Bridge, { fx: fxB }));
+  });
+
+  assert.equal(fxA.calls.setExpanded.filter((call) => call.add.includes(1)).length, 1);
+  assert.equal(fxB.calls.setExpanded.filter((call) => call.add.includes(1)).length, 1);
+
+  await act(async () => {
+    root.unmount();
+  });
   container.remove();
 });
 

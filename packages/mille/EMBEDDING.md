@@ -1020,6 +1020,14 @@ Port calls resolve only after every attached mirror receives the membership
 change. Watch registrations, exclude matching, and later path resolution all
 use the replacement list.
 
+`FileTree` treats the `FileExplorer` object as the identity boundary for all
+uncontrolled UI state. Replacing `fx` starts a fresh tree session even when the
+new engine reuses entry IDs or version numbers; expansion, selection, focus,
+navigation, rename, clipboard, drag, scroll, and structural caches reset. In
+contrast, calling `updateWorkspaceRoots()` on the same `fx` retains state for
+the entry IDs the engine retains, as described above. Controlled props remain
+owned by the caller and should be re-scoped when their engine changes.
+
 Configured roots that disappear or become unreadable remain in the tree with
 their original ID and `EntryKind.Unavailable`; known descendants are removed
 so stale files cannot be opened. Re-stat roots without walking their contents:
