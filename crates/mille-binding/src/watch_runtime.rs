@@ -504,6 +504,32 @@ pub(crate) fn reconcile_directory(
         }
     }
 
+    // Publish listing completion independently of child insertion. An empty
+    // directory produces no child records, and a previously URI-hydrated
+    // directory may already contain only a partial chain. Without an explicit
+    // completion marker both cases remain indistinguishable from "loading".
+    let completed_ids: Vec<EntryId> = walked
+        .iter()
+        .filter(|entry| {
+            let directory_like =
+                entry.kind == EntryKind::Directory || entry.symlink_target_is_dir == Some(true);
+            let listing_covered = entry.kind == EntryKind::Directory
+                || (entry.path == directory && entry.symlink_target_is_dir == Some(true));
+            let below_frontier = depth.is_none_or(|limit| (entry.depth as usize) < limit);
+            let traversal_complete = entry.path == directory
+                || (!repository_ignore
+                    .as_ref()
+                    .is_some_and(|matcher| matcher.is_ignored(&entry.path, directory_like))
+                    && !excludes
+                        .as_ref()
+                        .is_some_and(|matcher| matcher.is_ignored(&entry.path, directory_like)));
+            listing_covered && below_frontier && traversal_complete
+        })
+        .filter_map(|entry| store.get_by_path(&entry.path).map(|stored| stored.id))
+        .collect();
+    let newly_loaded = store.mark_directories_children_loaded(&completed_ids)?;
+    out.child_set_changed.extend(newly_loaded);
+
     Ok(out)
 }
 

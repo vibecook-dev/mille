@@ -252,24 +252,21 @@ class FileExplorerHostImpl implements FileExplorerHost {
   private ackRequestedForNextTick = false;
   private nextSessionId = 1;
   private disposed = false;
-  /**
-   * Phase B2 — ids the host has already triggered a prefetch for. Guards
-   * against re-firing a walk when a client re-expands the same folder
-   * across sessions or after a collapse/re-expand cycle. The native
-   * `populateFromPath` is already idempotent (snapshot-filter), but
-   * skipping the call entirely also saves the NAPI hop. Keyed by id;
-   * never pruned — prefetch is a one-shot per id per host lifetime.
-   */
-  private readonly prefetched: Set<number> = new Set();
+  /** Directory listings currently in flight. Completion is held by the
+   * native snapshot, not this transient set, so empty folders and failures
+   * have truthful retry semantics. */
+  private readonly prefetchInFlight: Set<number> = new Set();
   /** Phase B2 — initial-walk policy. See ExplorerOptions.initialWalk. */
   private readonly initialWalk: 'full' | 'roots-only' | 'none';
-  /**
-   * Phase B2 — has the initial walk (roots-only seeding) run yet? The
-   * first `attachPort` triggers it so sessions can attach and handshake
-   * before any filesystem work. Subsequent attaches skip the walk but
-   * still ship whatever the store holds.
-   */
-  private initialWalkDone = false;
+  /** Background root metadata refresh is started once, after first attach. */
+  private rootRefreshStarted = false;
+  /** Shared watcher-registration task. Null allows a later attach to retry a
+   * failed registration without blocking root display or expansion. */
+  private watchStartPromise: Promise<void> | null = null;
+  private watchReady = false;
+  /** Folders expanded before watch registration. They are reconciled once the
+   * registration boundary is known, closing the seed/watch startup gap. */
+  private readonly watchGapExpansions = new Set<number>();
   /** setInterval handle for the fan-out tick. Null when idle. */
   private tickHandle: ReturnType<typeof setInterval> | null = null;
   /**
@@ -311,13 +308,18 @@ class FileExplorerHostImpl implements FileExplorerHost {
   constructor(options: ExplorerOptions) {
     this.explorer = new FileExplorer(options);
     this.initialWalk = options.initialWalk ?? 'full';
+    if (this.initialWalk === 'roots-only') {
+      // Pure in-memory publication: the first handshake always contains the
+      // configured roots, even when stat/read_dir or watcher registration is
+      // slow (network volumes, huge repositories, unavailable roots).
+      this.explorer.seedWorkspaceRoots();
+    }
     this.watcherEventSub = this.explorer.on('event', (raw) => {
       const event = raw as { kind?: string; id?: number } | undefined;
       if (event?.kind !== 'overflow' || typeof event.id !== 'number') return;
       // The native watcher has already reconciled this subtree before it
       // emits overflow. Force the next delta to replace the mirror's child
-      // list and allow a later expansion to prefetch again if needed.
-      this.prefetched.delete(event.id);
+      // list; native listing-completion state remains authoritative.
       this.markSubtreeCoarse(event.id);
     });
     // Forward warnings to attached renderers. Operation-scoped warnings go
@@ -479,70 +481,63 @@ class FileExplorerHostImpl implements FileExplorerHost {
     this.sessions.set(id, session);
     this.ensureTick();
 
-    // Phase B2 — kick off the configured initial walk on first attach.
-    // Done non-blocking so handshake can fire immediately; `roots-only`
-    // drops root Entry records into the store within one NAPI hop, and
-    // the next tick's delta fan-out ships `roots` to every attached
-    // session. Errors surface as warnings (not fatal — an unreachable
-    // root is the user's concern, not the host's).
-    this.ensureInitialWalk();
+    this.ensureBackgroundServices();
 
     return { dispose: () => this.detachSession(id) };
   }
 
-  /**
-   * Phase B2 — run the configured initial walk exactly once, lazily, at
-   * the first `attachPort`. `'full'` is a no-op here (the consumer is
-   * expected to drive `populateFromRoots` themselves — back-compat with
-   * v0.1). `'roots-only'` walks each configured root at depth 0 so root
-   * Entry records exist in the store before the client asks to expand.
-   * `'none'` is a no-op (consumer handles hydration end-to-end).
-   */
-  private ensureInitialWalk(): void {
-    if (this.initialWalkDone) return;
-    this.initialWalkDone = true;
-    if (this.initialWalk === 'full' || this.initialWalk === 'none') return;
-    // roots-only — walk each configured root at depth 0. The native
-    // `populateFromPath` with depth=0 + includeRoot=true seeds only the
-    // root Entry; children arrive when a client expands the root.
-    void this.doRootsOnlyWalk();
+  /** Start filesystem-dependent services after the synchronous root contract
+   * is already satisfied. Neither task is on the handshake/expansion path. */
+  private ensureBackgroundServices(): void {
+    if (this.initialWalk === 'roots-only' && !this.rootRefreshStarted) {
+      this.rootRefreshStarted = true;
+      void this.explorer.refreshWorkspaceRoots().catch((error) => {
+        this.rootRefreshStarted = false;
+        // eslint-disable-next-line no-console
+        console.warn('[mille] workspace-root metadata refresh failed:', error);
+      });
+    }
+    this.ensureWatching();
   }
 
-  private async doRootsOnlyWalk(): Promise<void> {
-    // Reach into the Rust-configured roots via the raw native binding.
-    // The TS-side `FileExplorer` doesn't expose them separately; we use
-    // the wrapper's internal knowledge of the configured root paths.
-    // Rather than reconstruct them, we defer to the typed wrapper:
-    // `FileExplorer` accepts `Uri | string` roots and stores them on
-    // `this.rootPaths` (B2 addition). The public surface is
-    // `populateFromRoots` at full depth, but for roots-only we call
-    // the native `populateFromPath` per root at depth 0.
-    const rootsInternal = (this.explorer as unknown as { rootPaths?: readonly string[] }).rootPaths;
-    if (!rootsInternal || rootsInternal.length === 0) return;
-    const nativeFx = (
-      this.explorer as unknown as {
-        nativeFx?: {
-          populateFromPath?: (p: string, d?: number | null, r?: boolean | null) => Promise<number>;
-        };
-      }
-    ).nativeFx;
-    if (!nativeFx || typeof nativeFx.populateFromPath !== 'function') {
-      // Older native builds. Silently fall back to nothing; the
-      // playground's setExpanded-triggered prefetch still fills the
-      // root's children on first expansion.
-      return;
-    }
-    for (const rootPath of rootsInternal) {
-      try {
-        // Invoke as a method on nativeFx so napi-rs preserves the
-        // receiver — destructuring the method ref and calling it
-        // bare drops `this` and throws TypeError: Illegal invocation.
-        await nativeFx.populateFromPath(rootPath, 0, true);
-      } catch (e) {
+  private ensureWatching(): void {
+    if (this.watchReady || this.watchStartPromise !== null || this.disposed) return;
+    this.watchStartPromise = this.explorer
+      .startWatching()
+      .then(async () => {
+        if (this.disposed) return;
+        // Registration is now active. Anything after this point is covered by
+        // the watcher; anything expanded before it is in the gap set.
+        this.watchReady = true;
+        const gapIds = new Set(this.watchGapExpansions);
+        this.watchGapExpansions.clear();
+        for (const session of this.sessions.values()) {
+          for (const id of session.expanded) gapIds.add(id);
+        }
+        for (const id of gapIds) {
+          if (this.disposed) return;
+          const snapshot = this.explorer.getSnapshot();
+          if (snapshot.getById(id) === null) continue;
+          try {
+            // Always reconcile known gap entries, even if their first prefetch
+            // is still running. The native policy gate serializes the two: a
+            // walk that read before watch registration cannot publish stale
+            // state after this post-registration pass.
+            await this.explorer.resync(id);
+          } catch (error) {
+            // Entry may have disappeared while registration completed. The
+            // live watcher owns subsequent state, so keep startup resilient.
+            // eslint-disable-next-line no-console
+            console.warn(`[mille] post-watch reconcile failed for id ${id}:`, error);
+          }
+        }
+      })
+      .catch((error) => {
+        // Keep the tree usable and permit a later attach to retry watching.
+        this.watchStartPromise = null;
         // eslint-disable-next-line no-console
-        console.warn(`[mille] initialWalk: roots-only walk failed for ${rootPath}:`, e);
-      }
-    }
+        console.warn('[mille] filesystem watcher failed to start:', error);
+      });
   }
 
   /** Start the 16ms fan-out tick if it isn't already running. */
@@ -717,7 +712,13 @@ class FileExplorerHostImpl implements FileExplorerHost {
         } else if (session.expanded.has(parentId)) {
           // An expanded nesting parent that just lost its final projected
           // child must actively clear the mirror's previous non-zero count.
-          outDirectChildCounts[String(parentId)] = 0;
+          // Do not apply this fallback to filesystem directories: `null`
+          // there means a listing is still partial, and publishing zero would
+          // falsely turn "loading" into "loaded empty" on the client.
+          const parent = snap.getById(parentId);
+          if (parent !== null && parent.kind !== 1 && parent.symlinkTargetIsDir !== true) {
+            outDirectChildCounts[String(parentId)] = 0;
+          }
         }
         if (!session.expanded.has(parentId)) continue;
         const kids = sortedChildIds(snap, parentId);
@@ -980,7 +981,10 @@ class FileExplorerHostImpl implements FileExplorerHost {
   }
 
   private handleSetExpanded(session: Session, body: { add?: number[]; remove?: number[] }): void {
-    for (const id of body.add ?? []) session.expanded.add(id);
+    for (const id of body.add ?? []) {
+      session.expanded.add(id);
+      if (!this.watchReady) this.watchGapExpansions.add(id);
+    }
     for (const id of body.remove ?? []) session.expanded.delete(id);
 
     // Headless clients may expand before publishing a viewport. Give that
@@ -996,52 +1000,33 @@ class FileExplorerHostImpl implements FileExplorerHost {
     // viewport-patch contract during normal delta fan-out.
     const snap = this.explorer.getSnapshot();
 
-    // Phase B2 — auto-walk newly-expanded folders whose children aren't
-    // in the store yet. Fires a depth-1 prefetch per id; delibrately
-    // does NOT await — the walker publishes children via the ChangeSet
+    // Auto-reconcile newly-expanded folders whose children aren't loaded.
+    // This is an authoritative depth-1 disk read, deliberately not awaited:
+    // the reconciler publishes children via the ChangeSet
     // and the next tick's delta fan-out delivers them. We still ship
     // whatever's already in the snapshot below so the reply isn't empty
     // in the (common) case where the folder was already walked.
     //
-    // Guard with `prefetched` to skip repeat walks and with `hasChildren`
-    // so known-leaf folders don't trigger a pointless NAPI round-trip.
+    // Completion lives in the immutable native snapshot. The transient
+    // in-flight set only deduplicates concurrent sessions; failures are
+    // retryable and a loaded empty directory is a definitive result.
     for (const id of body.add ?? []) {
-      if (this.prefetched.has(id)) continue;
+      if (snap.directoryChildrenLoaded(id) || this.prefetchInFlight.has(id)) continue;
       const expandable = snap.getById(id);
-      if (expandable !== null && expandable.kind !== 1 && expandable.symlinkTargetIsDir !== true) {
+      // Stale/forged ids can race removal or arrive from an untrusted port.
+      // They have no path to hydrate and must remain a bounded no-op.
+      if (expandable === null) continue;
+      if (expandable.kind !== 1 && expandable.symlinkTargetIsDir !== true) {
         // Nested files are virtual containers whose child records already
         // reside in their real parent directory; never attempt a filesystem
         // walk "inside" the file.
-        this.prefetched.add(id);
         continue;
       }
-      // "Has children in the store" only means "was walked" when something
-      // guarantees the store was walked whole — `initialWalk: 'full'` does.
-      // Under lazy expansion it does not: `getByUri` hydrates one ancestor
-      // chain at a time (the SCM companion resolves every dirty path that
-      // way), so a folder can hold exactly the one child that happened to be
-      // on such a chain. Skipping the walk there freezes the folder at that
-      // subset — expand `packages` and you get the one dirty package, not the
-      // five that are there. One depth-1 walk per folder per session is the
-      // price of a correct child list; `prefetched` still makes it once.
-      const kids = snap.childrenOf(id);
-      if (kids.length > 0 && this.initialWalk === 'full') {
-        // Already walked; mark as covered to skip future expansions too.
-        this.prefetched.add(id);
-        continue;
-      }
-      // Check hasChildren — if the snapshot says this is a known leaf,
-      // there's nothing to walk. The store returns `true` when the
-      // directory has cached children; when the folder hasn't been
-      // walked at all, it returns `false` (can't distinguish
-      // "unknown-but-maybe-has-children" from "genuine leaf" without
-      // doing the walk). Fire the walk regardless for now — depth-1
-      // walks of empty / leaf folders are cheap.
-      this.prefetched.add(id);
+      this.prefetchInFlight.add(id);
       try {
         const prefetch = snap.compactFolders
           ? this.prefetchCompactChain(id)
-          : this.explorer.prefetch(id, { depth: 1 });
+          : this.explorer.resync(id).then(() => undefined);
         void prefetch
           .then(async () => {
             // The first depth-1 result may have published the raw chain head.
@@ -1055,14 +1040,17 @@ class FileExplorerHostImpl implements FileExplorerHost {
           })
           .catch((e) => {
             // eslint-disable-next-line no-console
-            console.warn(`[mille] setExpanded prefetch failed for id ${id}:`, e);
+            console.warn(`[mille] setExpanded reconcile failed for id ${id}:`, e);
+          })
+          .finally(() => {
+            this.prefetchInFlight.delete(id);
           });
       } catch (e) {
-        // Synchronous throw (older native missing populateFromPath).
-        // Fall back to the v0.1 behaviour — ship whatever's already in
-        // the snapshot — and log once.
+        this.prefetchInFlight.delete(id);
+        // A synchronous binding failure still leaves the current snapshot
+        // usable. Completion remains false, so a later expansion can retry.
         // eslint-disable-next-line no-console
-        console.warn(`[mille] setExpanded: prefetch not available for id ${id}; carrying on:`, e);
+        console.warn(`[mille] setExpanded: directory reconcile failed for id ${id}:`, e);
       }
     }
 
@@ -1114,7 +1102,7 @@ class FileExplorerHostImpl implements FileExplorerHost {
   private async prefetchCompactChain(parentId: number): Promise<void> {
     let current = parentId;
     for (let depth = 0; depth < 256; depth++) {
-      await this.explorer.prefetch(current, { depth: 1 });
+      await this.explorer.resync(current);
       const snapshot = this.explorer.getSnapshot();
       const children = snapshot.projectedChildrenOf(current);
       if (children.length !== 1) return;
@@ -1662,7 +1650,7 @@ class FileExplorerHostImpl implements FileExplorerHost {
             ? (requested.parentId ?? id)
             : id;
         const version = await this.explorer.resync(id, { recursive });
-        this.prefetched.delete(markerId);
+        this.prefetchInFlight.delete(markerId);
         this.markSubtreeResynced(markerId);
         await this.flushTickAcked();
         return version;
@@ -1674,7 +1662,7 @@ class FileExplorerHostImpl implements FileExplorerHost {
           .map((root) => root.id);
         const version = await this.explorer.resyncWorkspace();
         for (const rootId of rootIds) {
-          this.prefetched.delete(rootId);
+          this.prefetchInFlight.delete(rootId);
           this.markSubtreeResynced(rootId);
         }
         await this.flushTickAcked();

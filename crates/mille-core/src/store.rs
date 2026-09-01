@@ -113,6 +113,66 @@ impl EntryStore {
             .map(|path| path.value().to_path_buf())
     }
 
+    /// Publish that an authoritative direct-child listing completed for a
+    /// directory, including the important zero-child case.
+    ///
+    /// Child records and listing completeness are separate facts: resolving a
+    /// URI may insert one partial ancestor chain, while listing an empty
+    /// directory inserts no records at all. This marker lets snapshots expose
+    /// `unknown` versus `loaded empty` without guessing from map membership.
+    pub fn mark_directory_children_loaded(&self, id: EntryId) -> Result<bool, FxError> {
+        Ok(!self.mark_directories_children_loaded(&[id])?.is_empty())
+    }
+
+    /// Batch form of `mark_directory_children_loaded`. One bounded/full walk
+    /// can complete thousands of directories, so publishing them in a single
+    /// immutable snapshot avoids an O(n²) clone cascade.
+    pub fn mark_directories_children_loaded(
+        &self,
+        ids: &[EntryId],
+    ) -> Result<Vec<EntryId>, FxError> {
+        let _guard = self.write_lock.lock();
+        let current = self.inner.load_full();
+        let mut newly_loaded = Vec::new();
+        let mut seen = HashSet::with_capacity(ids.len());
+        for &id in ids {
+            let entry = current
+                .entries
+                .get(&id)
+                .ok_or_else(|| FxError::InvalidInput(format!("entry {:?} not found", id)))?;
+            if entry.kind != EntryKind::Directory && entry.symlink_target_is_dir != Some(true) {
+                return Err(FxError::InvalidInput(format!(
+                    "entry {:?} is not a directory",
+                    id
+                )));
+            }
+            if !current.loaded_directories.contains(&id) && seen.insert(id) {
+                newly_loaded.push(id);
+            }
+        }
+        if newly_loaded.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut next = (*current).clone();
+        for &id in &newly_loaded {
+            next.loaded_directories.insert(id);
+            let count = next.children.get(&id).map_or(0, |children| children.len());
+            next.direct_child_counts
+                .insert(id, count.min(u32::MAX as usize) as u32);
+        }
+        let prev_tree_version = next.tree_version;
+        next.tree_version += 1;
+        let new_tree_version = next.tree_version;
+        self.inner.store(Arc::new(next));
+        self.record_mutation(prev_tree_version, new_tree_version, |changes| {
+            changes
+                .child_set_changed
+                .extend(newly_loaded.iter().copied());
+        });
+        Ok(newly_loaded)
+    }
+
     /// Atomically replace the display order of the current workspace roots.
     ///
     /// `roots` must be an exact permutation of the published root ids. Root
@@ -254,6 +314,7 @@ impl EntryStore {
         for id in &removed_ids {
             next.entries.remove(id);
             next.children.remove(id);
+            next.loaded_directories.remove(id);
             next.direct_child_counts.remove(id);
             next.descendant_visible_counts.remove(id);
             next.descendant_total_sizes.remove(id);
@@ -343,12 +404,14 @@ impl EntryStore {
         for id in &removed_ids {
             next.entries.remove(id);
             next.children.remove(id);
+            next.loaded_directories.remove(id);
             next.direct_child_counts.remove(id);
             next.descendant_visible_counts.remove(id);
             next.descendant_total_sizes.remove(id);
         }
         next.entries.insert(root_id, Arc::new(unavailable.clone()));
         next.children.remove(&root_id);
+        next.loaded_directories.remove(&root_id);
         next.direct_child_counts.insert(root_id, 0);
         next.descendant_visible_counts
             .insert(root_id, visibility.includes(&unavailable) as u32);
@@ -599,6 +662,7 @@ impl EntryStore {
         let parent_for_walk = existing.parent_id;
 
         next.entries.remove(&id)?;
+        next.loaded_directories.remove(&id);
         next.descendant_visible_counts.remove(&id);
         next.descendant_total_sizes.remove(&id);
 
@@ -716,6 +780,7 @@ impl EntryStore {
         for entry_id in &ids {
             next.entries.remove(entry_id);
             next.children.remove(entry_id);
+            next.loaded_directories.remove(entry_id);
             next.direct_child_counts.remove(entry_id);
             next.descendant_visible_counts.remove(entry_id);
             next.descendant_total_sizes.remove(entry_id);
@@ -1398,6 +1463,34 @@ mod tests {
         // Lazy-expand contract: unvisited directories report has_children so
         // the UI shows a chevron and setExpanded can fire a depth-1 walk.
         assert!(snap.has_children(root));
+    }
+
+    #[test]
+    fn directory_listing_completion_distinguishes_unknown_partial_and_empty() {
+        let s = EntryStore::new();
+        let root = s.insert("/r".into(), dir("r", None)).unwrap();
+
+        // Resolving one path can hydrate a partial child chain. It must not
+        // claim that the directory's complete child count is known.
+        s.insert("/r/known".into(), leaf("known", Some(root)))
+            .unwrap();
+        let partial = s.snapshot();
+        assert!(!partial.directory_children_loaded(root));
+        assert_eq!(partial.projected_child_count(root, false), None);
+        assert!(partial.has_children(root));
+
+        assert!(s.mark_directory_children_loaded(root).unwrap());
+        let complete = s.snapshot();
+        assert!(complete.directory_children_loaded(root));
+        assert_eq!(complete.projected_child_count(root, false), Some(1));
+        assert!(!s.mark_directory_children_loaded(root).unwrap());
+
+        let empty = s.insert("/empty".into(), dir("empty", None)).unwrap();
+        assert!(s.mark_directory_children_loaded(empty).unwrap());
+        let complete_empty = s.snapshot();
+        assert!(complete_empty.directory_children_loaded(empty));
+        assert_eq!(complete_empty.projected_child_count(empty, false), Some(0));
+        assert!(!complete_empty.has_children(empty));
     }
 
     #[test]

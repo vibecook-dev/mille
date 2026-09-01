@@ -68,12 +68,12 @@ test('initialWalk=roots-only seeds root; setExpanded triggers child walk via del
       initialWalk: 'roots-only',
     });
 
-    // Before any attach, the store is empty — roots-only walk is
-    // deferred until the first attachPort (lazy init).
+    // Root identity is published synchronously, before any filesystem I/O or
+    // client handshake. Descendants remain lazy.
     assert.equal(
       host.local.getSnapshot().roots().length,
-      0,
-      'pre-attach: host store has no roots yet',
+      1,
+      'pre-attach: configured root is already visible',
     );
 
     const { port1, port2 } = new MessageChannel();
@@ -87,17 +87,15 @@ test('initialWalk=roots-only seeds root; setExpanded triggers child walk via del
 
     const client = await connectFileExplorer(port2);
 
-    // The root may arrive via the initial snapshot OR via the first
-    // delta after handshake, depending on whether the async roots-only
-    // walk finished before `handleHandshake` fires. Both are correct;
-    // we only care that the root shows up within a bounded time.
+    // The root is part of the initial snapshot; it must never depend on a
+    // later delta or watcher startup.
     const rootId = await waitFor(() => {
       const roots = client.getSnapshot().roots();
       return roots.length === 1 ? roots[0].id : null;
     });
 
     const rootsAfter = client.getSnapshot().roots();
-    assert.equal(rootsAfter.length, 1, 'client learned one root via delta');
+    assert.equal(rootsAfter.length, 1, 'client received one root at handshake');
     assert.equal(rootsAfter[0].id, rootId, 'root id matches');
 
     // Critical: the root should be visible, but its CHILDREN should
@@ -175,11 +173,54 @@ test('initialWalk=roots-only seeds root; setExpanded triggers child walk via del
   }
 });
 
+test('empty directory expansion publishes loaded-empty completion without a second toggle', async () => {
+  const dir = tempRoot();
+  try {
+    const host = await createFileExplorerHost({
+      roots: [dir],
+      initialWalk: 'roots-only',
+    });
+    const rootBeforeAttach = host.local.getSnapshot().roots()[0];
+    assert.ok(rootBeforeAttach, 'root seeded synchronously');
+    assert.equal(
+      host.local.getSnapshot().directoryChildrenLoaded(rootBeforeAttach.id),
+      false,
+      'placeholder root is pending before expansion',
+    );
+
+    const { port1, port2 } = new MessageChannel();
+    host.attachPort(port1);
+    const client = await connectFileExplorer(port2);
+    const rootId = client.getSnapshot().roots()[0]?.id;
+    assert.equal(rootId, rootBeforeAttach.id, 'handshake preserves seeded identity');
+
+    client.setExpanded({ add: [rootId] });
+    await waitFor(() => client.getSnapshot().directChildCount(rootId) === 0);
+
+    assert.equal(
+      host.local.getSnapshot().directoryChildrenLoaded(rootId),
+      true,
+      'one expansion completed the directory listing',
+    );
+    assert.equal(
+      client.getSnapshot().directoryChildrenLoaded(rootId),
+      true,
+      'loaded-empty completion reached the client mirror',
+    );
+    assert.equal(client.getSnapshot().hasChildren(rootId), false, 'loaded empty is a leaf');
+
+    await client.dispose();
+    await host.dispose();
+  } finally {
+    removeTempDir(dir);
+  }
+});
+
 test('re-expanding an already-walked folder does not re-trigger a walk', async () => {
-  // Guard against accidental re-walks: the host keeps a `prefetched`
-  // Set so `setExpanded({add:[id]})` after a prior walk is a no-op on
-  // the native side. We observe this by checking that no additional
-  // child-carrying deltas fan out on the second expand.
+  // Guard against accidental re-walks: authoritative native listing state
+  // makes `setExpanded({add:[id]})` after completion a no-op on the native
+  // side. We observe this by checking that no additional child-carrying
+  // deltas fan out on the second expand.
   const dir = tempRoot();
   try {
     mkdirSync(join(dir, 'a'));
@@ -340,7 +381,24 @@ test('expanding a folder that lazy hydration touched still walks its whole child
       'hydration left `packages` holding exactly the chain child',
     );
 
+    // A partial child list may be rendered immediately, but it must remain
+    // explicitly pending until the authoritative directory read completes.
+    const expansionFrames = [];
+    port2.on('message', (raw) => {
+      if (raw && raw.type === 'delta') expansionFrames.push(raw.body);
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expansionFrames.length = 0;
     client.setExpanded({ add: [packagesId] });
+    const provisional = await waitFor(() =>
+      expansionFrames.find((body) => body.childSetChanged?.includes(packagesId)),
+    );
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(provisional.directChildCounts, String(packagesId)),
+      false,
+      'provisional children do not claim listing completion',
+    );
+
     const names = await waitFor(() => {
       const hostSnap = host.local.getSnapshot();
       const kids = hostSnap
@@ -352,6 +410,7 @@ test('expanding a folder that lazy hydration touched still walks its whole child
     assert.ok(names.has('design-kit'), 'expand keeps the hydrated child');
     assert.ok(names.has('shell-ui'), 'expand adds the sibling hydration never saw');
     assert.ok(names.has('fieldd'), 'expand adds every sibling, not just the first');
+    await waitFor(() => client.getSnapshot().directoryChildrenLoaded(packagesId));
 
     await client.dispose();
     await host.dispose();

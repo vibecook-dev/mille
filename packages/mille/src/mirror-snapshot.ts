@@ -210,6 +210,11 @@ export class ClientMirrorSnapshot {
     return v ?? null;
   }
 
+  /** Whether the host has published an authoritative direct-child result. */
+  directoryChildrenLoaded(id: EntryId): boolean {
+    return this.state.directChildCounts.has(id);
+  }
+
   hasChildren(id: EntryId): boolean {
     return this.hasChildrenForProjection(id, false);
   }

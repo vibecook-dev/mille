@@ -70,33 +70,21 @@ impl Default for WatcherOptions {
 /// watched-roots bookkeeping and shutdown path.
 enum NotifyBackend {
     Raw(RecommendedWatcher),
-    Debounced(
-        notify_debouncer_full::Debouncer<RecommendedWatcher, notify_debouncer_full::FileIdMap>,
-    ),
+    Debounced(notify_debouncer_full::Debouncer<RecommendedWatcher, notify_debouncer_full::NoCache>),
 }
 
 impl NotifyBackend {
     fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
         match self {
             NotifyBackend::Raw(w) => w.watch(path, mode),
-            NotifyBackend::Debounced(d) => {
-                d.watcher().watch(path, mode)?;
-                // The FileIdMap cache stitches From/To rename events on
-                // backends (FSEvents, Windows) that don't provide cookies.
-                d.cache().add_root(path, mode);
-                Ok(())
-            }
+            NotifyBackend::Debounced(d) => d.watcher().watch(path, mode),
         }
     }
 
     fn unwatch(&mut self, path: &Path) -> notify::Result<()> {
         match self {
             NotifyBackend::Raw(w) => w.unwatch(path),
-            NotifyBackend::Debounced(d) => {
-                d.watcher().unwatch(path)?;
-                d.cache().remove_root(path);
-                Ok(())
-            }
+            NotifyBackend::Debounced(d) => d.watcher().unwatch(path),
         }
     }
 }
@@ -314,17 +302,30 @@ fn build_debounced_backend<F>(
 where
     F: Fn(Vec<RawEvent>) + Send + Sync + 'static,
 {
-    use notify_debouncer_full::{new_debouncer, DebounceEventResult};
+    use notify_debouncer_full::{new_debouncer_opt, DebounceEventResult, NoCache};
 
     let (tx, rx) = mpsc::channel::<DebounceEventResult>();
+    // Do not use notify-debouncer-full's FileIdMap here. Registering one
+    // recursive root populates that cache with a synchronous WalkDir over the
+    // complete workspace before `watch()` returns. On a large monorepo this
+    // made an otherwise O(1) watcher registration block the first root and
+    // directory-list responses for tens of seconds.
+    //
+    // Mille already treats platform events as invalidation hints: ambiguous
+    // rename shapes and overflow are reconciled from disk by watch_runtime.
+    // NoCache therefore preserves correctness while keeping watcher startup
+    // proportional to the number of configured roots, not their descendants.
+    let config = Config::default().with_poll_interval(Duration::from_secs(2));
     // tick_rate = None lets the debouncer pick ~timeout/4, which
     // matches the recommended upstream default.
-    let debouncer = new_debouncer(
+    let debouncer = new_debouncer_opt(
         Duration::from_millis(debounce_ms),
         None,
         move |res: DebounceEventResult| {
             let _ = tx.send(res);
         },
+        NoCache,
+        config,
     )
     .map_err(map_notify_err)?;
 

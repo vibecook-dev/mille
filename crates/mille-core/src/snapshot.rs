@@ -10,7 +10,7 @@
 // ancestor-walks in EntryStore insert/remove. A full Zed-style SumTree port
 // is deferred to Phase 12 behind the same public query API.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -53,6 +53,13 @@ fn is_os_or_vcs_noise(name: &str) -> bool {
 pub struct StoreSnapshot {
     pub(crate) entries: BTreeMap<EntryId, Arc<Entry>>,
     pub(crate) children: BTreeMap<EntryId, SmallVec<[EntryId; 8]>>,
+    /// Directory ids whose immediate child listing has completed.
+    ///
+    /// This is deliberately separate from `children`: an empty directory has
+    /// no child records, while URI hydration can insert a partial ancestor
+    /// chain before the directory has ever been listed. Conflating either case
+    /// with completeness causes permanent loading spinners or truncated trees.
+    pub(crate) loaded_directories: BTreeSet<EntryId>,
     pub(crate) roots: SmallVec<[EntryId; 4]>,
     pub(crate) tree_version: u64,
     pub(crate) direct_child_counts: BTreeMap<EntryId, u32>,
@@ -72,6 +79,7 @@ impl Clone for StoreSnapshot {
         Self {
             entries: self.entries.clone(),
             children: self.children.clone(),
+            loaded_directories: self.loaded_directories.clone(),
             roots: self.roots.clone(),
             tree_version: self.tree_version,
             direct_child_counts: self.direct_child_counts.clone(),
@@ -93,6 +101,7 @@ impl Default for StoreSnapshot {
         Self {
             entries: BTreeMap::new(),
             children: BTreeMap::new(),
+            loaded_directories: BTreeSet::new(),
             roots: SmallVec::new(),
             tree_version: 0,
             direct_child_counts: BTreeMap::new(),
@@ -167,6 +176,12 @@ impl StoreSnapshot {
         self.children.get(&id).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
+    /// Whether an authoritative direct-child listing has completed for `id`.
+    /// A loaded directory may have zero children.
+    pub fn directory_children_loaded(&self, id: EntryId) -> bool {
+        self.loaded_directories.contains(&id)
+    }
+
     pub fn direct_child_count(&self, id: EntryId) -> Option<u32> {
         self.direct_child_counts.get(&id).copied()
     }
@@ -187,7 +202,10 @@ impl StoreSnapshot {
         // symlink-to-dir (pnpm/npm workspace links), matching the
         // client mirror. Without this, expand never fires for links.
         match self.entries.get(&id) {
-            Some(e) => e.kind == EntryKind::Directory || e.symlink_target_is_dir == Some(true),
+            Some(e) => {
+                !self.directory_children_loaded(id)
+                    && (e.kind == EntryKind::Directory || e.symlink_target_is_dir == Some(true))
+            }
             None => false,
         }
     }
@@ -275,16 +293,18 @@ impl StoreSnapshot {
     pub fn projected_child_count(&self, id: EntryId, include_ignored: bool) -> Option<u32> {
         let mut projection = ProjectionContext::new(self, include_ignored);
         let children = projection.children_of(id);
-        if !children.is_empty() {
+        let entry = self.entries.get(&id)?;
+        // File-nesting parents are files, not filesystem directories. Their
+        // projected children are complete whenever their containing directory
+        // is complete, and an empty list simply means they are not a nesting
+        // parent.
+        if entry.kind == EntryKind::File && !children.is_empty() {
             return Some(children.len().min(u32::MAX as usize) as u32);
         }
-        let entry = self.entries.get(&id)?;
-        if self.children.contains_key(&id) {
-            return Some(0);
+        if self.directory_children_loaded(id) {
+            return Some(children.len().min(u32::MAX as usize) as u32);
         }
-        (entry.kind == EntryKind::Directory || entry.symlink_target_is_dir == Some(true))
-            .then(|| self.direct_child_count(id))
-            .flatten()
+        None
     }
 
     /// Iterate over every (id, entry) pair in the snapshot. Primarily for
@@ -476,7 +496,7 @@ impl<'a> ProjectionContext<'a> {
             return true;
         }
         self.snapshot.entries.get(&id).is_some_and(|entry| {
-            !self.snapshot.children.contains_key(&id)
+            !self.snapshot.directory_children_loaded(id)
                 && (entry.kind == EntryKind::Directory || entry.symlink_target_is_dir == Some(true))
         })
     }
@@ -577,7 +597,7 @@ impl StoreSnapshot {
                             stack.push(child);
                         }
                     } else if self.entries.get(&projected_id).is_some_and(|entry| {
-                        !self.children.contains_key(&projected_id)
+                        !self.directory_children_loaded(projected_id)
                             && (entry.kind == EntryKind::Directory
                                 || entry.symlink_target_is_dir == Some(true))
                     }) {
@@ -862,6 +882,10 @@ mod tests {
             Some(p) => {
                 snap.children.entry(p).or_default().push(id);
                 *snap.direct_child_counts.entry(p).or_insert(0) += 1;
+                // Snapshot unit fixtures describe complete static trees unless
+                // they deliberately leave a leaf directory childless to test
+                // pending expansion.
+                snap.loaded_directories.insert(p);
             }
         }
         snap.descendant_visible_counts.insert(id, visible as u32);

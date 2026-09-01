@@ -45,6 +45,42 @@ fn entry_from_walked(walked: &mille_core::WalkedEntry, parent_id: Option<EntryId
         is_hidden: walked.is_hidden,
     }
 }
+
+/// Publish every directory whose immediate listing was actually covered by a
+/// completed walk. Directories exactly on a bounded walk's depth frontier are
+/// entries only—their children were not read—and ignored/excluded descendants
+/// may have had traversal pruned. The walk root is the exception: expanding an
+/// ignored folder explicitly is allowed and does read its direct children.
+fn mark_walked_directory_listings(
+    store: &EntryStore,
+    walked: &[mille_core::WalkedEntry],
+    walk_root: &Path,
+    max_depth: Option<usize>,
+    repository_ignore: Option<&mille_core::IgnoreMatcher>,
+    excludes: Option<&mille_core::IgnoreMatcher>,
+) -> std::result::Result<Vec<EntryId>, FxError> {
+    let ids: Vec<EntryId> = walked
+        .iter()
+        .filter(|entry| {
+            let directory_like =
+                entry.kind == EntryKind::Directory || entry.symlink_target_is_dir == Some(true);
+            // Smart/Never traversal records descendant directory symlinks but
+            // does not read through them. Only an explicitly walked symlink
+            // root can claim listing completion.
+            let listing_covered = entry.kind == EntryKind::Directory
+                || (entry.path == walk_root && entry.symlink_target_is_dir == Some(true));
+            let below_frontier = max_depth.is_none_or(|limit| (entry.depth as usize) < limit);
+            let traversal_complete = entry.path == walk_root
+                || (!repository_ignore
+                    .is_some_and(|matcher| matcher.is_ignored(&entry.path, directory_like))
+                    && !excludes
+                        .is_some_and(|matcher| matcher.is_ignored(&entry.path, directory_like)));
+            listing_covered && below_frontier && traversal_complete
+        })
+        .filter_map(|entry| store.get_by_path(&entry.path).map(|stored| stored.id))
+        .collect();
+    store.mark_directories_children_loaded(&ids)
+}
 use crate::events::{Channel, EventBus};
 use crate::journal::{
     capture_fs_identity, directory_is_empty, ensure_managed_recycle_base, path_is_under,
@@ -576,8 +612,9 @@ impl FileExplorer {
                 }
             }
             let new_entries: Vec<_> = walked
-                .into_iter()
+                .iter()
                 .filter(|entry| self.store.get_by_path(&entry.path).is_none())
+                .cloned()
                 .collect();
             let ids = populate_store_with_provenance(
                 &self.store,
@@ -587,9 +624,97 @@ impl FileExplorer {
                 excludes.as_ref(),
             )
             .map_err(fx_error_to_napi)?;
+            mark_walked_directory_listings(
+                &self.store,
+                &walked,
+                root,
+                None,
+                repository_ignore.as_ref(),
+                excludes.as_ref(),
+            )
+            .map_err(fx_error_to_napi)?;
             total = total.saturating_add(ids.len() as u32);
         }
         Ok(total)
+    }
+
+    /// Seed configured workspace roots as lazy directory placeholders without
+    /// touching the filesystem. This is the first-paint contract for remote,
+    /// unavailable, and very large workspaces: a host can handshake with stable
+    /// root identities immediately, then refresh metadata and hydrate children
+    /// independently.
+    #[napi(js_name = "seedWorkspaceRoots", catch_unwind)]
+    pub fn seed_workspace_roots(&self) -> Result<u32> {
+        if self.disposed.load(Ordering::Acquire) {
+            return Err(Error::from_reason("FileExplorer is disposed"));
+        }
+        let roots = self.roots.read().clone();
+        let exclude_matchers = self.current_exclude_matchers().map_err(fx_error_to_napi)?;
+        let prepared: Vec<(PathBuf, Entry)> = roots
+            .iter()
+            .map(|root| {
+                let name = root
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| root.to_string_lossy().into_owned());
+                let mut entry = Entry {
+                    id: EntryId(0),
+                    parent_id: None,
+                    is_hidden: name.starts_with('.'),
+                    name,
+                    kind: EntryKind::Directory,
+                    size: 0,
+                    mtime_ms: 0,
+                    ctime_ms: 0,
+                    symlink_target_is_dir: None,
+                    path_segments: None,
+                    is_ignored: false,
+                    is_excluded: false,
+                    is_readonly: false,
+                };
+                entry.is_excluded = Self::path_is_excluded(root, &entry, &exclude_matchers);
+                (root.clone(), entry)
+            })
+            .collect();
+
+        let _policy_guard = self.policy_gate.lock();
+        let previous_version = self.store.tree_version();
+        let (version, added_ids, removed_ids) = self
+            .store
+            .replace_roots(prepared)
+            .map_err(fx_error_to_napi)?;
+        if version != previous_version {
+            let root_ids: Vec<EntryId> = self.store.snapshot().roots().to_vec();
+            let mut changed_ids: Vec<i64> = removed_ids
+                .iter()
+                .chain(added_ids.iter())
+                .chain(root_ids.iter())
+                .map(|id| id.raw() as i64)
+                .collect();
+            changed_ids.sort_unstable();
+            changed_ids.dedup();
+            let notice = || ChangeNoticeJs {
+                tree_version: version as u32,
+                decoration_version: 0,
+                tree_changed: true,
+                decorations_changed: false,
+                changed_ids: changed_ids.clone(),
+                child_set_changed: Vec::new(),
+                decoration_changed_ids: Vec::new(),
+                coarse_subtrees: Vec::new(),
+            };
+            self.events.emit_change(Channel::Change, notice());
+            self.events.emit_change(Channel::ChangeTree, notice());
+        }
+        Ok(version as u32)
+    }
+
+    /// Register recursive OS watches without walking workspace descendants.
+    /// Host mode starts this independently from root seeding and expansion.
+    #[napi(js_name = "startWatching", catch_unwind)]
+    pub async fn start_watching(&self) -> Result<u32> {
+        self.ensure_watcher()?;
+        Ok(self.store.tree_version() as u32)
     }
 
     /// Re-stat configured roots without walking descendants.
@@ -600,6 +725,9 @@ impl FileExplorer {
     /// complete refresh, and the returned version is a synchronization point.
     #[napi(js_name = "refreshWorkspaceRoots", catch_unwind)]
     pub async fn refresh_workspace_roots(&self) -> Result<u32> {
+        // Preserve the local FileExplorer contract: filesystem-facing calls
+        // lazily enable live updates. Registration is root-bounded (NoCache),
+        // so this no longer scans descendants or delays the host handshake.
         self.ensure_watcher()?;
         let roots = self.roots.read().clone();
         let mut observed = Vec::with_capacity(roots.len());
@@ -961,18 +1089,24 @@ impl FileExplorer {
         // Avoid rebuilding entries the store already knows about. `insert`
         // independently enforces path idempotence for watcher/walker races.
         let filtered: Vec<_> = walked
-            .into_iter()
+            .iter()
             .filter(|w| self.store.get_by_path(&w.path).is_none())
+            .cloned()
             .collect();
-
-        if filtered.is_empty() {
-            return Ok(0);
-        }
 
         let ids = populate_store_with_provenance(
             &self.store,
             &root,
             &filtered,
+            repository_ignore.as_ref(),
+            excludes.as_ref(),
+        )
+        .map_err(fx_error_to_napi)?;
+        mark_walked_directory_listings(
+            &self.store,
+            &walked,
+            &p,
+            max_depth.map(|depth| depth as usize),
             repository_ignore.as_ref(),
             excludes.as_ref(),
         )

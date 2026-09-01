@@ -202,15 +202,15 @@ export interface ExplorerOptions {
    * `FileExplorer` itself (it never walks at construction time; callers
    * drive `populateFromRoots` / `prefetch` explicitly). The
    * `FileExplorerHost` in `host.ts` reads this field and picks the
-   * right walk at attach time:
+   * corresponding hydration policy:
    *
    *   - `'full'` (default, v0.1 behaviour): the host does nothing; the
    *     consumer is responsible for calling `host.local.populateFromRoots()`
    *     or equivalent. Back-compat preserving — every existing consumer
    *     keeps working without a code change.
-   *   - `'roots-only'`: the host walks each configured root at depth 0
-   *     (the root Entry only, no children). Children stream in via
-   *     `setExpanded` — B2's big ergonomic win for large monorepos.
+   *   - `'roots-only'`: the host publishes configured root placeholders
+   *     synchronously without filesystem I/O. Metadata refresh, watching, and
+   *     child hydration run independently; children arrive on expansion.
    *   - `'none'`: no walk at all. The consumer drives `prefetch` /
    *     `list` by hand — useful for tests and for consumers who want
    *     to layer their own lazy-hydration strategy.
@@ -260,6 +260,8 @@ type NativeFx = {
   resync(id: number, recursive?: boolean): Promise<number>;
   resyncWorkspace(): Promise<number>;
   populateFromRoots(): Promise<number>;
+  seedWorkspaceRoots(): number;
+  startWatching(): Promise<number>;
   // Phase B2 — bounded-depth walk of a single path. Older native builds
   // (pre-v0.2) may not ship this method; the TS wrapper guards with
   // `typeof === 'function'` before invoking.
@@ -381,6 +383,7 @@ type NativeSnapshot = {
   roots(): Entry[];
   getById(id: number): Entry | null;
   directChildCount(id: number): number | null;
+  directoryChildrenLoaded(id: number): boolean;
   projectedChildCount(id: number, includeIgnored?: boolean): number | null;
   hasChildren(id: number): boolean;
   childrenOf(id: number): number[];
@@ -603,6 +606,16 @@ export class FileExplorer {
    */
   refreshWorkspaceRoots(): Promise<number> {
     return wrap(this.nativeFx.refreshWorkspaceRoots());
+  }
+
+  /** Seed stable root rows without filesystem I/O or descendant walking. */
+  seedWorkspaceRoots(): number {
+    return wrapSync(() => this.nativeFx.seedWorkspaceRoots());
+  }
+
+  /** Start live filesystem watching independently from tree hydration. */
+  startWatching(): Promise<number> {
+    return wrap(this.nativeFx.startWatching());
   }
 
   /**
@@ -1326,6 +1339,11 @@ export class MirrorSnapshot {
   directChildCount(id: EntryId): number | null {
     const v = this.inner.directChildCount(id);
     return v ?? null;
+  }
+
+  /** @internal — distinguishes a pending directory from a loaded empty one. */
+  directoryChildrenLoaded(id: EntryId): boolean {
+    return this.inner.directoryChildrenLoaded(id);
   }
 
   /** @internal — child count after compact-folder and file-nesting projection. */

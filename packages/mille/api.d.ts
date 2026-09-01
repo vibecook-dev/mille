@@ -240,10 +240,10 @@ export interface ExplorerOptions {
    *
    *   - `'full'` (default, v0.1 behaviour): the host does not walk;
    *     the consumer calls `host.local.populateFromRoots()` explicitly.
-   *   - `'roots-only'`: the host walks each configured root at depth 0
-   *     so root Entry records appear in the store before handshake.
-   *     Children stream in on-demand via `setExpanded` (which now fires
-   *     a per-folder walk when the child list isn't in the store).
+   *   - `'roots-only'`: configured root placeholders are published
+   *     synchronously before handshake and without filesystem I/O.
+   *     Metadata refresh, watching, and child hydration run independently;
+   *     children stream in on-demand via `setExpanded`.
    *   - `'none'`: the host does not walk at all; the consumer drives
    *     `prefetch` / `list` / `populateFromRoots` by hand.
    *
@@ -402,7 +402,10 @@ export interface MirrorSnapshot {
   /** Cached immediate-child count for a folder. `null` if not yet known. */
   directChildCount(id: EntryId): number | null;
 
-  /** True if the snapshot holds this folder's full child list (safe to call `visibleRows` crossing it). */
+  /** True once the folder's authoritative direct-child listing completed. */
+  directoryChildrenLoaded(id: EntryId): boolean;
+
+  /** True when the entry has visible children or is an unloaded directory that may have them. */
   hasChildren(id: EntryId): boolean;
 
   /** Merged decorations for an entry across all registered providers. Fast path — precomputed per snapshot. */
@@ -622,6 +625,12 @@ export declare class FileExplorer implements Disposable {
    * identity. Port calls resolve after every attached mirror is current.
    */
   refreshWorkspaceRoots(): Promise<TreeVersion>;
+
+  /** Seed configured root rows synchronously without filesystem I/O. */
+  seedWorkspaceRoots(): TreeVersion;
+
+  /** Start live filesystem watching without hydrating descendants. */
+  startWatching(): Promise<TreeVersion>;
 
   /**
    * Reconcile one indexed entry against disk using the watcher reconciliation

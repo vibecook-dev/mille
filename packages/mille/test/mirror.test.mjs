@@ -182,6 +182,7 @@ test('ClientMirrorSnapshot.directChildCount returns null when unknown', () => {
   const m = createMirror();
   const snap = new ClientMirrorSnapshot(m);
   assert.equal(snap.directChildCount(1), null);
+  assert.equal(snap.directoryChildrenLoaded(1), false);
 });
 
 test('ClientMirrorSnapshot.directChildCount returns cached value', () => {
@@ -191,6 +192,8 @@ test('ClientMirrorSnapshot.directChildCount returns cached value', () => {
   const snap = new ClientMirrorSnapshot(m);
   assert.equal(snap.directChildCount(1), 4);
   assert.equal(snap.directChildCount(2), 0);
+  assert.equal(snap.directoryChildrenLoaded(1), true);
+  assert.equal(snap.directoryChildrenLoaded(2), true, 'zero children is still loaded');
 });
 
 test('ClientMirrorSnapshot.hasChildren only true for >0 count', () => {

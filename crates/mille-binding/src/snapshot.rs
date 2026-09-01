@@ -101,13 +101,21 @@ impl MirrorSnapshot {
         self.inner.direct_child_count(eid)
     }
 
+    /// True once an authoritative direct-child listing completed. This is
+    /// distinct from `hasChildren`: a loaded directory can be empty.
+    #[napi(js_name = "directoryChildrenLoaded", catch_unwind)]
+    pub fn directory_children_loaded(&self, id: i64) -> bool {
+        self.inner.directory_children_loaded(EntryId(id as u64))
+    }
+
     #[napi(js_name = "projectedChildCount", catch_unwind)]
     pub fn projected_child_count(&self, id: i64, include_ignored: Option<bool>) -> Option<u32> {
         self.inner
             .projected_child_count(EntryId(id as u64), include_ignored.unwrap_or(false))
     }
 
-    /// True if the entry has at least one child visible in this snapshot.
+    /// True when the entry has a visible child or is an unloaded directory
+    /// that may have children (the disclosure-chevron contract).
     #[napi(js_name = "hasChildren", catch_unwind)]
     pub fn has_children(&self, id: i64) -> bool {
         let eid = EntryId(id as u64);
