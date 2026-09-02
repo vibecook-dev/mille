@@ -11,6 +11,7 @@
 
 import type {
   Decoration,
+  DirectoryLoadState,
   Entry,
   EntryId,
   SearchHit,
@@ -42,6 +43,7 @@ export interface FakeMirrorSnapshot {
   getById(id: EntryId): Entry | null;
   directChildCount(id: EntryId): number | null;
   hasChildren(id: EntryId): boolean;
+  directoryLoadState(id: EntryId): DirectoryLoadState;
   getDecorations(id: EntryId): readonly Decoration[];
 }
 
@@ -61,6 +63,7 @@ export interface FakeSnapshotInit {
   readonly rows?: readonly VisibleRow[];
   readonly decorations?: ReadonlyMap<EntryId, readonly Decoration[]>;
   readonly pendingExpansions?: ReadonlySet<EntryId>;
+  readonly directoryLoads?: ReadonlyMap<EntryId, DirectoryLoadState>;
 }
 
 // ─── Recorded mutation calls ──────────────────────────────────────────
@@ -240,6 +243,7 @@ const EMPTY_SNAPSHOT: FakeMirrorSnapshot = freeze({
   getById: () => null,
   directChildCount: () => null,
   hasChildren: () => false,
+  directoryLoadState: () => IDLE_DIRECTORY_LOAD,
   getDecorations: () => [],
 });
 
@@ -250,6 +254,7 @@ function freeze<T>(v: T): T {
 const EMPTY_DECORATIONS: readonly Decoration[] = freeze(
   [] as readonly Decoration[],
 );
+const IDLE_DIRECTORY_LOAD: DirectoryLoadState = freeze({ state: 'idle' });
 
 function nextEntryIdSource(start: number): () => EntryId {
   let n = start;
@@ -272,6 +277,7 @@ export function createFakeSnapshot(init: FakeSnapshotInit = {}): FakeMirrorSnaps
   const roots = init.roots ?? rows.filter((r) => r.parentId === null);
   const decorations = init.decorations ?? new Map<EntryId, readonly Decoration[]>();
   const pending = init.pendingExpansions ?? new Set<EntryId>();
+  const directoryLoads = init.directoryLoads ?? new Map<EntryId, DirectoryLoadState>();
   const showHiddenFiles = init.showHiddenFiles ?? true;
   const showIgnoredFiles = init.showIgnoredFiles ?? true;
   const projectedRows: VisibleRow[] = [];
@@ -335,6 +341,7 @@ export function createFakeSnapshot(init: FakeSnapshotInit = {}): FakeMirrorSnaps
     getById: (id) => byId.get(id) ?? null,
     directChildCount: (id) => childCounts.get(id) ?? null,
     hasChildren: (id) => (childCounts.get(id) ?? 0) > 0,
+    directoryLoadState: (id) => directoryLoads.get(id) ?? IDLE_DIRECTORY_LOAD,
     getDecorations: (id) => decorations.get(id) ?? EMPTY_DECORATIONS,
   };
   return freeze(snap);
@@ -689,6 +696,7 @@ export function createFakeEngine(): FakeEngine {
         getById: (id) => structural.getById(id),
         directChildCount: (id) => structural.directChildCount(id),
         hasChildren: (id) => structural.hasChildren(id),
+        directoryLoadState: (id) => structural.directoryLoadState(id),
         getDecorations: (id) => decorationMap.get(id) ?? EMPTY_DECORATIONS,
       });
       notify();

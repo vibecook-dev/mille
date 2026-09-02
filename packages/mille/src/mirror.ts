@@ -61,6 +61,15 @@ export interface ClientEntry {
 /** Packed or legacy authoritative child identities for one expanded folder. */
 export type ChildIdList = number[] | Uint32Array | Float64Array;
 
+export interface DirectoryLoadRecord {
+  readonly generation: number;
+  readonly state: 'loading' | 'error';
+  readonly error?: {
+    readonly code: string;
+    readonly message: string;
+  };
+}
+
 /**
  * Mutable working state. The reducer (8.3) produces a new
  * MirrorWorking via cloneMirror() + mutations; the snapshot wrapper
@@ -77,6 +86,8 @@ export interface MirrorWorking {
   directChildCounts: Map<number, number>;
   /** Folders the client has asked to expand but whose children haven't arrived yet. */
   pendingExpansions: Set<number>;
+  /** Active and failed directory reads; completion is represented by counts. */
+  directoryLoads: Map<number, DirectoryLoadRecord>;
   /** Folders currently expanded by this client. */
   expanded: Set<number>;
   /** Entry ids in the latest authoritative host viewport patch. */
@@ -122,6 +133,7 @@ export function createMirror(): MirrorWorking {
     orderedChildren: new Set(),
     directChildCounts: new Map(),
     pendingExpansions: new Set(),
+    directoryLoads: new Map(),
     expanded: new Set(),
     viewportIds: new Set(),
     roots: [],
@@ -151,6 +163,7 @@ export function cloneMirror(m: MirrorWorking): MirrorWorking {
     orderedChildren: new Set(m.orderedChildren),
     directChildCounts: new Map(m.directChildCounts),
     pendingExpansions: new Set(m.pendingExpansions),
+    directoryLoads: new Map(m.directoryLoads),
     expanded: new Set(m.expanded),
     viewportIds: new Set(m.viewportIds),
     roots: [...m.roots],

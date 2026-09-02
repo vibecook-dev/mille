@@ -643,6 +643,157 @@ impl EntryStore {
         Ok(id)
     }
 
+    /// Insert a bounded batch while cloning and publishing the immutable
+    /// snapshot only once. This is the progressive-listing hot path: calling
+    /// `insert` for every child of a 100k-entry folder would repeatedly clone
+    /// an ever-growing map and become quadratic.
+    ///
+    /// Entries whose paths are already indexed are skipped. Parents must
+    /// already exist in the published snapshot; directory-page batches only
+    /// contain direct children, so this also catches malformed topology at the
+    /// engine boundary.
+    pub fn insert_batch(&self, entries: Vec<(PathBuf, Entry)>) -> Result<Vec<EntryId>, FxError> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let _guard = self.write_lock.lock();
+        let sibling_order = self.sibling_order.read().clone();
+        let visibility = *self.visibility.read();
+        let current = self.inner.load_full();
+        let mut next = (*current).clone();
+        let mut batch_paths = HashSet::with_capacity(entries.len());
+        let mut additions: Vec<(PathBuf, EntryId, Arc<Entry>)> = Vec::with_capacity(entries.len());
+
+        for (path, mut entry) in entries {
+            if self.path_to_id.contains_key(path.as_path()) {
+                continue;
+            }
+            if !batch_paths.insert(path.clone()) {
+                return Err(FxError::InvalidInput(format!(
+                    "duplicate path in insert batch: {path:?}"
+                )));
+            }
+            if let Some(parent_id) = entry.parent_id {
+                if !current.entries.contains_key(&parent_id) {
+                    return Err(FxError::InvalidInput(format!(
+                        "batch parent {:?} is not in the current snapshot",
+                        parent_id
+                    )));
+                }
+            }
+            let id = EntryId::alloc_from(&self.id_counter)?;
+            entry.id = id;
+            additions.push((path, id, Arc::new(entry)));
+        }
+        if additions.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Materialize every record before sorting sibling ids so the
+        // comparator can read the new entries from the same immutable view.
+        for (_, id, entry) in &additions {
+            next.entries.insert(*id, Arc::clone(entry));
+            next.descendant_visible_counts
+                .insert(*id, visibility.includes(entry.as_ref()) as u32);
+            next.descendant_total_sizes.insert(*id, entry.size);
+        }
+
+        let mut new_children: std::collections::HashMap<EntryId, Vec<EntryId>> =
+            std::collections::HashMap::new();
+        let mut summary_changed_ancestors = HashSet::new();
+        for (_, id, entry) in &additions {
+            match entry.parent_id {
+                None => next.roots.push(*id),
+                Some(parent_id) => {
+                    new_children.entry(parent_id).or_default().push(*id);
+                    *next.direct_child_counts.entry(parent_id).or_insert(0) += 1;
+                }
+            }
+
+            let counts_visible = visibility.includes(entry.as_ref());
+            let mut cursor = entry.parent_id;
+            let mut hops = 0usize;
+            while let Some(ancestor) = cursor {
+                if hops >= MAX_ANCESTOR_WALK {
+                    break;
+                }
+                let mut touched = false;
+                if counts_visible {
+                    *next.descendant_visible_counts.entry(ancestor).or_insert(0) += 1;
+                    touched = true;
+                }
+                if entry.size > 0 {
+                    *next.descendant_total_sizes.entry(ancestor).or_insert(0) += entry.size;
+                    touched = true;
+                } else {
+                    next.descendant_total_sizes.entry(ancestor).or_insert(0);
+                }
+                if touched {
+                    summary_changed_ancestors.insert(ancestor);
+                }
+                cursor = next
+                    .entries
+                    .get(&ancestor)
+                    .and_then(|parent| parent.parent_id);
+                hops += 1;
+            }
+        }
+
+        // Existing sibling lists are already ordered. Sort only the incoming
+        // page, then merge it linearly. Re-sorting the full accumulated list
+        // for every page makes a 100k-entry directory needlessly superlinear.
+        for (parent_id, ids) in &new_children {
+            let siblings = next.children.remove(parent_id).unwrap_or_default();
+            let compare =
+                |a: &EntryId, b: &EntryId| match (next.entries.get(a), next.entries.get(b)) {
+                    (Some(ae), Some(be)) => sibling_order.compare(ae, be),
+                    _ => a.cmp(b),
+                };
+            let mut incoming = ids.clone();
+            incoming.sort_by(&compare);
+
+            let mut merged = Vec::with_capacity(siblings.len() + incoming.len());
+            let mut old_index = 0usize;
+            let mut new_index = 0usize;
+            while old_index < siblings.len() && new_index < incoming.len() {
+                if compare(&siblings[old_index], &incoming[new_index]).is_le() {
+                    merged.push(siblings[old_index]);
+                    old_index += 1;
+                } else {
+                    merged.push(incoming[new_index]);
+                    new_index += 1;
+                }
+            }
+            merged.extend_from_slice(&siblings[old_index..]);
+            merged.extend_from_slice(&incoming[new_index..]);
+            next.children.insert(*parent_id, merged.into());
+        }
+
+        let prev_tree_version = next.tree_version;
+        next.tree_version += 1;
+        let new_tree_version = next.tree_version;
+        self.inner.store(Arc::new(next));
+
+        for (path, id, _) in &additions {
+            let indexed_path: Arc<Path> = Arc::from(path.clone().into_boxed_path());
+            self.path_to_id.insert(Arc::clone(&indexed_path), *id);
+            self.id_to_path.insert(*id, indexed_path);
+        }
+
+        let added_ids: Vec<EntryId> = additions.iter().map(|(_, id, _)| *id).collect();
+        self.record_mutation(prev_tree_version, new_tree_version, |changes| {
+            changes.changed_ids.extend(added_ids.iter().copied());
+            changes
+                .child_set_changed
+                .extend(new_children.keys().copied());
+            changes
+                .subtree_roots_changed
+                .extend(summary_changed_ancestors.iter().copied());
+        });
+        Ok(added_ids)
+    }
+
     pub fn remove(&self, id: EntryId) -> Option<Arc<Entry>> {
         let _guard = self.write_lock.lock();
         let visibility = *self.visibility.read();
@@ -2241,6 +2392,39 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(s.tree_version(), version);
         assert_eq!(s.snapshot().entry_count(), 1);
+    }
+
+    #[test]
+    fn insert_batch_publishes_once_and_orders_children() {
+        let s = EntryStore::new();
+        let root = s.insert("/r".into(), dir("r", None)).unwrap();
+        s.insert_batch(vec![
+            ("/r/b".into(), leaf("b", Some(root))),
+            ("/r/d".into(), leaf("d", Some(root))),
+        ])
+        .unwrap();
+        let _ = s.take_pending_changes();
+        let before = s.tree_version();
+        let ids = s
+            .insert_batch(vec![
+                ("/r/c".into(), leaf("c", Some(root))),
+                ("/r/a".into(), leaf("a", Some(root))),
+                ("/r/e".into(), leaf("e", Some(root))),
+            ])
+            .unwrap();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(s.tree_version(), before + 1);
+        let snapshot = s.snapshot();
+        let names: Vec<_> = snapshot
+            .children_of(root)
+            .iter()
+            .map(|id| snapshot.get(*id).unwrap().name.as_str())
+            .collect();
+        assert_eq!(names, ["a", "b", "c", "d", "e"]);
+        assert_eq!(snapshot.direct_child_count(root), Some(5));
+        let changes = s.take_pending_changes();
+        assert_eq!(changes.changed_ids.len(), 3);
+        assert!(changes.child_set_changed.contains(&root));
     }
 
     #[test]

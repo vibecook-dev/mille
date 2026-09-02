@@ -25,6 +25,7 @@ import type { Decoration, DecorationProvider } from './decorations.js';
 import { FileSystemError, type ErrorCode } from './errors.js';
 import {
   applyDelta,
+  applyDirectoryLoad,
   applySnapshot,
   DEFAULT_MIRROR_CAP,
   hydrateLookupEntries,
@@ -296,10 +297,12 @@ export class PortFileExplorer {
         next.pendingExpansions.add(id);
         touched = true;
       }
+      if (next.directoryLoads.delete(id)) touched = true;
     }
     for (const id of remove) {
       if (next.expanded.delete(id)) touched = true;
       if (next.pendingExpansions.delete(id)) touched = true;
+      if (next.directoryLoads.delete(id)) touched = true;
     }
     if (touched) {
       this.working = next;
@@ -752,6 +755,18 @@ export class PortFileExplorer {
         }
         return;
       }
+      case 'directoryLoad':
+        this.working = applyDirectoryLoad(
+          this.working,
+          f.body as {
+            id: number;
+            generation: number;
+            state: 'loading' | 'complete' | 'error' | 'cancelled';
+            error?: { code: string; message: string };
+          },
+        );
+        this.publishSnapshot();
+        return;
       case 'mutateResult':
       case 'callResult':
         this.handleResult(

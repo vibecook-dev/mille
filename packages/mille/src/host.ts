@@ -235,6 +235,16 @@ interface Session {
   detach: () => void;
 }
 
+interface DirectoryLoadTask {
+  readonly rootId: number;
+  readonly generation: number;
+  readonly interestedSessions: Set<number>;
+  readonly compactFolders: boolean;
+  operationId: string | null;
+  cancelled: boolean;
+  promise: Promise<void> | null;
+}
+
 /**
  * 16ms ≈ one render frame. SPEC §4.9 sizes the coalescer + fan-out tick
  * so the host never spends more than one frame between draining changes
@@ -252,10 +262,10 @@ class FileExplorerHostImpl implements FileExplorerHost {
   private ackRequestedForNextTick = false;
   private nextSessionId = 1;
   private disposed = false;
-  /** Directory listings currently in flight. Completion is held by the
-   * native snapshot, not this transient set, so empty folders and failures
-   * have truthful retry semantics. */
-  private readonly prefetchInFlight: Set<number> = new Set();
+  /** Shared cancellable loads keyed by expanded directory. */
+  private readonly directoryLoads = new Map<number, DirectoryLoadTask>();
+  private nextDirectoryLoadGeneration = 1;
+  private readonly directoryBatchSize: number;
   /** Phase B2 — initial-walk policy. See ExplorerOptions.initialWalk. */
   private readonly initialWalk: 'full' | 'roots-only' | 'none';
   /** Background root metadata refresh is started once, after first attach. */
@@ -308,6 +318,11 @@ class FileExplorerHostImpl implements FileExplorerHost {
   constructor(options: ExplorerOptions) {
     this.explorer = new FileExplorer(options);
     this.initialWalk = options.initialWalk ?? 'full';
+    const requestedBatchSize =
+      typeof options.directoryBatchSize === 'number' && Number.isFinite(options.directoryBatchSize)
+        ? Math.trunc(options.directoryBatchSize)
+        : 256;
+    this.directoryBatchSize = Math.max(16, Math.min(4096, requestedBatchSize));
     if (this.initialWalk === 'roots-only') {
       // Pure in-memory publication: the first handshake always contains the
       // configured roots, even when stat/read_dir or watcher registration is
@@ -980,12 +995,19 @@ class FileExplorerHostImpl implements FileExplorerHost {
     );
   }
 
-  private handleSetExpanded(session: Session, body: { add?: number[]; remove?: number[] }): void {
+  private handleSetExpanded(
+    session: Session,
+    body: { add?: number[]; remove?: number[] },
+    skipLoad = false,
+  ): void {
     for (const id of body.add ?? []) {
       session.expanded.add(id);
       if (!this.watchReady) this.watchGapExpansions.add(id);
     }
-    for (const id of body.remove ?? []) session.expanded.delete(id);
+    for (const id of body.remove ?? []) {
+      session.expanded.delete(id);
+      this.releaseDirectoryLoad(session, id);
+    }
 
     // Headless clients may expand before publishing a viewport. Give that
     // first expansion a bounded useful window rather than returning only
@@ -1007,51 +1029,34 @@ class FileExplorerHostImpl implements FileExplorerHost {
     // whatever's already in the snapshot below so the reply isn't empty
     // in the (common) case where the folder was already walked.
     //
-    // Completion lives in the immutable native snapshot. The transient
-    // in-flight set only deduplicates concurrent sessions; failures are
-    // retryable and a loaded empty directory is a definitive result.
-    for (const id of body.add ?? []) {
-      if (snap.directoryChildrenLoaded(id) || this.prefetchInFlight.has(id)) continue;
+    // Completion lives in the immutable native snapshot. Active tasks are
+    // shared by interested sessions and carry explicit cancellation/error
+    // state over the port.
+    for (const id of skipLoad ? [] : (body.add ?? [])) {
       const expandable = snap.getById(id);
       // Stale/forged ids can race removal or arrive from an untrusted port.
-      // They have no path to hydrate and must remain a bounded no-op.
-      if (expandable === null) continue;
+      if (expandable === null) {
+        this.sendDirectoryLoad(session, id, 0, 'error', {
+          code: 'EINVAL',
+          message: `entry ${id} is not in the current snapshot`,
+        });
+        continue;
+      }
       if (expandable.kind !== 1 && expandable.symlinkTargetIsDir !== true) {
         // Nested files are virtual containers whose child records already
         // reside in their real parent directory; never attempt a filesystem
         // walk "inside" the file.
+        this.sendDirectoryLoad(session, id, 0, 'complete');
         continue;
       }
-      this.prefetchInFlight.add(id);
-      try {
-        const prefetch = snap.compactFolders
-          ? this.prefetchCompactChain(id)
-          : this.explorer.resync(id).then(() => undefined);
-        void prefetch
-          .then(async () => {
-            // The first depth-1 result may have published the raw chain head.
-            // Drain its structural ChangeSet first, then re-emit this parent's
-            // authoritative projected child list last so a raw walker entry
-            // cannot overwrite the compact row metadata.
-            if (snap.compactFolders && this.sessions.has(session.id) && session.handshook) {
-              await this.flushTickNow();
-              this.handleSetExpanded(session, { add: [id] });
-            }
-          })
-          .catch((e) => {
-            // eslint-disable-next-line no-console
-            console.warn(`[mille] setExpanded reconcile failed for id ${id}:`, e);
-          })
-          .finally(() => {
-            this.prefetchInFlight.delete(id);
-          });
-      } catch (e) {
-        this.prefetchInFlight.delete(id);
-        // A synchronous binding failure still leaves the current snapshot
-        // usable. Completion remains false, so a later expansion can retry.
-        // eslint-disable-next-line no-console
-        console.warn(`[mille] setExpanded: directory reconcile failed for id ${id}:`, e);
+      if (
+        snap.directoryChildrenLoaded(id) &&
+        (!snap.compactFolders || !this.compactChainNeedsLoad(snap, id))
+      ) {
+        this.sendDirectoryLoad(session, id, 0, 'complete');
+        continue;
       }
+      this.joinDirectoryLoad(session, id, snap.compactFolders);
     }
 
     const childLists = new Map<number, readonly number[]>();
@@ -1095,21 +1100,164 @@ class FileExplorerHostImpl implements FileExplorerHost {
     );
   }
 
-  /**
-   * Hydrate only the single-directory chain below an expanded folder.
-   * Each step is depth-1, so a branch never causes an eager subtree walk.
-   */
-  private async prefetchCompactChain(parentId: number): Promise<void> {
-    let current = parentId;
+  /** True when compact-folder projection still needs a disk listing to know
+   * where its single-directory chain ends. A fully-known branch/leaf is a
+   * completed expansion and must not start a no-op task (or a re-entrant
+   * flush) merely because compact folders are enabled. */
+  private compactChainNeedsLoad(snapshot: MirrorSnapshot, rootId: number): boolean {
+    let current = rootId;
+    const seen = new Set<number>();
     for (let depth = 0; depth < 256; depth++) {
-      await this.explorer.resync(current);
-      const snapshot = this.explorer.getSnapshot();
+      if (seen.has(current)) return false;
+      seen.add(current);
+      if (!snapshot.directoryChildrenLoaded(current)) return true;
+
       const children = snapshot.projectedChildrenOf(current);
-      if (children.length !== 1) return;
+      if (children.length !== 1) return false;
       const child = snapshot.getById(children[0]!);
-      if (child === null || child.kind !== 1) return;
+      if (child === null || (child.kind !== 1 && child.symlinkTargetIsDir !== true)) return false;
       current = child.id;
     }
+    return false;
+  }
+
+  private joinDirectoryLoad(session: Session, id: number, compactFolders: boolean): void {
+    let task = this.directoryLoads.get(id);
+    if (task?.cancelled) {
+      this.directoryLoads.delete(id);
+      task = undefined;
+    }
+    if (task !== undefined) {
+      task.interestedSessions.add(session.id);
+      this.sendDirectoryLoad(session, id, task.generation, 'loading');
+      return;
+    }
+
+    task = {
+      rootId: id,
+      generation: this.nextDirectoryLoadGeneration++,
+      interestedSessions: new Set([session.id]),
+      compactFolders,
+      operationId: null,
+      cancelled: false,
+      promise: null,
+    };
+    this.directoryLoads.set(id, task);
+    this.sendDirectoryLoad(session, id, task.generation, 'loading');
+    // Never run a native reconciliation or flush re-entrantly while handling
+    // setExpanded. The initial bounded structural/viewport frame must be the
+    // first expansion frame on the wire; progressive pages follow it.
+    const scheduledTask = task;
+    task.promise = Promise.resolve().then(() => this.runDirectoryLoad(scheduledTask));
+  }
+
+  /** Hydrate one folder, then only the single-directory chain needed by the
+   * compact-folder projection. Every disk step is independently bounded. */
+  private async runDirectoryLoad(task: DirectoryLoadTask): Promise<void> {
+    try {
+      let current = task.rootId;
+      for (let depth = 0; depth < 256; depth++) {
+        if (task.cancelled || task.interestedSessions.size === 0) return;
+        const snapshot = this.explorer.getSnapshot();
+        if (!snapshot.directoryChildrenLoaded(current)) {
+          const operationId = `mille:directory:${task.generation}:${current}:${depth}`;
+          task.operationId = operationId;
+          await this.explorer.resyncProgressive(current, {
+            operationId,
+            batchSize: this.directoryBatchSize,
+          });
+          task.operationId = null;
+        }
+        if (!task.compactFolders) break;
+
+        const after = this.explorer.getSnapshot();
+        const children = after.projectedChildrenOf(current);
+        if (children.length !== 1) break;
+        const child = after.getById(children[0]!);
+        if (child === null || (child.kind !== 1 && child.symlinkTargetIsDir !== true)) break;
+        current = child.id;
+      }
+
+      if (this.directoryLoads.get(task.rootId) !== task || task.cancelled) return;
+      await this.flushTickNow();
+      if (this.directoryLoads.get(task.rootId) !== task || task.cancelled) return;
+      for (const sessionId of [...task.interestedSessions]) {
+        const session = this.sessions.get(sessionId);
+        if (session === undefined || !session.handshook || !session.expanded.has(task.rootId)) {
+          continue;
+        }
+        if (task.compactFolders) {
+          // Send the final projected child list after all raw batches drain.
+          this.handleSetExpanded(session, { add: [task.rootId] }, true);
+        }
+        // Completion follows the authoritative projected structure on the
+        // same ordered channel, so the renderer never observes "done" first.
+        this.sendDirectoryLoad(session, task.rootId, task.generation, 'complete');
+      }
+    } catch (error) {
+      if (this.directoryLoads.get(task.rootId) !== task) return;
+      const cancelled = task.cancelled || (isFileSystemError(error) && error.code === 'ECANCELED');
+      await this.flushTickNow();
+      if (this.directoryLoads.get(task.rootId) !== task) return;
+      for (const sessionId of task.interestedSessions) {
+        const session = this.sessions.get(sessionId);
+        if (session === undefined || !session.handshook) continue;
+        if (cancelled) {
+          this.sendDirectoryLoad(session, task.rootId, task.generation, 'cancelled');
+        } else {
+          this.sendDirectoryLoad(session, task.rootId, task.generation, 'error', {
+            code: isFileSystemError(error) ? error.code : 'EUNKNOWN',
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+    } finally {
+      if (this.directoryLoads.get(task.rootId) === task) {
+        this.directoryLoads.delete(task.rootId);
+      }
+    }
+  }
+
+  private releaseDirectoryLoad(session: Session, id: number, notify = true): void {
+    const task = this.directoryLoads.get(id);
+    if (task === undefined) return;
+    task.interestedSessions.delete(session.id);
+    if (notify) this.sendDirectoryLoad(session, id, task.generation, 'cancelled');
+    if (task.interestedSessions.size > 0) return;
+    task.cancelled = true;
+    if (task.operationId !== null) this.explorer.cancelOperation(task.operationId);
+  }
+
+  /** Supersede a progressive task after another authoritative resync wins. */
+  private completeDirectoryLoadTask(id: number): void {
+    const task = this.directoryLoads.get(id);
+    if (task === undefined) return;
+    task.cancelled = true;
+    this.directoryLoads.delete(id);
+    if (task.operationId !== null) this.explorer.cancelOperation(task.operationId);
+    for (const sessionId of task.interestedSessions) {
+      const session = this.sessions.get(sessionId);
+      if (session === undefined || !session.handshook || !session.expanded.has(id)) continue;
+      this.sendDirectoryLoad(session, id, task.generation, 'complete');
+    }
+  }
+
+  private sendDirectoryLoad(
+    session: Session,
+    id: number,
+    generation: number,
+    state: 'loading' | 'complete' | 'error' | 'cancelled',
+    error?: { code: string; message: string },
+  ): void {
+    this.send(
+      session,
+      frame('directoryLoad', {
+        id,
+        generation,
+        state,
+        ...(error !== undefined ? { error } : {}),
+      }),
+    );
   }
 
   private handleSetViewport(
@@ -1650,9 +1798,9 @@ class FileExplorerHostImpl implements FileExplorerHost {
             ? (requested.parentId ?? id)
             : id;
         const version = await this.explorer.resync(id, { recursive });
-        this.prefetchInFlight.delete(markerId);
         this.markSubtreeResynced(markerId);
         await this.flushTickAcked();
+        this.completeDirectoryLoadTask(markerId);
         return version;
       }
       case 'resyncWorkspace': {
@@ -1662,10 +1810,10 @@ class FileExplorerHostImpl implements FileExplorerHost {
           .map((root) => root.id);
         const version = await this.explorer.resyncWorkspace();
         for (const rootId of rootIds) {
-          this.prefetchInFlight.delete(rootId);
           this.markSubtreeResynced(rootId);
         }
         await this.flushTickAcked();
+        for (const rootId of rootIds) this.completeDirectoryLoadTask(rootId);
         return version;
       }
       case 'resolvePath': {
@@ -1768,6 +1916,8 @@ class FileExplorerHostImpl implements FileExplorerHost {
   private detachSession(id: number): void {
     const session = this.sessions.get(id);
     if (!session) return;
+    for (const expandedId of session.expanded)
+      this.releaseDirectoryLoad(session, expandedId, false);
     session.detach();
     // SPEC §23.3 — releasing the claims here is what stops a session that
     // dropped mid-transfer from reserving its operation ids forever.
@@ -1783,9 +1933,14 @@ class FileExplorerHostImpl implements FileExplorerHost {
     this.watcherEventSub.dispose();
     this.warningSub.dispose();
     this.stopTick();
+    const directoryLoadPromises = [...this.directoryLoads.values()]
+      .map((task) => task.promise)
+      .filter((promise): promise is Promise<void> => promise !== null);
     for (const id of [...this.sessions.keys()]) {
       this.detachSession(id);
     }
+    await Promise.allSettled(directoryLoadPromises);
+    this.directoryLoads.clear();
     await this.explorer.dispose();
   }
 }

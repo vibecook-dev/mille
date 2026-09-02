@@ -17,6 +17,7 @@
 // package root.
 
 import type {
+  DirectoryLoadState,
   Decoration,
   Entry,
   EntryId,
@@ -213,6 +214,20 @@ export class ClientMirrorSnapshot {
   /** Whether the host has published an authoritative direct-child result. */
   directoryChildrenLoaded(id: EntryId): boolean {
     return this.state.directChildCounts.has(id);
+  }
+
+  directoryLoadState(id: EntryId): DirectoryLoadState {
+    if (this.state.directChildCounts.has(id)) return { state: 'complete' };
+    const record = this.state.directoryLoads.get(id);
+    if (record?.state === 'loading') return { state: 'loading' };
+    if (record?.state === 'error') {
+      return {
+        state: 'error',
+        code: record.error?.code ?? 'EUNKNOWN',
+        message: record.error?.message ?? 'Directory listing failed',
+      };
+    }
+    return { state: 'idle' };
   }
 
   hasChildren(id: EntryId): boolean {

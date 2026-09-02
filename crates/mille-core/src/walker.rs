@@ -109,11 +109,97 @@ pub fn walk_with_ignore(
     walk_inner(root, options, Some(ignore))
 }
 
+/// Stream a walk in bounded batches. The walker keeps its deterministic
+/// per-directory ordering, but callers can publish each completed batch
+/// instead of waiting for the entire subtree to materialize.
+pub fn walk_batched<C, F>(
+    root: &Path,
+    options: WalkOptions,
+    batch_size: usize,
+    cancelled: C,
+    on_batch: F,
+) -> Result<(), FxError>
+where
+    C: FnMut() -> bool,
+    F: FnMut(Vec<WalkedEntry>) -> Result<(), FxError>,
+{
+    walk_inner_batched(root, options, None, batch_size, cancelled, on_batch)
+}
+
+/// Ignore-aware companion to [`walk_batched`].
+pub fn walk_with_ignore_batched<C, F>(
+    root: &Path,
+    options: WalkOptions,
+    ignore: &IgnoreMatcher,
+    batch_size: usize,
+    cancelled: C,
+    on_batch: F,
+) -> Result<(), FxError>
+where
+    C: FnMut() -> bool,
+    F: FnMut(Vec<WalkedEntry>) -> Result<(), FxError>,
+{
+    walk_inner_batched(root, options, Some(ignore), batch_size, cancelled, on_batch)
+}
+
 fn walk_inner(
     root: &Path,
     options: WalkOptions,
     ignore: Option<&IgnoreMatcher>,
 ) -> Result<Vec<WalkedEntry>, FxError> {
+    let mut out = Vec::new();
+    walk_inner_visit(root, options, ignore, |entry| {
+        out.push(entry);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+fn walk_inner_batched<C, F>(
+    root: &Path,
+    options: WalkOptions,
+    ignore: Option<&IgnoreMatcher>,
+    batch_size: usize,
+    mut cancelled: C,
+    mut on_batch: F,
+) -> Result<(), FxError>
+where
+    C: FnMut() -> bool,
+    F: FnMut(Vec<WalkedEntry>) -> Result<(), FxError>,
+{
+    let batch_size = batch_size.max(1);
+    let mut batch = Vec::with_capacity(batch_size.min(4096));
+    walk_inner_visit(root, options, ignore, |entry| {
+        if cancelled() {
+            return Err(FxError::Cancelled);
+        }
+        batch.push(entry);
+        if batch.len() >= batch_size {
+            on_batch(std::mem::take(&mut batch))?;
+            // Be cooperative with the host/runtime thread consuming the
+            // immutable snapshots and change notices produced by the batch.
+            std::thread::yield_now();
+        }
+        Ok(())
+    })?;
+    if cancelled() {
+        return Err(FxError::Cancelled);
+    }
+    if !batch.is_empty() {
+        on_batch(batch)?;
+    }
+    Ok(())
+}
+
+fn walk_inner_visit<F>(
+    root: &Path,
+    options: WalkOptions,
+    ignore: Option<&IgnoreMatcher>,
+    mut visit: F,
+) -> Result<(), FxError>
+where
+    F: FnMut(WalkedEntry) -> Result<(), FxError>,
+{
     if !root.exists() {
         return Err(FxError::Io {
             code: ErrorCode::ENOENT,
@@ -210,8 +296,6 @@ fn walk_inner(
         });
     }
 
-    let mut out = Vec::new();
-
     for result in builder {
         let dent = match result {
             Ok(d) => d,
@@ -279,7 +363,7 @@ fn walk_inner(
             path.parent().map(|p| p.to_path_buf())
         };
 
-        out.push(WalkedEntry {
+        visit(WalkedEntry {
             path,
             parent_path,
             name,
@@ -292,10 +376,10 @@ fn walk_inner(
             is_readonly,
             is_hidden,
             depth: depth as u16,
-        });
+        })?;
     }
 
-    Ok(out)
+    Ok(())
 }
 
 /// Convert a walked entry set into `Entry` records and push them into
@@ -539,6 +623,59 @@ mod tests {
         let entries = walk(td.path(), WalkOptions::default()).unwrap();
         let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn batched_walk_preserves_order_and_bound() {
+        let td = TempDir::new().unwrap();
+        for name in ["e", "a", "d", "b", "c"] {
+            make_file(td.path(), name, b"");
+        }
+        let mut batches = Vec::new();
+        walk_batched(
+            td.path(),
+            WalkOptions::default(),
+            2,
+            || false,
+            |batch| {
+                batches.push(batch);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(batches.iter().map(Vec::len).collect::<Vec<_>>(), [2, 2, 1]);
+        let names: Vec<_> = batches
+            .iter()
+            .flatten()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["a", "b", "c", "d", "e"]);
+    }
+
+    #[test]
+    fn batched_walk_cancels_before_publishing_a_second_page() {
+        use std::cell::Cell;
+
+        let td = TempDir::new().unwrap();
+        for name in ["a", "b", "c", "d"] {
+            make_file(td.path(), name, b"");
+        }
+        let cancelled = Cell::new(false);
+        let mut pages = 0;
+        let err = walk_batched(
+            td.path(),
+            WalkOptions::default(),
+            2,
+            || cancelled.get(),
+            |_| {
+                pages += 1;
+                cancelled.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, FxError::Cancelled));
+        assert_eq!(pages, 1);
     }
 
     #[test]

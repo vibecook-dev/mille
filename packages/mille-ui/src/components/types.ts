@@ -19,6 +19,7 @@ import type {
 } from 'react';
 import type {
   Decoration,
+  DirectoryLoadState,
   Entry,
   EntryId,
   MirrorSnapshot,
@@ -124,6 +125,8 @@ export interface FileTreeSnapshotLike {
   getById(id: EntryId): Entry | null;
   directChildCount(id: EntryId): number | null;
   hasChildren(id: EntryId): boolean;
+  /** Optional progressive hydration state supplied by port snapshots. */
+  directoryLoadState?(id: EntryId): DirectoryLoadState;
   getDecorations(id: EntryId): readonly Decoration[];
 }
 
@@ -191,6 +194,8 @@ export interface FileTreeRowProps {
   readonly expanded: boolean;
   readonly hasChildren: boolean;
   readonly pending: boolean;
+  readonly loadError?: { readonly code: string; readonly message: string };
+  readonly onRetryLoad?: () => void;
   readonly decorations: MergedDecoration;
   readonly iconTheme?: IconTheme;
   readonly className?: string;

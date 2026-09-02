@@ -89,22 +89,24 @@ export interface VisibleRowCount {
   readonly pendingExpansions: ReadonlySet<EntryId>;
 }
 
+export type DirectoryLoadState =
+  | { readonly state: 'idle' }
+  | { readonly state: 'loading' }
+  | { readonly state: 'complete' }
+  | {
+      readonly state: 'error';
+      readonly code: string;
+      readonly message: string;
+    };
+
 export type CollisionPolicy = 'error' | 'rename' | 'overwrite' | 'skip' | 'merge';
 
 // Undo types + normalizers live in browser-safe `undo.ts` so the port
 // client can share them without pulling this Node/native module.
 export type { UndoDescriptor, UndoKind, UndoResult } from './undo.js';
-export {
-  normalizeUndoDescriptor,
-  normalizeUndoKind,
-  normalizeUndoResult,
-} from './undo.js';
+export { normalizeUndoDescriptor, normalizeUndoKind, normalizeUndoResult } from './undo.js';
 import type { UndoDescriptor, UndoKind, UndoResult } from './undo.js';
-import {
-  normalizeUndoDescriptor,
-  normalizeUndoKind,
-  normalizeUndoResult,
-} from './undo.js';
+import { normalizeUndoDescriptor, normalizeUndoKind, normalizeUndoResult } from './undo.js';
 
 export type DestinationProbeStatus = 'free' | 'exists' | 'case_conflict';
 
@@ -146,6 +148,12 @@ export interface TransferOptions {
 export interface ResyncOptions {
   /** Reconcile every known descendant. Defaults to direct children only. */
   readonly recursive?: boolean;
+}
+
+export interface ProgressiveResyncOptions {
+  readonly operationId: string;
+  readonly batchSize?: number;
+  readonly signal?: AbortSignal;
 }
 
 export interface Decoration {
@@ -197,6 +205,8 @@ export interface ExplorerOptions {
   readonly excludeGlobs?: readonly string[];
   readonly snapshotPath?: string;
   readonly maxCachedEntries?: number;
+  /** Initial progressive page size. Later pages grow to amortize large stores. Default: 256. */
+  readonly directoryBatchSize?: number;
   /**
    * Phase B2 — initial walk policy. Currently advisory on the
    * `FileExplorer` itself (it never walks at construction time; callers
@@ -226,6 +236,11 @@ export interface ListOptions {
    * only. Default: 1.
    */
   readonly depth?: number;
+  readonly includeIgnored?: boolean;
+  readonly offset?: number;
+  readonly limit?: number;
+  readonly sort?: 'name' | 'mtime' | 'size' | 'kindThenName';
+  readonly sortDir?: 'asc' | 'desc';
   readonly signal?: AbortSignal;
 }
 
@@ -258,6 +273,7 @@ type NativeFx = {
   updateWorkspaceRoots(roots: string[]): Promise<number>;
   refreshWorkspaceRoots(): Promise<number>;
   resync(id: number, recursive?: boolean): Promise<number>;
+  resyncProgressive?(id: number, operationId: string, batchSize?: number): Promise<number>;
   resyncWorkspace(): Promise<number>;
   populateFromRoots(): Promise<number>;
   seedWorkspaceRoots(): number;
@@ -436,6 +452,8 @@ function resolveRoot(u: Uri | string): string {
   if (typeof u === 'string') return u;
   return u.path;
 }
+
+let nextDirectoryOperationId = 1;
 
 /**
  * Linear scan of a folder's direct children for a name match. Used by
@@ -624,6 +642,36 @@ export class FileExplorer {
    */
   resync(id: EntryId, options?: ResyncOptions): Promise<number> {
     return wrap(this.nativeFx.resync(id, options?.recursive ?? false));
+  }
+
+  /** Bounded, cancellable direct-child reconciliation used by lazy hosts. */
+  async resyncProgressive(id: EntryId, options: ProgressiveResyncOptions): Promise<number> {
+    const signal = options.signal;
+    if (signal?.aborted) {
+      throw new FileSystemError('ECANCELED', 'directory reconciliation cancelled');
+    }
+    const nativeMethod = this.nativeFx.resyncProgressive;
+    if (typeof nativeMethod !== 'function') {
+      return this.resync(id);
+    }
+    const requestedBatchSize = options.batchSize;
+    const batchSize =
+      typeof requestedBatchSize === 'number' && Number.isFinite(requestedBatchSize)
+        ? Math.max(16, Math.min(4096, Math.trunc(requestedBatchSize)))
+        : 256;
+    const cancel = (): void => {
+      if (!this.cancelOperation(options.operationId)) {
+        // The async native body registers on its first runtime poll. A signal
+        // can fire in the narrow gap between invocation and registration.
+        queueMicrotask(() => this.cancelOperation(options.operationId));
+      }
+    };
+    signal?.addEventListener('abort', cancel, { once: true });
+    try {
+      return await wrap(nativeMethod.call(this.nativeFx, id, options.operationId, batchSize));
+    } finally {
+      signal?.removeEventListener('abort', cancel);
+    }
   }
 
   /** Reconcile every configured root and descendant against disk. */
@@ -826,6 +874,19 @@ export class FileExplorer {
    */
   async prefetch(id: EntryId, options?: { depth?: number; signal?: AbortSignal }): Promise<void> {
     const depth = options?.depth ?? 1;
+    if (options?.signal?.aborted) {
+      throw new FileSystemError('ECANCELED', 'directory prefetch cancelled');
+    }
+    if (depth === 1 && this.getSnapshot().directoryChildrenLoaded(id)) return;
+    if (depth === 1 && typeof this.nativeFx.resyncProgressive === 'function') {
+      const operationId = `mille:prefetch:${nextDirectoryOperationId++}:${id}`;
+      await this.resyncProgressive(id, {
+        operationId,
+        batchSize: 256,
+        ...(options?.signal !== undefined ? { signal: options.signal } : {}),
+      });
+      return;
+    }
     const populateFromPath = this.nativeFx.populateFromPath;
     if (typeof populateFromPath !== 'function') {
       throw new Error(
@@ -842,10 +903,9 @@ export class FileExplorer {
   /**
    * Phase B2 — asynchronous listing of a folder's children. Triggers a
    * bounded walk (same primitive as `prefetch`) and then reads the
-   * freshly-populated children from the snapshot. Matches the shape
-   * described in api.d.ts but scoped to the subset the host needs today —
-   * depth-1 listing without pagination. Pagination + `ListPage.hasMore`
-   * are wired to the native search/list primitives in a later phase.
+   * freshly-populated children from the snapshot. Offset/limit are applied
+   * after the authoritative read; host-driven expansion publishes the same
+   * read progressively while it is in flight.
    */
   async list(parentId: EntryId, options?: ListOptions): Promise<ListPage> {
     const depth = options?.depth ?? 1;
@@ -860,13 +920,38 @@ export class FileExplorer {
       }
     }
     const snap = this.getSnapshot();
-    const kids = snap.childrenOf(parentId);
+    const kids = snap.projectedChildrenOf(parentId, options?.includeIgnored);
     const entries: Entry[] = [];
     for (const kidId of kids) {
       const e = snap.getById(kidId);
       if (e) entries.push(e);
     }
-    return { entries, total: entries.length, hasMore: false };
+    if (options?.sort !== undefined) {
+      const direction = options.sortDir === 'desc' ? -1 : 1;
+      const sort = options.sort;
+      entries.sort((a, b) => {
+        let result = 0;
+        if (sort === 'mtime') result = a.mtimeMs - b.mtimeMs;
+        else if (sort === 'size') result = a.size - b.size;
+        else if (sort === 'kindThenName') {
+          const aDirectory = a.kind === 1 || a.symlinkTargetIsDir === true;
+          const bDirectory = b.kind === 1 || b.symlinkTargetIsDir === true;
+          result = Number(bDirectory) - Number(aDirectory);
+        }
+        if (result === 0) result = a.name.localeCompare(b.name, undefined, { numeric: true });
+        if (result === 0) result = a.id - b.id;
+        return result * direction;
+      });
+    }
+    const total = entries.length;
+    const normalizePageNumber = (value: number | undefined, fallback: number): number =>
+      typeof value === 'number' && Number.isFinite(value)
+        ? Math.min(0xffff_ffff, Math.max(0, Math.trunc(value)))
+        : fallback;
+    const offset = normalizePageNumber(options?.offset, 0);
+    const limit = normalizePageNumber(options?.limit, total);
+    const page = entries.slice(offset, offset + limit);
+    return { entries: page, total, hasMore: offset + page.length < total };
   }
 
   /**
@@ -1344,6 +1429,11 @@ export class MirrorSnapshot {
   /** @internal — distinguishes a pending directory from a loaded empty one. */
   directoryChildrenLoaded(id: EntryId): boolean {
     return this.inner.directoryChildrenLoaded(id);
+  }
+
+  /** Local snapshots have no transport-level failure state. */
+  directoryLoadState(id: EntryId): DirectoryLoadState {
+    return this.inner.directoryChildrenLoaded(id) ? { state: 'complete' } : { state: 'idle' };
   }
 
   /** @internal — child count after compact-folder and file-nesting projection. */

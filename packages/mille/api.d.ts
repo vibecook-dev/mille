@@ -193,6 +193,18 @@ export interface ResyncOptions {
   readonly recursive?: boolean;
 }
 
+export interface ProgressiveResyncOptions {
+  /** Unique id accepted by `cancelOperation`. */
+  readonly operationId: string;
+  /**
+   * Initial entries per immutable snapshot. Later publications grow
+   * geometrically, bounded at 16x this value and 4096. Default: 256.
+   */
+  readonly batchSize?: number;
+  /** Cooperative cancellation for local/native callers. */
+  readonly signal?: AbortSignal;
+}
+
 // ─── Explorer construction ─────────────────────────────────────────────────
 
 export interface ExplorerOptions {
@@ -232,6 +244,13 @@ export interface ExplorerOptions {
 
   /** Max in-memory entries. Further children are lazy-loaded. Default: 500_000. */
   readonly maxCachedEntries?: number;
+
+  /**
+   * Initial entries per progressive directory page. Later pages grow
+   * geometrically (bounded at 4096) to keep very wide folders efficient.
+   * Default: 256.
+   */
+  readonly directoryBatchSize?: number;
 
   /**
    * Phase B2 — initial walk policy. Consumed by `createFileExplorerHost`
@@ -367,6 +386,16 @@ export interface VisibleRowCount {
   readonly pendingExpansions: ReadonlySet<EntryId>;
 }
 
+export type DirectoryLoadState =
+  | { readonly state: 'idle' }
+  | { readonly state: 'loading' }
+  | { readonly state: 'complete' }
+  | {
+      readonly state: 'error';
+      readonly code: string;
+      readonly message: string;
+    };
+
 /**
  * Immutable view of the tree at a specific tree-version + decoration-version.
  * Safe to read during React render; safe to cache in refs; safe to diff via
@@ -404,6 +433,9 @@ export interface MirrorSnapshot {
 
   /** True once the folder's authoritative direct-child listing completed. */
   directoryChildrenLoaded(id: EntryId): boolean;
+
+  /** Explicit loading/error state for progressive directory hydration. */
+  directoryLoadState(id: EntryId): DirectoryLoadState;
 
   /** True when the entry has visible children or is an unloaded directory that may have them. */
   hasChildren(id: EntryId): boolean;
@@ -637,6 +669,9 @@ export declare class FileExplorer implements Disposable {
    * path. Files refresh through their containing directory.
    */
   resync(id: EntryId, options?: ResyncOptions): Promise<TreeVersion>;
+
+  /** Cancellable direct-child reconciliation with bounded publications. */
+  resyncProgressive(id: EntryId, options: ProgressiveResyncOptions): Promise<TreeVersion>;
 
   /** Reconcile every configured root and descendant against disk. */
   resyncWorkspace(): Promise<TreeVersion>;

@@ -298,6 +298,15 @@
   text-transform: none;
 }
 
+[data-mille-theme="vibefield"] .mille-load-error-badge {
+  border: 0;
+  padding: 0 2px;
+  color: var(--mille-error-color, #ff718d);
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+}
+
 /* ── Chevron and icons ────────────────────────────────────────────────
    Icons are muted by opacity rather than color so they keep inheriting the
    row's ramp through every state with one rule instead of five. */

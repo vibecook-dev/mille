@@ -73,6 +73,7 @@ export function evictToCap(
     state.orderedChildren.delete(c.id);
     state.directChildCounts.delete(c.id);
     state.pendingExpansions.delete(c.id);
+    state.directoryLoads.delete(c.id);
     state.expanded.delete(c.id);
     state.viewportIds.delete(c.id);
     state.volatileSubtrees.delete(c.id);
@@ -234,6 +235,7 @@ export function applySnapshot(
     orderedChildren: new Set(),
     directChildCounts: new Map(),
     pendingExpansions: new Set(),
+    directoryLoads: new Map(),
     expanded: new Set(_prev.expanded),
     viewportIds: new Set(_prev.viewportIds),
     roots: [...msg.roots],
@@ -386,6 +388,7 @@ export function applyDelta(
     next.orderedChildren.delete(id);
     next.directChildCounts.delete(id);
     next.pendingExpansions.delete(id);
+    next.directoryLoads.delete(id);
     next.expanded.delete(id);
     next.viewportIds.delete(id);
     next.volatileSubtrees.delete(id);
@@ -428,16 +431,20 @@ export function applyDelta(
         next.children.set(parentId, fresh);
       }
       next.orderedChildren.delete(parentId);
-      // Arrival of a parent's children clears its pendingExpansions
-      // flag — consumers stop rendering a spinner for it.
-      next.pendingExpansions.delete(parentId);
+      // A progressive listing can publish several authoritative partial
+      // child arrays. Only the final direct-child count proves completion.
+      if (Object.prototype.hasOwnProperty.call(msg.directChildCounts, String(parentId))) {
+        next.pendingExpansions.delete(parentId);
+      }
     }
   }
 
   for (const [parentId, ids] of incomingChildLists) {
     next.children.set(parentId, ids);
     next.orderedChildren.add(parentId);
-    next.pendingExpansions.delete(parentId);
+    if (Object.prototype.hasOwnProperty.call(msg.directChildCounts, String(parentId))) {
+      next.pendingExpansions.delete(parentId);
+    }
   }
 
   // Merge direct-child-counts (fresh values win).
@@ -516,6 +523,37 @@ export function applyDelta(
   }
 
   evictToCap(next, mirrorCap, activeSet(next));
+  return next;
+}
+
+export interface InboundDirectoryLoad {
+  readonly id: number;
+  readonly generation: number;
+  readonly state: 'loading' | 'complete' | 'error' | 'cancelled';
+  readonly error?: { readonly code: string; readonly message: string };
+}
+
+/** Apply one session-scoped directory hydration state transition. */
+export function applyDirectoryLoad(state: MirrorWorking, msg: InboundDirectoryLoad): MirrorWorking {
+  const next = cloneMirror(state);
+  const current = next.directoryLoads.get(msg.id);
+  if (current !== undefined && msg.generation < current.generation) return state;
+
+  if (msg.state === 'loading') {
+    next.directoryLoads.set(msg.id, { generation: msg.generation, state: 'loading' });
+    next.pendingExpansions.add(msg.id);
+  } else if (msg.state === 'error') {
+    next.directoryLoads.set(msg.id, {
+      generation: msg.generation,
+      state: 'error',
+      error: msg.error ?? { code: 'EUNKNOWN', message: 'Directory listing failed' },
+    });
+    next.pendingExpansions.delete(msg.id);
+  } else {
+    next.directoryLoads.delete(msg.id);
+    next.pendingExpansions.delete(msg.id);
+  }
+  next.projectionVersion += 1;
   return next;
 }
 

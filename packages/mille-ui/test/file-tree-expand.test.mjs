@@ -4,7 +4,8 @@
 //   B. After emitDelta with the children visible, DOM reflects growth.
 //   C. A row with id in `pendingExpansions` renders a LoadingBadge;
 //      once the fake clears `pendingExpansions`, the badge is gone.
-//   D. When a command registry is attached to the provider, chevron
+//   D. A failed directory shows a reason and exposes an in-place retry.
+//   E. When a command registry is attached to the provider, chevron
 //      click dispatches `tree.expand` (and later `tree.collapse`).
 
 import { test } from 'node:test';
@@ -540,7 +541,57 @@ test('LoadingBadge appears for rows in pendingExpansions and clears on delta', a
   container.remove();
 });
 
-// ─── Test D: chevron click dispatches `tree.expand` via command registry
+test('directory load errors expose their reason and retry without a collapse toggle', async () => {
+  const fx = createFakeEngine();
+  const rows = [
+    makeRow({ id: 1, parentId: null, name: 'root', depth: 0, hasChildren: true, isExpanded: true }),
+  ];
+  fx.emitDelta(
+    createFakeSnapshot({
+      rows,
+      treeVersion: 1,
+      directoryLoads: new Map([
+        [1, { state: 'error', code: 'EACCES', message: 'permission denied' }],
+      ]),
+    }),
+  );
+
+  const { container, root } = mount();
+  const obs = makeObservers();
+  await act(async () => {
+    root.render(
+      createElement(FileTree, {
+        fx,
+        ariaLabel: 'Retry loading',
+        rowHeight: 22,
+        overscan: 5,
+        __testObserveElementRect: obs.observeElementRect,
+        __testObserveElementOffset: obs.observeElementOffset,
+      }),
+    );
+  });
+
+  const retry = container.querySelector('button[aria-label="Retry loading root"]');
+  assert.ok(retry, 'expected an in-row retry control');
+  assert.equal(retry.getAttribute('title'), 'EACCES: permission denied');
+  fx.calls.setExpanded.length = 0;
+  await act(async () => { dispatchClick(retry); });
+  assert.deepEqual(fx.calls.setExpanded, [{ add: [1], remove: [] }]);
+
+  await act(async () => {
+    fx.emitDelta(createFakeSnapshot({ rows, treeVersion: 2 }));
+  });
+  assert.equal(
+    container.querySelector('button[aria-label="Retry loading root"]'),
+    null,
+    'successful retry clears the error affordance',
+  );
+
+  await act(async () => { root.unmount(); });
+  container.remove();
+});
+
+// ─── Test E: chevron click dispatches `tree.expand` via command registry
 
 test('chevron click dispatches tree.expand through the command registry', async () => {
   const fx = createFakeEngine();

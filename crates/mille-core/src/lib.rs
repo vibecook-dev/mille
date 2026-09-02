@@ -43,7 +43,8 @@ pub use resume::{
 pub mod walker;
 pub use walker::{
     build_ignore_matcher_from_walk, populate_store, populate_store_with_provenance, walk,
-    walk_with_ignore, SymlinkPolicy, WalkOptions, WalkedEntry,
+    walk_batched, walk_with_ignore, walk_with_ignore_batched, SymlinkPolicy, WalkOptions,
+    WalkedEntry,
 };
 
 // TODO: Phase 2 — ripgrep `ignore` crate wrapper

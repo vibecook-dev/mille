@@ -267,6 +267,24 @@ export interface EventMsg {
   };
 }
 
+/**
+ * Per-directory hydration state. Additive in protocol v1: older clients
+ * ignore the frame, while current clients use it to keep partial listings in
+ * a loading state and surface retryable failures without collapsing rows.
+ */
+export interface DirectoryLoadMsg {
+  type: 'directoryLoad';
+  body: {
+    id: number;
+    generation: number;
+    state: 'loading' | 'complete' | 'error' | 'cancelled';
+    error?: {
+      code: string;
+      message: string;
+    };
+  };
+}
+
 export interface MutateResultMsg {
   type: 'mutateResult';
   body: {
@@ -306,6 +324,7 @@ export interface ErrorMsg {
 export type HostToClientMessage =
   | SnapshotMsg
   | DeltaMsg
+  | DirectoryLoadMsg
   | EventMsg
   | MutateResultMsg
   | CallResultMsg

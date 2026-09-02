@@ -920,6 +920,66 @@ impl FileExplorer {
         Ok(self.store.tree_version() as u32)
     }
 
+    /// Progressively reconcile one directory in bounded publication batches.
+    /// The operation remains provisional until EOF; cancellation leaves any
+    /// useful prefix cached but does not mark the directory complete.
+    #[napi(js_name = "resyncProgressive", catch_unwind)]
+    pub async fn resync_progressive(
+        &self,
+        id: i64,
+        operation_id: String,
+        batch_size: Option<u32>,
+    ) -> Result<u32> {
+        self.ensure_watcher()?;
+        if operation_id.is_empty() {
+            return Err(fx_error_to_napi(FxError::InvalidInput(
+                "resyncProgressive requires a non-empty operationId".into(),
+            )));
+        }
+        let entry = self.store.get_by_id(EntryId(id as u64)).ok_or_else(|| {
+            fx_error_to_napi(FxError::InvalidInput(format!(
+                "id {} not found in snapshot",
+                id
+            )))
+        })?;
+        if entry.kind != EntryKind::Directory && entry.symlink_target_is_dir != Some(true) {
+            return Err(fx_error_to_napi(FxError::InvalidInput(format!(
+                "id {} is not a directory",
+                id
+            ))));
+        }
+        let path = self.resolve_path_for_id(id)?;
+        let token = CancellationToken::new();
+        {
+            let mut operations = self.operations.lock();
+            if operations.contains_key(&operation_id) {
+                return Err(fx_error_to_napi(FxError::InvalidInput(format!(
+                    "duplicate operationId already in flight: {operation_id}"
+                ))));
+            }
+            operations.insert(operation_id.clone(), token.clone());
+        }
+
+        let result: std::result::Result<u32, FxError> = (|| {
+            let _policy_guard = self.policy_gate.lock();
+            let mut previous_version = self.store.tree_version();
+            crate::watch_runtime::reconcile_directory_progressive(
+                &self.store,
+                &self.watch_config(),
+                &path,
+                batch_size.unwrap_or(256).clamp(16, 4096) as usize,
+                &token,
+                |outcome| {
+                    self.emit_reconcile_notice(previous_version, outcome);
+                    previous_version = self.store.tree_version();
+                },
+            )?;
+            Ok(self.store.tree_version() as u32)
+        })();
+        self.operations.lock().remove(&operation_id);
+        result.map_err(fx_error_to_napi)
+    }
+
     /// Authoritatively reconcile every configured root and all descendants.
     /// One change notice covers the complete operation.
     #[napi(js_name = "resyncWorkspace", catch_unwind)]

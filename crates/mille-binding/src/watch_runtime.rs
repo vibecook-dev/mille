@@ -11,11 +11,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mille_core::{
-    coalesce_events, walk, walk_with_ignore, Entry, EntryId, EntryKind, EntryStore, FsChangeEvent,
-    FxError, IgnoreMatcher, IntentCache, IntentKind, RenamePairer, SymlinkPolicy, WalkOptions,
-    WalkedEntry, Watcher, WatcherOptions,
+    coalesce_events, walk, walk_batched, walk_with_ignore, walk_with_ignore_batched, Entry,
+    EntryId, EntryKind, EntryStore, FsChangeEvent, FxError, IgnoreMatcher, IntentCache, IntentKind,
+    RenamePairer, SymlinkPolicy, WalkOptions, WalkedEntry, Watcher, WatcherOptions,
 };
 use parking_lot::Mutex;
+use tokio_util::sync::CancellationToken;
 
 use crate::events::{clone_event, Channel, EventBus};
 use crate::types::{ChangeNoticeJs, EntryJs, ErrorPayloadJs, FileSystemEventJs, WarningPayloadJs};
@@ -533,6 +534,190 @@ pub(crate) fn reconcile_directory(
     Ok(out)
 }
 
+/// Depth-one reconciliation that publishes bounded child batches as they are
+/// walked. Missing-entry removal and the loaded-directory marker are deferred
+/// until the iterator reaches EOF, so every partial snapshot is explicitly
+/// provisional and cancellation can never turn a prefix into an authoritative
+/// directory listing.
+pub(crate) fn reconcile_directory_progressive<F>(
+    store: &EntryStore,
+    config: &WatchConfig,
+    directory: &Path,
+    batch_size: usize,
+    token: &CancellationToken,
+    mut publish: F,
+) -> Result<ReconcileOutcome, FxError>
+where
+    F: FnMut(&ReconcileOutcome),
+{
+    if !directory.exists() {
+        let outcome = reconcile_directory(store, config, directory, Some(1))?;
+        publish(&outcome);
+        return Ok(outcome);
+    }
+
+    let walk_options = WalkOptions {
+        max_depth: Some(1),
+        follow_symlinks: config.follow_symlinks,
+        include_hidden: true,
+        include_root: true,
+        // A progressive page is already a bounded unit of parallelism. Keep
+        // jwalk serial so callbacks preserve deterministic directory order.
+        parallelism: 0,
+    };
+    let (traversal, repository_ignore, excludes) = build_reconcile_matchers(directory, config)?;
+    let mut disk_paths = HashSet::new();
+    let mut total = ReconcileOutcome::default();
+    let mut pending_walked = Vec::with_capacity(batch_size);
+    let mut publication_target = batch_size;
+    // Keep the first paint small, then amortize immutable-snapshot cloning as
+    // a pathological directory grows. The ceiling preserves cancellation and
+    // renderer responsiveness while avoiding hundreds of ever-larger clones.
+    let publication_ceiling = batch_size.saturating_mul(16).min(4096);
+
+    {
+        let mut flush_pending =
+            |pending: &mut Vec<WalkedEntry>, target: &mut usize| -> Result<(), FxError> {
+                if pending.is_empty() {
+                    return Ok(());
+                }
+                let walked = std::mem::take(pending);
+                let batch = apply_walked_batch(
+                    store,
+                    directory,
+                    &walked,
+                    repository_ignore.as_ref(),
+                    excludes.as_ref(),
+                )?;
+                publish(&batch);
+                total.merge(batch);
+                *target = target.saturating_mul(2).min(publication_ceiling);
+                pending.reserve(*target);
+                // Give the JS host enough scheduling room to drain and publish a
+                // page instead of coalescing a whole wide folder into one frame.
+                std::thread::sleep(Duration::from_millis(1));
+                Ok(())
+            };
+
+        {
+            let mut consume = |walked: Vec<WalkedEntry>| -> Result<(), FxError> {
+                if token.is_cancelled() {
+                    return Err(FxError::Cancelled);
+                }
+                disk_paths.extend(walked.iter().map(|entry| entry.path.clone()));
+                pending_walked.extend(walked);
+                if pending_walked.len() >= publication_target {
+                    flush_pending(&mut pending_walked, &mut publication_target)?;
+                }
+                Ok(())
+            };
+
+            let cancelled = || token.is_cancelled();
+            match traversal.as_ref() {
+                Some(ignore) => walk_with_ignore_batched(
+                    directory,
+                    walk_options,
+                    ignore,
+                    batch_size,
+                    cancelled,
+                    &mut consume,
+                )?,
+                None => walk_batched(directory, walk_options, batch_size, cancelled, &mut consume)?,
+            }
+        }
+        if token.is_cancelled() {
+            return Err(FxError::Cancelled);
+        }
+        flush_pending(&mut pending_walked, &mut publication_target)?;
+    }
+
+    // EOF is the authority boundary. Remove children that disappeared while
+    // preserving deeper known subtrees for every child still present.
+    let mut final_outcome = ReconcileOutcome::default();
+    let known = store.paths_under(directory);
+    let mut missing: Vec<_> = known
+        .into_iter()
+        .filter(|(path, _)| in_depth(directory, path, Some(1)) && !disk_paths.contains(path))
+        .collect();
+    missing.sort_by_key(|(path, _)| path.components().count());
+    for (path, id) in missing {
+        if store.get_by_path(&path).is_none() {
+            continue;
+        }
+        let parent = store.get_by_id(id).and_then(|entry| entry.parent_id);
+        let removed = store.remove_subtree(id);
+        final_outcome
+            .changed_ids
+            .extend(removed.iter().map(|entry| entry.id));
+        if let Some(parent) = parent {
+            final_outcome.child_set_changed.insert(parent);
+        }
+    }
+
+    if let Some(root) = store.get_by_path(directory) {
+        if store.mark_directory_children_loaded(root.id)? {
+            final_outcome.child_set_changed.insert(root.id);
+        }
+    }
+    publish(&final_outcome);
+    total.merge(final_outcome);
+    Ok(total)
+}
+
+fn apply_walked_batch(
+    store: &EntryStore,
+    directory: &Path,
+    walked: &[WalkedEntry],
+    repository_ignore: Option<&IgnoreMatcher>,
+    excludes: Option<&IgnoreMatcher>,
+) -> Result<ReconcileOutcome, FxError> {
+    let mut out = ReconcileOutcome::default();
+    let mut additions = Vec::new();
+
+    for walked_entry in walked {
+        let existing = store.get_by_path(&walked_entry.path);
+        let parent_id = existing
+            .as_ref()
+            .and_then(|entry| entry.parent_id)
+            .or_else(|| {
+                walked_entry
+                    .parent_path
+                    .as_ref()
+                    .and_then(|parent| store.get_by_path(parent))
+                    .map(|entry| entry.id)
+            })
+            .or_else(|| {
+                (walked_entry.path == directory)
+                    .then(|| walked_entry.path.parent())
+                    .flatten()
+                    .and_then(|parent| store.get_by_path(parent))
+                    .map(|entry| entry.id)
+            });
+        let entry = entry_from_walked(walked_entry, parent_id, repository_ignore, excludes);
+
+        if let Some(existing) = existing {
+            if existing.kind == EntryKind::Directory && entry.kind != EntryKind::Directory {
+                let removed = store.remove_subtree(existing.id);
+                out.changed_ids.extend(removed.iter().map(|entry| entry.id));
+                additions.push((walked_entry.path.clone(), entry));
+                if let Some(parent) = parent_id {
+                    out.child_set_changed.insert(parent);
+                }
+            } else if store.update(existing.id, entry)? {
+                out.changed_ids.insert(existing.id);
+            }
+        } else {
+            additions.push((walked_entry.path.clone(), entry));
+            if let Some(parent) = parent_id {
+                out.child_set_changed.insert(parent);
+            }
+        }
+    }
+
+    out.changed_ids.extend(store.insert_batch(additions)?);
+    Ok(out)
+}
+
 fn in_depth(root: &Path, path: &Path, depth: Option<usize>) -> bool {
     match depth {
         None => true,
@@ -603,6 +788,54 @@ fn walk_for_reconcile(
     }
     Ok((
         walked,
+        config.respect_ignore.then_some(repository_ignore),
+        (!exclude_globs.is_empty()).then_some(excludes),
+    ))
+}
+
+type ReconcileMatchers = (
+    Option<IgnoreMatcher>,
+    Option<IgnoreMatcher>,
+    Option<IgnoreMatcher>,
+);
+
+fn build_reconcile_matchers(
+    directory: &Path,
+    config: &WatchConfig,
+) -> Result<ReconcileMatchers, FxError> {
+    let exclude_globs = config.exclude_globs.read().clone();
+    if !config.respect_ignore && exclude_globs.is_empty() {
+        return Ok((None, None, None));
+    }
+
+    let root =
+        containing_root(&config.roots.read(), directory).unwrap_or_else(|| directory.to_path_buf());
+    let mut traversal = IgnoreMatcher::new();
+    let mut repository_ignore = IgnoreMatcher::new();
+    let mut excludes = IgnoreMatcher::new();
+    if !exclude_globs.is_empty() {
+        traversal.add_from_string(&root, &exclude_globs.join("\n"))?;
+        excludes.add_from_string(&root, &exclude_globs.join("\n"))?;
+    }
+    let mut anchor = root.clone();
+    for segment in directory
+        .strip_prefix(&root)
+        .ok()
+        .into_iter()
+        .flat_map(|path| path.iter())
+    {
+        if config.respect_ignore {
+            add_ignore_files(&mut traversal, &anchor);
+            add_ignore_files(&mut repository_ignore, &anchor);
+        }
+        anchor = anchor.join(segment);
+    }
+    if config.respect_ignore {
+        add_ignore_files(&mut traversal, directory);
+        add_ignore_files(&mut repository_ignore, directory);
+    }
+    Ok((
+        Some(traversal),
         config.respect_ignore.then_some(repository_ignore),
         (!exclude_globs.is_empty()).then_some(excludes),
     ))

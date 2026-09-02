@@ -25,7 +25,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { MessageChannel } from 'node:worker_threads';
 
-import { createFileExplorerHost, connectFileExplorer } from '../dist/index.js';
+import { FileExplorer, createFileExplorerHost, connectFileExplorer } from '../dist/index.js';
 
 function tempRoot() {
   return mkdtempSync(join(tmpdir(), 'mille-lazy-expand-'));
@@ -216,11 +216,266 @@ test('empty directory expansion publishes loaded-empty completion without a seco
   }
 });
 
+test('wide directories publish usable partial rows before authoritative completion', async () => {
+  const dir = tempRoot();
+  try {
+    const total = 512;
+    for (let i = 0; i < total; i++) {
+      writeFileSync(join(dir, `file-${String(i).padStart(4, '0')}.txt`), 'x');
+    }
+    const host = await createFileExplorerHost({
+      roots: [dir],
+      initialWalk: 'roots-only',
+      compactFolders: false,
+      directoryBatchSize: 16,
+    });
+    const { port1, port2 } = new MessageChannel();
+    host.attachPort(port1);
+    const client = await connectFileExplorer(port2, { prefetchRows: 128 });
+    const rootId = client.getSnapshot().roots()[0].id;
+
+    let clientObservedPartial = false;
+    const sub = client.on('change', () => {
+      const snapshot = client.getSnapshot();
+      const rows = snapshot.visibleRows({
+        expanded: new Set([rootId]),
+        offset: 0,
+        limit: 128,
+      });
+      if (
+        rows.length > 1 &&
+        snapshot.directChildCount(rootId) === null &&
+        snapshot.directoryLoadState(rootId).state === 'loading'
+      ) {
+        clientObservedPartial = true;
+      }
+    });
+
+    client.setExpanded({ add: [rootId] });
+    await waitFor(() => {
+      const snapshot = host.local.getSnapshot();
+      const count = snapshot.childrenOf(rootId).length;
+      return count > 0 && count < total && !snapshot.directoryChildrenLoaded(rootId);
+    });
+    await waitFor(() => clientObservedPartial);
+    assert.ok(
+      client
+        .getSnapshot()
+        .visibleRowCount(new Set([rootId]))
+        .pendingExpansions.has(rootId),
+      'partial rows retain the loading indicator',
+    );
+
+    await waitFor(() => client.getSnapshot().directChildCount(rootId) === total, {
+      timeoutMs: 5000,
+    });
+    assert.equal(client.getSnapshot().directoryLoadState(rootId).state, 'complete');
+    const page = await host.local.list(rootId, { offset: 10, limit: 5, sort: 'name' });
+    assert.equal(page.total, total);
+    assert.equal(page.entries.length, 5);
+    assert.equal(page.entries[0].name, 'file-0010.txt');
+    assert.equal(page.hasMore, true);
+    sub.dispose();
+    await client.dispose();
+    await host.dispose();
+  } finally {
+    removeTempDir(dir);
+  }
+});
+
+test('collapsing cancels an obsolete wide-directory read and re-expand retries cleanly', async () => {
+  const dir = tempRoot();
+  try {
+    const total = 2048;
+    for (let i = 0; i < total; i++) {
+      writeFileSync(join(dir, `cancel-${String(i).padStart(5, '0')}.txt`), 'x');
+    }
+    const host = await createFileExplorerHost({
+      roots: [dir],
+      initialWalk: 'roots-only',
+      compactFolders: false,
+      directoryBatchSize: 16,
+    });
+    const { port1, port2 } = new MessageChannel();
+    host.attachPort(port1);
+    const client = await connectFileExplorer(port2);
+    const rootId = client.getSnapshot().roots()[0].id;
+
+    client.setExpanded({ add: [rootId] });
+    await waitFor(() => {
+      const snapshot = host.local.getSnapshot();
+      return snapshot.childrenOf(rootId).length > 0 && !snapshot.directoryChildrenLoaded(rootId);
+    });
+    client.setExpanded({ remove: [rootId] });
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.equal(
+      host.local.getSnapshot().directoryChildrenLoaded(rootId),
+      false,
+      'cancelled prefix is never promoted to an authoritative listing',
+    );
+
+    client.setExpanded({ add: [rootId] });
+    await waitFor(() => client.getSnapshot().directChildCount(rootId) === total, {
+      timeoutMs: 8000,
+    });
+    assert.equal(client.getSnapshot().directoryLoadState(rootId).state, 'complete');
+
+    await client.dispose();
+    await host.dispose();
+  } finally {
+    removeTempDir(dir);
+  }
+});
+
+test('one collapsed window does not cancel a progressive load still used by another', async () => {
+  const dir = tempRoot();
+  try {
+    const total = 1024;
+    for (let i = 0; i < total; i++) {
+      writeFileSync(join(dir, `shared-${String(i).padStart(5, '0')}.txt`), 'x');
+    }
+    const host = await createFileExplorerHost({
+      roots: [dir],
+      initialWalk: 'roots-only',
+      compactFolders: false,
+      directoryBatchSize: 16,
+    });
+    const a = new MessageChannel();
+    const b = new MessageChannel();
+    host.attachPort(a.port1);
+    host.attachPort(b.port1);
+    const clientA = await connectFileExplorer(a.port2);
+    const clientB = await connectFileExplorer(b.port2);
+    const rootId = clientA.getSnapshot().roots()[0].id;
+    assert.equal(clientB.getSnapshot().roots()[0].id, rootId);
+
+    clientA.setExpanded({ add: [rootId] });
+    clientB.setExpanded({ add: [rootId] });
+    await waitFor(() => {
+      const snapshot = host.local.getSnapshot();
+      return snapshot.childrenOf(rootId).length > 0 && !snapshot.directoryChildrenLoaded(rootId);
+    });
+    await waitFor(
+      () =>
+        clientA.getSnapshot().directoryLoadState(rootId).state === 'loading' &&
+        clientB.getSnapshot().directoryLoadState(rootId).state === 'loading',
+    );
+
+    clientA.setExpanded({ remove: [rootId] });
+    await waitFor(() => clientA.getSnapshot().directoryLoadState(rootId).state === 'idle');
+    await waitFor(() => clientB.getSnapshot().directChildCount(rootId) === total, {
+      timeoutMs: 8000,
+    });
+    assert.equal(clientB.getSnapshot().directoryLoadState(rootId).state, 'complete');
+    assert.equal(host.local.getSnapshot().directoryChildrenLoaded(rootId), true);
+
+    // Once the shared authoritative read is cached, the collapsed peer can
+    // re-expand immediately without starting a second filesystem scan.
+    clientA.setExpanded({ add: [rootId] });
+    await waitFor(() => clientA.getSnapshot().directChildCount(rootId) === total);
+    assert.equal(clientA.getSnapshot().directoryLoadState(rootId).state, 'complete');
+
+    await clientA.dispose();
+    await clientB.dispose();
+    await host.dispose();
+  } finally {
+    removeTempDir(dir);
+  }
+});
+
+test('local progressive resync honors AbortSignal without marking a partial page complete', async () => {
+  const dir = tempRoot();
+  const fx = new FileExplorer({ roots: [dir] });
+  try {
+    const total = 1024;
+    for (let i = 0; i < total; i++) {
+      writeFileSync(join(dir, `abort-${String(i).padStart(5, '0')}.txt`), 'x');
+    }
+    fx.seedWorkspaceRoots();
+    const rootId = fx.getSnapshot().roots()[0].id;
+    const controller = new AbortController();
+    const pending = fx.resyncProgressive(rootId, {
+      operationId: 'test-progressive-abort',
+      batchSize: 16,
+      signal: controller.signal,
+    });
+    await waitFor(() => {
+      const snapshot = fx.getSnapshot();
+      return snapshot.childrenOf(rootId).length > 0 && !snapshot.directoryChildrenLoaded(rootId);
+    });
+    controller.abort();
+    await assert.rejects(pending, (error) => error?.code === 'ECANCELED');
+    assert.equal(
+      fx.getSnapshot().directoryChildrenLoaded(rootId),
+      false,
+      'aborted prefix remains retryable rather than masquerading as complete',
+    );
+  } finally {
+    await fx.dispose();
+    removeTempDir(dir);
+  }
+});
+
+test('host disposal cancels and joins an in-flight progressive directory read', async () => {
+  const dir = tempRoot();
+  let host;
+  let client;
+  try {
+    for (let i = 0; i < 1024; i++) {
+      writeFileSync(join(dir, `dispose-${String(i).padStart(5, '0')}.txt`), 'x');
+    }
+    host = await createFileExplorerHost({
+      roots: [dir],
+      initialWalk: 'roots-only',
+      compactFolders: false,
+      directoryBatchSize: 16,
+    });
+    const { port1, port2 } = new MessageChannel();
+    host.attachPort(port1);
+    client = await connectFileExplorer(port2);
+    const rootId = client.getSnapshot().roots()[0].id;
+    client.setExpanded({ add: [rootId] });
+    await waitFor(() => {
+      const snapshot = host.local.getSnapshot();
+      return snapshot.childrenOf(rootId).length > 0 && !snapshot.directoryChildrenLoaded(rootId);
+    });
+
+    await host.dispose();
+    host = undefined;
+  } finally {
+    await client?.dispose().catch(() => {});
+    await host?.dispose().catch(() => {});
+    removeTempDir(dir);
+  }
+});
+
+test('invalid expansion surfaces structured retryable error state', async () => {
+  const dir = tempRoot();
+  try {
+    const host = await createFileExplorerHost({ roots: [dir], initialWalk: 'roots-only' });
+    const { port1, port2 } = new MessageChannel();
+    host.attachPort(port1);
+    const client = await connectFileExplorer(port2);
+    const invalidId = 9_999_999;
+    client.setExpanded({ add: [invalidId] });
+    const state = await waitFor(() => {
+      const current = client.getSnapshot().directoryLoadState(invalidId);
+      return current.state === 'error' ? current : null;
+    });
+    assert.equal(state.code, 'EINVAL');
+    assert.match(state.message, /not in the current snapshot/);
+    await client.dispose();
+    await host.dispose();
+  } finally {
+    removeTempDir(dir);
+  }
+});
+
 test('re-expanding an already-walked folder does not re-trigger a walk', async () => {
   // Guard against accidental re-walks: authoritative native listing state
   // makes `setExpanded({add:[id]})` after completion a no-op on the native
-  // side. We observe this by checking that no additional child-carrying
-  // deltas fan out on the second expand.
+  // side. We observe the explicit load-state channel rather than inferring a
+  // scan from timing-sensitive viewport refill frames.
   const dir = tempRoot();
   try {
     mkdirSync(join(dir, 'a'));
@@ -235,8 +490,10 @@ test('re-expanding an already-walked folder does not re-trigger a walk', async (
     host.attachPort(port1);
 
     const observedDeltaFrames = [];
+    const observedLoadFrames = [];
     port2.on('message', (raw) => {
       if (raw && raw.type === 'delta') observedDeltaFrames.push(raw.body);
+      if (raw && raw.type === 'directoryLoad') observedLoadFrames.push(raw.body);
     });
 
     const client = await connectFileExplorer(port2);
@@ -257,6 +514,7 @@ test('re-expanding an already-walked folder does not re-trigger a walk', async (
     // Let any trailing deltas land before counting.
     await new Promise((r) => setTimeout(r, 50));
     const deltasAfterFirstExpand = observedDeltaFrames.length;
+    const loadsAfterFirstExpand = observedLoadFrames.length;
 
     // Collapse + re-expand. The collapse is a pure session-state change
     // on the client (setExpanded({remove}) ships to the host, which
@@ -265,25 +523,33 @@ test('re-expanding an already-walked folder does not re-trigger a walk', async (
     await new Promise((r) => setTimeout(r, 40));
     client.setExpanded({ add: [rootId] });
 
-    // Give the host a few tick windows. If the guard were broken, a
-    // second prefetch would fire and potentially produce duplicate
-    // child-insertion deltas. The walker's `populateFromPath` filter
-    // (dedupe on path) means duplicates wouldn't actually land —
-    // but firing the walk at all is wasted work.
+    // Give the host a few tick windows. A new native read would publish a
+    // loading transition even when path de-duplication prevented tree deltas.
     await new Promise((r) => setTimeout(r, 80));
 
-    // Re-expansion does not walk again, but it does produce one bounded
-    // viewport refill because collapsing changed the mounted host window to
-    // the root alone.
+    const secondLoadFrames = observedLoadFrames.slice(loadsAfterFirstExpand);
+    assert.equal(
+      secondLoadFrames.filter((body) => body.state === 'loading').length,
+      0,
+      're-expand of an authoritative folder must not start another native read',
+    );
+    assert.ok(
+      secondLoadFrames.some((body) => body.state === 'complete'),
+      'host reports cached completion immediately',
+    );
+
+    // Viewport refills are opportunistically coalesced with the 16ms host
+    // tick, but must stay bounded regardless of scheduler load.
     const entriesOnSecondExpand = observedDeltaFrames
       .slice(deltasAfterFirstExpand)
       .filter((b) => b.viewportPatch instanceof ArrayBuffer && b.viewportPatch.byteLength > 1);
-    assert.equal(
-      entriesOnSecondExpand.length,
-      1,
-      `re-expand should ship one viewport refill (saw ${entriesOnSecondExpand.length})`,
+    assert.ok(
+      entriesOnSecondExpand.length <= 1,
+      `re-expand should ship at most one viewport refill (saw ${entriesOnSecondExpand.length})`,
     );
-    assert.ok(Array.isArray(entriesOnSecondExpand[0].viewportIds));
+    if (entriesOnSecondExpand.length === 1) {
+      assert.ok(Array.isArray(entriesOnSecondExpand[0].viewportIds));
+    }
 
     await client.dispose();
     await host.dispose();

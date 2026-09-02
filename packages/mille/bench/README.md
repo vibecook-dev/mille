@@ -1,5 +1,26 @@
 # Mille core benchmarks
 
+## Progressive directory hydration
+
+`pnpm bench:progressive-directory` creates a 10,000-entry real directory and
+gates time-to-first-partial-page, authoritative completion, and the number of
+host delta frames. The frame gate enforces the adaptive publication schedule:
+the first page stays small, while later pages grow to avoid repeatedly cloning
+an ever-larger immutable snapshot. Override the fixture and budgets with
+`MILLE_PROGRESSIVE_DIRECTORY_COUNT`,
+`MILLE_PROGRESSIVE_DIRECTORY_BATCH`,
+`MILLE_PROGRESSIVE_DIRECTORY_FIRST_PAGE_BUDGET_MS`, and
+`MILLE_PROGRESSIVE_DIRECTORY_COMPLETE_BUDGET_MS`. The derived frame limit can
+be overridden with `MILLE_PROGRESSIVE_DIRECTORY_MAX_DELTA_FRAMES`.
+
+The pathological 100,000-sibling stress gate is:
+
+```sh
+MILLE_PROGRESSIVE_DIRECTORY_COUNT=100000 \
+MILLE_PROGRESSIVE_DIRECTORY_COMPLETE_BUDGET_MS=30000 \
+pnpm bench:progressive-directory
+```
+
 ## Viewport retention
 
 ```sh

@@ -275,6 +275,15 @@
   font-weight: 400;
 }
 
+[data-mille-theme="minimal"] .mille-load-error-badge {
+  border: 0;
+  padding: 0 2px;
+  color: var(--mille-error-color, #d14343);
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+}
+
 [data-mille-theme="minimal"]
   .mille-row[data-mille-selected="true"]
   .mille-row-name,

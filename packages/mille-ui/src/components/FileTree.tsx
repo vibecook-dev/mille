@@ -1965,6 +1965,11 @@ function FileTreeEngineSession(props: FileTreeInnerProps): ReactElement {
 
           const rowExpanded = expanded.has(row.id);
           const pending = pendingSet.has(row.id) || row.pending === true;
+          const directoryLoad = snapshot.directoryLoadState?.(row.id);
+          const loadError =
+            directoryLoad?.state === 'error'
+              ? { code: directoryLoad.code, message: directoryLoad.message }
+              : undefined;
           const depth = row.depth;
           const isStickyRoot = stickyRoots && depth === 0;
           const isSelected = selection.selectedIds.has(row.id);
@@ -2020,6 +2025,12 @@ function FileTreeEngineSession(props: FileTreeInnerProps): ReactElement {
             expanded: rowExpanded,
             hasChildren: row.hasChildren,
             pending,
+            ...(loadError !== undefined
+              ? {
+                  loadError,
+                  onRetryLoad: () => fx.setExpanded({ add: [row.id] }),
+                }
+              : null),
             decorations: rowDecorations,
             ...(iconTheme ? { iconTheme } : null),
             style: rowStyle,

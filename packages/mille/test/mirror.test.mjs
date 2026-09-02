@@ -12,6 +12,7 @@ import { ClientMirrorSnapshot } from '../dist/mirror-snapshot.js';
 import {
   applySnapshot,
   applyDelta,
+  applyDirectoryLoad,
   evictToCap,
   DEFAULT_MIRROR_CAP,
 } from '../dist/mirror-reducer.js';
@@ -56,6 +57,7 @@ test('cloneMirror returns independent map references', () => {
   src.directChildCounts.set(1, 3);
   src.orderedChildren.add(1);
   src.pendingExpansions.add(1);
+  src.directoryLoads.set(1, { generation: 3, state: 'loading' });
   src.expanded.add(1);
   src.viewportIds.add(1);
   src.roots.push(1);
@@ -71,6 +73,7 @@ test('cloneMirror returns independent map references', () => {
   clone.directChildCounts.set(2, 0);
   clone.orderedChildren.add(2);
   clone.pendingExpansions.add(2);
+  clone.directoryLoads.set(2, { generation: 4, state: 'loading' });
   clone.expanded.add(2);
   clone.viewportIds.add(2);
   clone.roots.push(2);
@@ -83,6 +86,7 @@ test('cloneMirror returns independent map references', () => {
   assert.equal(src.directChildCounts.size, 1, 'directChildCounts on src untouched');
   assert.equal(src.orderedChildren.size, 1, 'orderedChildren on src untouched');
   assert.equal(src.pendingExpansions.size, 1, 'pendingExpansions on src untouched');
+  assert.equal(src.directoryLoads.size, 1, 'directoryLoads on src untouched');
   assert.equal(src.expanded.size, 1, 'expanded on src untouched');
   assert.equal(src.viewportIds.size, 1, 'viewportIds on src untouched');
   assert.deepEqual(src.roots, [1], 'roots on src untouched');
@@ -204,6 +208,76 @@ test('ClientMirrorSnapshot.hasChildren only true for >0 count', () => {
   assert.equal(snap.hasChildren(1), false);
   assert.equal(snap.hasChildren(2), true);
   assert.equal(snap.hasChildren(999), false);
+});
+
+test('directory load state distinguishes loading, error, and completion', () => {
+  let state = createMirror();
+  state = applyDirectoryLoad(state, { id: 7, generation: 1, state: 'loading' });
+  assert.deepEqual(new ClientMirrorSnapshot(state).directoryLoadState(7), { state: 'loading' });
+  assert.ok(state.pendingExpansions.has(7));
+
+  state = applyDirectoryLoad(state, {
+    id: 7,
+    generation: 1,
+    state: 'error',
+    error: { code: 'EACCES', message: 'permission denied' },
+  });
+  assert.deepEqual(new ClientMirrorSnapshot(state).directoryLoadState(7), {
+    state: 'error',
+    code: 'EACCES',
+    message: 'permission denied',
+  });
+  assert.equal(state.pendingExpansions.has(7), false);
+
+  state.directChildCounts.set(7, 0);
+  state = applyDirectoryLoad(state, { id: 7, generation: 1, state: 'complete' });
+  assert.deepEqual(new ClientMirrorSnapshot(state).directoryLoadState(7), { state: 'complete' });
+});
+
+test('stale directory load generations cannot overwrite a newer retry', () => {
+  let state = createMirror();
+  state = applyDirectoryLoad(state, { id: 7, generation: 2, state: 'loading' });
+  const current = state;
+  state = applyDirectoryLoad(state, {
+    id: 7,
+    generation: 1,
+    state: 'error',
+    error: { code: 'EIO', message: 'stale failure' },
+  });
+  assert.equal(state, current, 'stale completion state preserves snapshot identity');
+  assert.deepEqual(new ClientMirrorSnapshot(state).directoryLoadState(7), { state: 'loading' });
+  assert.ok(state.pendingExpansions.has(7));
+});
+
+test('partial child pages remain pending until the final count arrives', () => {
+  const state = createMirror();
+  state.pendingExpansions.add(1);
+  state.directoryLoads.set(1, { generation: 1, state: 'loading' });
+  const partial = applyDelta(state, {
+    version: 1,
+    changedIds: [],
+    removedIds: [],
+    directChildCounts: {},
+    childSetChanged: [1],
+    childLists: { 1: [2] },
+    coarseSubtrees: [],
+    subtreeDirty: [],
+    subtreeResynced: [],
+  });
+  assert.ok(partial.pendingExpansions.has(1), 'partial page keeps spinner active');
+
+  const complete = applyDelta(partial, {
+    version: 2,
+    changedIds: [],
+    removedIds: [],
+    directChildCounts: { 1: 1 },
+    childSetChanged: [1],
+    childLists: { 1: [2] },
+    coarseSubtrees: [],
+    subtreeDirty: [],
+    subtreeResynced: [],
+  });
+  assert.equal(complete.pendingExpansions.has(1), false);
 });
 
 test('ClientMirrorSnapshot.getDecorations returns empty array', () => {

@@ -61,6 +61,20 @@ function FileTreeRowImpl(props: FileTreeRowProps): ReactElement {
         <span {...nameProps} />
       )}
       {pending ? <LoadingBadge /> : null}
+      {props.loadError !== undefined ? (
+        <button
+          type="button"
+          className="mille-load-error-badge"
+          aria-label={`Retry loading ${props.displayName ?? props.row.name}`}
+          title={`${props.loadError.code}: ${props.loadError.message}`}
+          onClick={(event) => {
+            event.stopPropagation();
+            props.onRetryLoad?.();
+          }}
+        >
+          ↻
+        </button>
+      ) : null}
     </div>
   );
 
@@ -168,6 +182,9 @@ export function areFileTreeRowPropsEqual(
     prev.expanded === next.expanded &&
     prev.hasChildren === next.hasChildren &&
     prev.pending === next.pending &&
+    prev.loadError?.code === next.loadError?.code &&
+    prev.loadError?.message === next.loadError?.message &&
+    prev.onRetryLoad === next.onRetryLoad &&
     prev.iconTheme === next.iconTheme &&
     prev.className === next.className &&
     stylesEqual(prev.style, next.style) &&

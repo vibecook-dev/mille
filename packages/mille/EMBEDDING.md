@@ -203,7 +203,8 @@ let host;
     watchDebounceMs: 75,
   });
   // Populate eagerly so the first renderer handshake returns a full tree.
-  // For very large workspaces, defer this and let `setExpanded` drive it.
+  // For very large workspaces, use `initialWalk: 'roots-only'`, omit this
+  // call, and let `setExpanded` drive progressive directory hydration.
   await host.local.populateFromRoots();
 
   process.parentPort.on('message', (evt) => {
@@ -722,15 +723,37 @@ profiling.
 
 ### 7.4 Large monorepos
 
-`populateFromRoots` walks every root eagerly. For a 200k-entry monorepo that's
-~200-400ms on an M1. If that's too long for your startup budget:
+`populateFromRoots` walks every root eagerly, so startup time grows with the
+entire workspace even when the renderer mounts only a few dozen rows. The
+production path for large workspaces is root seeding plus demand-driven reads:
 
-- Keep `populateFromRoots` in the utility process, not the main process — it
-  won't block the UI in either case.
-- Or skip the eager walk entirely and drive it lazily: render from the roots
-  only, call `fx.setExpanded({ add: [id] })` when the user expands a folder,
-  and let the host's delta stream bring children in. Viability depends on
-  how much of the tree your UI shows by default.
+```js
+const host = await createFileExplorerHost({
+  roots: [workspaceRoot],
+  initialWalk: 'roots-only',
+  directoryBatchSize: 256, // initial page; later pages grow, capped at 4096
+});
+```
+
+- Publish the virtualizer viewport before expansion, then call
+  `fx.setExpanded({ add: [id] })`. The host sends a bounded first page and
+  progressively larger pages; it never waits for a wide folder to finish
+  before showing usable rows.
+- Partial child arrays remain explicitly pending. An empty folder becomes a
+  leaf only after the authoritative end-of-directory marker arrives, so an
+  empty-looking loading state is never mistaken for a completed folder.
+- `snapshot.directoryLoadState(id)` reports `loading`, `complete`, `idle`, or
+  a structured `error`. Retry an error in place with another
+  `setExpanded({ add: [id] })`; no collapse/expand toggle is required.
+- Collapsing cancels an obsolete read once no attached renderer still needs
+  it. Multiple windows share one native read, so one window cannot cancel a
+  folder another window is still displaying.
+- `directoryBatchSize` trades first-page latency against publication overhead.
+  The default 256 is intended for interactive trees; later pages grow
+  geometrically to amortize immutable-snapshot work in pathological folders.
+- For direct/local callers, `resyncProgressive(id, { operationId, signal })`
+  exposes the same cancellable primitive. `list(id, { offset, limit })`
+  returns pages from the completed cached listing.
 
 ---
 
@@ -811,8 +834,8 @@ yet — shape may change.
   - registry, latency / offline wrappers, and `createProviderTreeSession`
     for renderable trees without native scheme dispatch
   - platform path helpers (`parsePlatformPath`, UNC/drive, Unicode NFC)
-  Native `registerProvider` wiring is still deferred; local `file:` trees
-  continue to use `FileExplorer`.
+    Native `registerProvider` wiring is still deferred; local `file:` trees
+    continue to use `FileExplorer`.
 - **Watchman optional backend** — v0.1 uses notify-rs's per-platform default
   (inotify / FSEvents / ReadDirectoryChangesW). A Watchman adapter is
   tracked for later.
@@ -1072,13 +1095,13 @@ await fx.move(entryId, destinationFolderId, undefined, {
 `collision` defaults to `'error'` and returns `EEXIST` before changing disk.
 Other policies:
 
-| Policy | Behavior |
-| --- | --- |
-| `error` | Fail when the destination name exists (including case-only siblings) |
-| `rename` | Choose a free `copy` / `copy N` suffix |
-| `overwrite` | Replace the destination file or directory |
-| `skip` | Leave the destination untouched and succeed |
-| `merge` | For directories, merge children; files overwrite |
+| Policy      | Behavior                                                             |
+| ----------- | -------------------------------------------------------------------- |
+| `error`     | Fail when the destination name exists (including case-only siblings) |
+| `rename`    | Choose a free `copy` / `copy N` suffix                               |
+| `overwrite` | Replace the destination file or directory                            |
+| `skip`      | Leave the destination untouched and succeed                          |
+| `merge`     | For directories, merge children; files overwrite                     |
 
 The same options apply to `copy`, `move`, and `copyFromPath`. Destination names
 must be single path components (no `..` / separators). Destination parents are
@@ -1092,11 +1115,11 @@ a collision) and `onDropError` for failed imports.
 Long recursive copies accept an `operationId` (and optional `reportProgress`)
 on `TransferOptions`. While the operation runs the explorer emits warnings:
 
-| Code | Meaning |
-| --- | --- |
-| `OP_PROGRESS` | `detail` JSON: `{ operationId, phase, done, total, path? }` |
-| `OP_COMPLETE` | finished successfully or failed (`status`, `done`, `total`) |
-| `OP_CANCELLED` | cancelled cooperatively (`status: "cancelled"`) |
+| Code           | Meaning                                                     |
+| -------------- | ----------------------------------------------------------- |
+| `OP_PROGRESS`  | `detail` JSON: `{ operationId, phase, done, total, path? }` |
+| `OP_COMPLETE`  | finished successfully or failed (`status`, `done`, `total`) |
+| `OP_CANCELLED` | cancelled cooperatively (`status: "cancelled"`)             |
 
 ```ts
 const sub = fx.on('warning', (w) => {
@@ -1132,13 +1155,13 @@ fx.lastMutation(); // most recent op, including non-undoable with reason
 await fx.undo(); // reverse create / rename / move / soft-delete
 ```
 
-| Operation | Undo behavior |
-| --- | --- |
-| `create` | Removes the path only if store identity + size still match |
-| `rename` / same-root `move` | Moves back when identity and free destination allow |
-| overwrite `move` | **Not undoable** — reported via `lastMutation().reason` |
-| soft `delete` | Restores from managed recycle |
-| permanent `delete` | **Not undoable** — `lastMutation()` explains why |
+| Operation                   | Undo behavior                                              |
+| --------------------------- | ---------------------------------------------------------- |
+| `create`                    | Removes the path only if store identity + size still match |
+| `rename` / same-root `move` | Moves back when identity and free destination allow        |
+| overwrite `move`            | **Not undoable** — reported via `lastMutation().reason`    |
+| soft `delete`               | Restores from managed recycle                              |
+| permanent `delete`          | **Not undoable** — `lastMutation()` explains why           |
 
 `create` / `rename` refuse to clobber existing destinations (`EEXIST`). Failed
 `undo` leaves the journal entry so the user can fix conflicts and retry.
