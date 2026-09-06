@@ -434,7 +434,10 @@ export interface MirrorSnapshot {
   /** True once the folder's authoritative direct-child listing completed. */
   directoryChildrenLoaded(id: EntryId): boolean;
 
-  /** Explicit loading/error state for progressive directory hydration. */
+  /**
+   * Explicit loading/error state for progressive directory hydration,
+   * including any compact-folder chain still loading below a cached parent.
+   */
   directoryLoadState(id: EntryId): DirectoryLoadState;
 
   /** True when the entry has visible children or is an unloaded directory that may have them. */
@@ -691,7 +694,8 @@ export declare class FileExplorer implements Disposable {
     expanded: ReadonlySet<EntryId>,
   ): Promise<EntryId | null>;
 
-  // Children (one level, paginated) — async form. Prefer `getSnapshot()`
+  // Physical children (one level, paginated), without compaction or file
+  // nesting. Visibility filtering precedes pagination. Prefer `getSnapshot()`
   // for already-loaded data; use `list` for uncached / paginated reads.
   list(parentId: EntryId, options?: ListOptions): Promise<ListPage>;
 

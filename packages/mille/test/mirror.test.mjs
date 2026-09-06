@@ -249,7 +249,46 @@ test('stale directory load generations cannot overwrite a newer retry', () => {
   assert.ok(state.pendingExpansions.has(7));
 });
 
-test('partial child pages remain pending until the final count arrives', () => {
+test('compact-chain loading and errors take precedence over a cached parent count', () => {
+  let state = createMirror();
+  state.directChildCounts.set(7, 1);
+  state = applyDirectoryLoad(state, { id: 7, generation: 1, state: 'loading' });
+  assert.deepEqual(new ClientMirrorSnapshot(state).directoryLoadState(7), { state: 'loading' });
+
+  state = applyDelta(state, {
+    version: 1,
+    changedIds: [],
+    removedIds: [],
+    directChildCounts: { 7: 1 },
+    childSetChanged: [7],
+    childLists: { 7: [8] },
+    coarseSubtrees: [],
+    subtreeDirty: [],
+    subtreeResynced: [],
+  });
+  assert.ok(state.pendingExpansions.has(7), 'the direct listing does not finish the chain');
+
+  state = applyDirectoryLoad(state, {
+    id: 7,
+    generation: 1,
+    state: 'error',
+    error: { code: 'EACCES', message: 'chain child is inaccessible' },
+  });
+  assert.deepEqual(new ClientMirrorSnapshot(state).directoryLoadState(7), {
+    state: 'error',
+    code: 'EACCES',
+    message: 'chain child is inaccessible',
+  });
+  assert.equal(state.pendingExpansions.has(7), false);
+
+  state = applyDirectoryLoad(state, { id: 7, generation: 2, state: 'loading' });
+  assert.deepEqual(new ClientMirrorSnapshot(state).directoryLoadState(7), { state: 'loading' });
+  state = applyDirectoryLoad(state, { id: 7, generation: 2, state: 'complete' });
+  assert.deepEqual(new ClientMirrorSnapshot(state).directoryLoadState(7), { state: 'complete' });
+  assert.equal(state.pendingExpansions.has(7), false);
+});
+
+test('partial child pages remain pending until the explicit directory load completes', () => {
   const state = createMirror();
   state.pendingExpansions.add(1);
   state.directoryLoads.set(1, { generation: 1, state: 'loading' });
@@ -277,7 +316,31 @@ test('partial child pages remain pending until the final count arrives', () => {
     subtreeDirty: [],
     subtreeResynced: [],
   });
-  assert.equal(complete.pendingExpansions.has(1), false);
+  assert.ok(complete.pendingExpansions.has(1), 'an explicit load waits for its completion frame');
+  const finished = applyDirectoryLoad(complete, { id: 1, generation: 1, state: 'complete' });
+  assert.equal(finished.pendingExpansions.has(1), false);
+});
+
+test('an expansion request is loading before the host acknowledges a cached listing', () => {
+  const state = createMirror();
+  state.directChildCounts.set(1, 2);
+  state.pendingExpansions.add(1);
+  assert.deepEqual(new ClientMirrorSnapshot(state).directoryLoadState(1), { state: 'loading' });
+
+  // Legacy hosts have no directoryLoad frames; their final count still
+  // completes the expansion once the requested child identities arrive.
+  const complete = applyDelta(state, {
+    version: 1,
+    changedIds: [],
+    removedIds: [],
+    directChildCounts: { 1: 2 },
+    childSetChanged: [1],
+    childLists: { 1: [2, 3] },
+    coarseSubtrees: [],
+    subtreeDirty: [],
+    subtreeResynced: [],
+  });
+  assert.deepEqual(new ClientMirrorSnapshot(complete).directoryLoadState(1), { state: 'complete' });
 });
 
 test('ClientMirrorSnapshot.getDecorations returns empty array', () => {

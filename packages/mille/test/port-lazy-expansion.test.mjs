@@ -25,7 +25,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { MessageChannel } from 'node:worker_threads';
 
-import { FileExplorer, createFileExplorerHost, connectFileExplorer } from '../dist/index.js';
+import {
+  FileExplorer,
+  FileSystemError,
+  createFileExplorerHost,
+  connectFileExplorer,
+} from '../dist/index.js';
 
 function tempRoot() {
   return mkdtempSync(join(tmpdir(), 'mille-lazy-expand-'));
@@ -269,7 +274,7 @@ test('wide directories publish usable partial rows before authoritative completi
     await waitFor(() => client.getSnapshot().directChildCount(rootId) === total, {
       timeoutMs: 5000,
     });
-    assert.equal(client.getSnapshot().directoryLoadState(rootId).state, 'complete');
+    await waitFor(() => client.getSnapshot().directoryLoadState(rootId).state === 'complete');
     const page = await host.local.list(rootId, { offset: 10, limit: 5, sort: 'name' });
     assert.equal(page.total, total);
     assert.equal(page.entries.length, 5);
@@ -318,7 +323,7 @@ test('collapsing cancels an obsolete wide-directory read and re-expand retries c
     await waitFor(() => client.getSnapshot().directChildCount(rootId) === total, {
       timeoutMs: 8000,
     });
-    assert.equal(client.getSnapshot().directoryLoadState(rootId).state, 'complete');
+    await waitFor(() => client.getSnapshot().directoryLoadState(rootId).state === 'complete');
 
     await client.dispose();
     await host.dispose();
@@ -366,14 +371,14 @@ test('one collapsed window does not cancel a progressive load still used by anot
     await waitFor(() => clientB.getSnapshot().directChildCount(rootId) === total, {
       timeoutMs: 8000,
     });
-    assert.equal(clientB.getSnapshot().directoryLoadState(rootId).state, 'complete');
+    await waitFor(() => clientB.getSnapshot().directoryLoadState(rootId).state === 'complete');
     assert.equal(host.local.getSnapshot().directoryChildrenLoaded(rootId), true);
 
     // Once the shared authoritative read is cached, the collapsed peer can
     // re-expand immediately without starting a second filesystem scan.
     clientA.setExpanded({ add: [rootId] });
     await waitFor(() => clientA.getSnapshot().directChildCount(rootId) === total);
-    assert.equal(clientA.getSnapshot().directoryLoadState(rootId).state, 'complete');
+    await waitFor(() => clientA.getSnapshot().directoryLoadState(rootId).state === 'complete');
 
     await clientA.dispose();
     await clientB.dispose();
@@ -412,6 +417,171 @@ test('local progressive resync honors AbortSignal without marking a partial page
     );
   } finally {
     await fx.dispose();
+    removeTempDir(dir);
+  }
+});
+
+test('progressive reads can be cancelled immediately and release their operation id', async () => {
+  const dir = tempRoot();
+  const fx = new FileExplorer({ roots: [dir], compactFolders: false });
+  let pending;
+  try {
+    for (let i = 0; i < 512; i++) writeFileSync(join(dir, `entry-${i}.txt`), '');
+    fx.seedWorkspaceRoots();
+    const rootId = fx.getSnapshot().roots()[0].id;
+    const operationId = 'immediate-directory-cancel';
+    pending = fx.resyncProgressive(rootId, { operationId, batchSize: 16 });
+    const rejected = assert.rejects(pending, (error) => error?.code === 'ECANCELED');
+    const cancelled = fx.cancelOperation(operationId);
+    await rejected;
+    assert.equal(cancelled, true, 'registered before the call returns');
+    assert.equal(fx.cancelOperation(operationId), false, 'settled operations release their ids');
+    assert.equal(fx.getSnapshot().directoryChildrenLoaded(rootId), false);
+
+    const controller = new AbortController();
+    pending = fx.resyncProgressive(rootId, {
+      operationId,
+      batchSize: 16,
+      signal: controller.signal,
+    });
+    controller.abort();
+    await assert.rejects(pending, (error) => error?.code === 'ECANCELED');
+    assert.equal(fx.cancelOperation(operationId), false);
+    assert.equal(fx.getSnapshot().directoryChildrenLoaded(rootId), false);
+
+    await fx.resyncProgressive(rootId, { operationId, batchSize: 16 });
+    assert.equal(fx.getSnapshot().directoryChildrenLoaded(rootId), true);
+    assert.equal(fx.getSnapshot().childrenOf(rootId).length, 512);
+    assert.equal(fx.cancelOperation(operationId), false);
+  } finally {
+    await pending?.catch(() => {});
+    await fx.dispose();
+    removeTempDir(dir);
+  }
+});
+
+test('duplicate progressive operation ids reject without cancelling the original read', async () => {
+  const dir = tempRoot();
+  const fx = new FileExplorer({ roots: [dir], compactFolders: false });
+  let pending;
+  try {
+    for (let i = 0; i < 512; i++) writeFileSync(join(dir, `entry-${i}.txt`), '');
+    fx.seedWorkspaceRoots();
+    const rootId = fx.getSnapshot().roots()[0].id;
+    const options = { operationId: 'duplicate-directory-read', batchSize: 16 };
+    pending = fx.resyncProgressive(rootId, options);
+    void pending.catch(() => {});
+    const controller = new AbortController();
+    const duplicate = fx.resyncProgressive(rootId, { ...options, signal: controller.signal });
+    controller.abort();
+    await assert.rejects(duplicate, (error) => error?.code === 'EINVAL');
+    await pending;
+    assert.equal(fx.getSnapshot().directoryChildrenLoaded(rootId), true);
+    assert.equal(fx.cancelOperation(options.operationId), false);
+  } finally {
+    await pending?.catch(() => {});
+    await fx.dispose();
+    removeTempDir(dir);
+  }
+});
+
+test('progressive setup failures leave no registered operation behind', async () => {
+  const dir = tempRoot();
+  const fx = new FileExplorer({ roots: [dir] });
+  try {
+    fx.seedWorkspaceRoots();
+    const rootId = fx.getSnapshot().roots()[0].id;
+    const options = { operationId: 'failed-directory-setup' };
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(
+      fx.resyncProgressive(rootId, { ...options, signal: controller.signal }),
+      (error) => error?.code === 'ECANCELED',
+    );
+    assert.equal(fx.cancelOperation(options.operationId), false);
+    await assert.rejects(
+      fx.resyncProgressive(9_999_999, options),
+      (error) => error instanceof FileSystemError && error.code === 'EINVAL',
+    );
+    assert.equal(fx.cancelOperation(options.operationId), false);
+
+    // Disposal is checked by the worker, after synchronous registration.
+    // Its rejection must release the id just like cancellation and success.
+    await fx.dispose();
+    await assert.rejects(fx.resyncProgressive(rootId, options), /disposed/);
+    assert.equal(fx.cancelOperation(options.operationId), false);
+    assert.equal(fx.getSnapshot().directoryChildrenLoaded(rootId), false);
+  } finally {
+    await fx.dispose();
+    removeTempDir(dir);
+  }
+});
+
+test('compact-chain failures stay visible and retry without collapsing the expanded parent', async () => {
+  const dir = tempRoot();
+  mkdirSync(join(dir, 'a', 'b'), { recursive: true });
+  const host = await createFileExplorerHost({
+    roots: [dir],
+    initialWalk: 'roots-only',
+    compactFolders: true,
+  });
+  const resync = host.local.resyncProgressive.bind(host.local);
+  let rejectChild;
+  let client;
+  let injected = false;
+  host.local.resyncProgressive = (id, options) => {
+    if (!injected && host.local.getSnapshot().getById(id)?.name === 'a') {
+      injected = true;
+      return new Promise((_, reject) => {
+        rejectChild = reject;
+      });
+    }
+    return resync(id, options);
+  };
+  try {
+    const { port1, port2 } = new MessageChannel();
+    host.attachPort(port1);
+    client = await connectFileExplorer(port2);
+    const rootId = client.getSnapshot().roots()[0].id;
+    client.setExpanded({ add: [rootId] });
+    await waitFor(
+      () => rejectChild !== undefined && client.getSnapshot().directChildCount(rootId) === 1,
+    );
+    assert.equal(client.getSnapshot().directoryLoadState(rootId).state, 'loading');
+    assert.ok(
+      client
+        .getSnapshot()
+        .visibleRowCount(new Set([rootId]))
+        .pendingExpansions.has(rootId),
+    );
+
+    rejectChild(new FileSystemError('EACCES', 'compact child is inaccessible'));
+    await waitFor(() => client.getSnapshot().directoryLoadState(rootId).state === 'error');
+    assert.deepEqual(client.getSnapshot().directoryLoadState(rootId), {
+      state: 'error',
+      code: 'EACCES',
+      message: 'compact child is inaccessible',
+    });
+    assert.equal(
+      client
+        .getSnapshot()
+        .visibleRowCount(new Set([rootId]))
+        .pendingExpansions.has(rootId),
+      false,
+    );
+
+    client.setExpanded({ add: [rootId] });
+    assert.equal(client.getSnapshot().directoryLoadState(rootId).state, 'loading');
+    await waitFor(() => client.getSnapshot().directoryLoadState(rootId).state === 'complete');
+    const rows = client
+      .getSnapshot()
+      .visibleRows({ expanded: new Set([rootId]), offset: 0, limit: 10 });
+    assert.equal(rows[1]?.name, 'b');
+    assert.deepEqual(rows[1]?.pathSegments, ['a', 'b']);
+  } finally {
+    rejectChild?.(new FileSystemError('ECANCELED', 'test cleanup'));
+    await client?.dispose();
+    await host.dispose();
     removeTempDir(dir);
   }
 });

@@ -21,9 +21,50 @@
 //!   - No direct `is_aborted()` query; rely on the callback to flip state
 
 use napi::bindgen_prelude::{AbortSignal, Result};
+use parking_lot::Mutex;
+use std::collections::HashMap;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::fx_error_to_napi;
+
+/// Owns a synchronously registered operation until its worker finishes or is
+/// dropped. Keeping cleanup in Drop also releases the id after a panic or a
+/// failure to schedule the future, so a retry cannot inherit a stale token.
+pub(crate) struct RegisteredOperation {
+    operations: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    id: String,
+    pub(crate) token: CancellationToken,
+}
+
+impl RegisteredOperation {
+    pub(crate) fn new(
+        operations: Arc<Mutex<HashMap<String, CancellationToken>>>,
+        id: String,
+    ) -> Result<Self> {
+        let token = CancellationToken::new();
+        {
+            let mut active = operations.lock();
+            if active.contains_key(&id) {
+                return Err(fx_error_to_napi(mille_core::FxError::InvalidInput(
+                    format!("duplicate operationId already in flight: {id}"),
+                )));
+            }
+            active.insert(id.clone(), token.clone());
+        }
+        Ok(Self {
+            operations,
+            id,
+            token,
+        })
+    }
+}
+
+impl Drop for RegisteredOperation {
+    fn drop(&mut self) {
+        self.operations.lock().remove(&self.id);
+    }
+}
 
 /// Convert an optional JS `AbortSignal` into a `CancellationToken`.
 ///

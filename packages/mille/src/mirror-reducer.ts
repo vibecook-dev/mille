@@ -431,9 +431,13 @@ export function applyDelta(
         next.children.set(parentId, fresh);
       }
       next.orderedChildren.delete(parentId);
-      // A progressive listing can publish several authoritative partial
-      // child arrays. Only the final direct-child count proves completion.
-      if (Object.prototype.hasOwnProperty.call(msg.directChildCounts, String(parentId))) {
+      // Older hosts finish an expansion with its child count. An explicit
+      // load task may still be hydrating a compact chain below this parent;
+      // only its directoryLoad completion frame can clear that spinner.
+      if (
+        !next.directoryLoads.has(parentId) &&
+        Object.prototype.hasOwnProperty.call(msg.directChildCounts, String(parentId))
+      ) {
         next.pendingExpansions.delete(parentId);
       }
     }
@@ -442,7 +446,10 @@ export function applyDelta(
   for (const [parentId, ids] of incomingChildLists) {
     next.children.set(parentId, ids);
     next.orderedChildren.add(parentId);
-    if (Object.prototype.hasOwnProperty.call(msg.directChildCounts, String(parentId))) {
+    if (
+      !next.directoryLoads.has(parentId) &&
+      Object.prototype.hasOwnProperty.call(msg.directChildCounts, String(parentId))
+    ) {
       next.pendingExpansions.delete(parentId);
     }
   }

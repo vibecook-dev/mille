@@ -27,6 +27,7 @@ import type {
 } from './client.js';
 import type { ChildIdList, ClientEntry, MirrorWorking } from './mirror.js';
 import { compareNaturalNames } from './natural-sort.js';
+import { isVisibleEntry } from './entry-visibility.js';
 
 /**
  * Translate a mirror-local ClientEntry (with `null`-holes) into the
@@ -114,34 +115,6 @@ export function createSortedChildrenLookup(
 }
 
 /**
- * Whether an entry appears in the default Project-view slice.
- *
- * JetBrains Project tool window conventions:
- *   - Hide OS noise (.DS_Store, Thumbs.db) and VCS internals (`.git`).
- *   - **Show** gitignored / excluded paths (node_modules, out, target,
- *     *.tsbuildinfo) so the tree matches what the IDE surfaces — the
- *     UI styles them as library roots / excluded rather than omitting.
- *   - **Show** project dotfiles (.gitignore, .env, …).
- *   - `includeIgnored=true` additionally reveals OS/VCS noise.
- */
-function isVisibleEntry(
-  e: ClientEntry,
-  includeIgnored: boolean,
-  showHiddenFiles: boolean,
-  showIgnoredFiles: boolean,
-): boolean {
-  if (includeIgnored) return true;
-  const n = e.name;
-  // OS + VCS noise — hidden unless the caller asks for everything.
-  if (n === '.DS_Store' || n === 'Thumbs.db' || n === 'desktop.ini') {
-    return false;
-  }
-  if (n === '.git') return false;
-
-  return (showHiddenFiles || !e.isHidden) && (showIgnoredFiles || !e.isIgnored);
-}
-
-/**
  * Frozen view of a MirrorWorking. Consumers receive this via
  * `PortFileExplorer.getSnapshot()` (wired in Wave 2); identity is
  * stable until the reducer publishes a new one.
@@ -217,7 +190,8 @@ export class ClientMirrorSnapshot {
   }
 
   directoryLoadState(id: EntryId): DirectoryLoadState {
-    if (this.state.directChildCounts.has(id)) return { state: 'complete' };
+    // A compact-chain task outlives its parent's direct listing. Explicit
+    // loading/error state wins until the host completes the whole task.
     const record = this.state.directoryLoads.get(id);
     if (record?.state === 'loading') return { state: 'loading' };
     if (record?.state === 'error') {
@@ -227,7 +201,10 @@ export class ClientMirrorSnapshot {
         message: record.error?.message ?? 'Directory listing failed',
       };
     }
-    return { state: 'idle' };
+    // setExpanded publishes the request before its host acknowledgement. A
+    // retry must not briefly reuse cached completion in that interval.
+    if (this.state.pendingExpansions.has(id)) return { state: 'loading' };
+    return this.state.directChildCounts.has(id) ? { state: 'complete' } : { state: 'idle' };
   }
 
   hasChildren(id: EntryId): boolean {

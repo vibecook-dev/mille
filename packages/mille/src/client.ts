@@ -30,6 +30,7 @@ import { basename, join as joinPath, sep as pathSep } from 'node:path';
 import { native } from './native.js';
 import { FileSystemError, wrap, wrapSync } from './errors.js';
 import { decodeBulkRows, type VisibleRow as DecodedRow } from './decode.js';
+import { isVisibleEntry } from './entry-visibility.js';
 import type { ChangeSet } from './delta.js';
 import { DecorationStore, type DecorationProvider } from './decorations.js';
 import type { ExplorerProjectionSettings, ResolvedExplorerSettings } from './explorer-settings.js';
@@ -659,16 +660,18 @@ export class FileExplorer {
       typeof requestedBatchSize === 'number' && Number.isFinite(requestedBatchSize)
         ? Math.max(16, Math.min(4096, Math.trunc(requestedBatchSize)))
         : 256;
+    // Native registers the operation synchronously, then returns its promise.
+    // Subscribe only after that succeeds so a rejected duplicate id cannot
+    // attach a cancellation listener to somebody else's operation.
+    const pending = wrapSync(() =>
+      nativeMethod.call(this.nativeFx, id, options.operationId, batchSize),
+    );
     const cancel = (): void => {
-      if (!this.cancelOperation(options.operationId)) {
-        // The async native body registers on its first runtime poll. A signal
-        // can fire in the narrow gap between invocation and registration.
-        queueMicrotask(() => this.cancelOperation(options.operationId));
-      }
+      this.cancelOperation(options.operationId);
     };
     signal?.addEventListener('abort', cancel, { once: true });
     try {
-      return await wrap(nativeMethod.call(this.nativeFx, id, options.operationId, batchSize));
+      return await wrap(pending);
     } finally {
       signal?.removeEventListener('abort', cancel);
     }
@@ -920,11 +923,24 @@ export class FileExplorer {
       }
     }
     const snap = this.getSnapshot();
-    const kids = snap.projectedChildrenOf(parentId, options?.includeIgnored);
+    // Listing returns physical children. Compaction and file nesting belong
+    // to row projection and can replace a child with a deeper descendant or
+    // hide siblings that still need to appear in a directory page.
+    const kids = snap.childrenOf(parentId);
     const entries: Entry[] = [];
     for (const kidId of kids) {
       const e = snap.getById(kidId);
-      if (e) entries.push(e);
+      if (
+        e &&
+        isVisibleEntry(
+          e,
+          options?.includeIgnored ?? false,
+          snap.showHiddenFiles,
+          snap.showIgnoredFiles,
+        )
+      ) {
+        entries.push(e);
+      }
     }
     if (options?.sort !== undefined) {
       const direction = options.sortDir === 'desc' ? -1 : 1;

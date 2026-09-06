@@ -10,9 +10,9 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use napi::bindgen_prelude::{Buffer, Result, Status, Unknown};
+use napi::bindgen_prelude::{Buffer, PromiseRaw, Result, Status, Unknown};
 use napi::threadsafe_function::ThreadsafeFunction;
-use napi::Error;
+use napi::{Env, Error};
 use napi_derive::napi;
 
 use mille_core::{
@@ -167,12 +167,15 @@ pub(crate) struct ResolvedOptions {
 }
 
 /// The in-process FileExplorer. Phase 5 builds it out method by method.
+#[derive(Clone)]
 #[napi]
 pub struct FileExplorer {
     pub(crate) store: Arc<EntryStore>,
     pub(crate) watcher: Arc<std::sync::Mutex<Option<Watcher>>>,
     pub(crate) intents: Arc<parking_lot::Mutex<IntentCache>>,
-    disposed: AtomicBool,
+    // Workers retain a clone of the engine's shared state after the JS call
+    // returns. Disposal must be visible to every such clone.
+    disposed: Arc<AtomicBool>,
     pub(crate) roots: Arc<parking_lot::RwLock<Vec<PathBuf>>>,
     pub(crate) options: ResolvedOptions,
     /// Runtime-configurable exclude rules shared by initial/lazy walks and
@@ -284,7 +287,7 @@ impl FileExplorer {
             )),
             watcher: Arc::new(std::sync::Mutex::new(None)),
             intents: Arc::new(parking_lot::Mutex::new(IntentCache::new())),
-            disposed: AtomicBool::new(false),
+            disposed: Arc::new(AtomicBool::new(false)),
             roots: Arc::new(parking_lot::RwLock::new(roots)),
             options: resolved,
             exclude_globs: Arc::new(parking_lot::RwLock::new(exclude_globs)),
@@ -924,13 +927,13 @@ impl FileExplorer {
     /// The operation remains provisional until EOF; cancellation leaves any
     /// useful prefix cached but does not mark the directory complete.
     #[napi(js_name = "resyncProgressive", catch_unwind)]
-    pub async fn resync_progressive(
+    pub fn resync_progressive<'env>(
         &self,
+        env: &'env Env,
         id: i64,
         operation_id: String,
         batch_size: Option<u32>,
-    ) -> Result<u32> {
-        self.ensure_watcher()?;
+    ) -> Result<PromiseRaw<'env, u32>> {
         if operation_id.is_empty() {
             return Err(fx_error_to_napi(FxError::InvalidInput(
                 "resyncProgressive requires a non-empty operationId".into(),
@@ -948,36 +951,33 @@ impl FileExplorer {
                 id
             ))));
         }
-        let path = self.resolve_path_for_id(id)?;
-        let token = CancellationToken::new();
-        {
-            let mut operations = self.operations.lock();
-            if operations.contains_key(&operation_id) {
-                return Err(fx_error_to_napi(FxError::InvalidInput(format!(
-                    "duplicate operationId already in flight: {operation_id}"
-                ))));
-            }
-            operations.insert(operation_id.clone(), token.clone());
-        }
-
-        let result: std::result::Result<u32, FxError> = (|| {
-            let _policy_guard = self.policy_gate.lock();
-            let mut previous_version = self.store.tree_version();
+        // This part runs on the JS thread: cancelOperation must find the token
+        // as soon as resyncProgressive returns, even before watcher startup or
+        // the first runtime poll. All filesystem work stays on the worker.
+        let operation =
+            crate::cancel::RegisteredOperation::new(Arc::clone(&self.operations), operation_id)?;
+        let explorer = self.clone();
+        env.spawn_future(async move {
+            crate::cancel::check_cancelled(&operation.token)?;
+            explorer.ensure_watcher()?;
+            let _policy_guard = explorer.policy_gate.lock();
+            crate::cancel::check_cancelled(&operation.token)?;
+            let path = explorer.resolve_path_for_id(id)?;
+            let mut previous_version = explorer.store.tree_version();
             crate::watch_runtime::reconcile_directory_progressive(
-                &self.store,
-                &self.watch_config(),
+                &explorer.store,
+                &explorer.watch_config(),
                 &path,
                 batch_size.unwrap_or(256).clamp(16, 4096) as usize,
-                &token,
+                &operation.token,
                 |outcome| {
-                    self.emit_reconcile_notice(previous_version, outcome);
-                    previous_version = self.store.tree_version();
+                    explorer.emit_reconcile_notice(previous_version, outcome);
+                    previous_version = explorer.store.tree_version();
                 },
-            )?;
-            Ok(self.store.tree_version() as u32)
-        })();
-        self.operations.lock().remove(&operation_id);
-        result.map_err(fx_error_to_napi)
+            )
+            .map_err(fx_error_to_napi)?;
+            Ok(explorer.store.tree_version() as u32)
+        })
     }
 
     /// Authoritatively reconcile every configured root and all descendants.
