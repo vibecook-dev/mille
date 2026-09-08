@@ -31,7 +31,7 @@ jobs:
     name: Rust lints & tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.97.1
@@ -59,7 +59,7 @@ jobs:
     name: JS typecheck & tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # `.gitignore` deliberately un-ignores packages/mille-*/**/*.node, because
       # npm falls back to .gitignore when packing and the release job's freshly
@@ -248,7 +248,7 @@ jobs:
     name: Release-profile tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -349,7 +349,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -495,7 +495,7 @@ jobs:
             build: pnpm build:napi --target aarch64-unknown-linux-musl --use-napi-cross
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Host tooling only for non-docker targets (see release.yml).
       - name: Setup pnpm

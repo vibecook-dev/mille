@@ -87,7 +87,7 @@ jobs:
             build: pnpm build:napi --target aarch64-unknown-linux-musl --release --use-napi-cross
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Host tooling only for non-docker targets. Docker images ship their own
       # Node/Rust; skipping host pnpm cache avoids post-step path errors when
@@ -179,7 +179,7 @@ jobs:
       contents: read
       id-token: write # required for npm OIDC trusted publishing
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
