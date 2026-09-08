@@ -72,6 +72,16 @@ test('handshake and expansion hydrate only roots plus the mounted viewport', asy
     });
     await viewportPromise;
 
+    // Root metadata can change during watcher startup, so the next delta may
+    // refresh the already-known root alongside its visible children. Force
+    // that timing here instead of depending on the platform's watcher speed.
+    const takePendingChanges = host.local.takePendingChanges.bind(host.local);
+    host.local.takePendingChanges = () => {
+      host.local.takePendingChanges = takePendingChanges;
+      const changes = takePendingChanges();
+      return { ...changes, changedIds: [...new Set([...changes.changedIds, rootId])] };
+    };
+
     const expansionPromise = nextMatching(
       port2,
       (message) => message?.type === 'delta' && message.body.childListsBin instanceof ArrayBuffer,
@@ -93,9 +103,17 @@ test('handshake and expansion hydrate only roots plus the mounted viewport', asy
         ? decodeClientEntries(expansion.body.viewportPatch)
         : [];
     assert.ok(
-      expansionEntries.length <= 15,
+      expansionEntries.length <= 16,
       `entry payload stays inside the 16-row viewport; got ${expansionEntries.length}`,
     );
+    assert.ok(
+      expansionEntries.filter((entry) => entry.id !== rootId).length <= 15,
+      'the root leaves room for at most 15 child records',
+    );
+    const viewportIds = new Set(expansion.body.viewportIds);
+    for (const entry of expansionEntries) {
+      assert.ok(viewportIds.has(entry.id), `entry ${entry.id} is outside the mounted viewport`);
+    }
 
     // Protocol-v1 clients that did not advertise the packed channel continue
     // to receive the legacy object shape.
