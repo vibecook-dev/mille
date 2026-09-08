@@ -240,6 +240,7 @@ jobs:
         run: |
           pnpm --filter @vibecook/mille run build:ts
           pnpm --filter @vibecook/mille-ui run build
+          pnpm --filter @vibecook/mille-truffle run build
 
       # A tag push is an explicit act of release, so it publishes on its own.
       # A dispatch must opt in via `publish=true` (release-please.yml passes
