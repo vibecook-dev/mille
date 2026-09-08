@@ -37,7 +37,7 @@
     "@vibecook/truffle": ">=0.7.8 <0.8.0"
   },
   "devDependencies": {
-    "@types/node": "^24.0.0",
+    "@types/node": "^26.1.2",
     "@vibecook/mille": "workspace:*",
     "@vibecook/truffle": "^0.7.8",
     "typescript": "~6.0.0"
