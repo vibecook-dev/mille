@@ -180,13 +180,20 @@ test('external directory rename/delete never leaves dangling descendants', async
 
     const newDir = join(root, 'new-dir');
     await rename(oldDir, newDir);
-    const renamed = await waitFor(
-      () => childByName(fx, rootEntry.id, 'new-dir'),
-      Boolean,
-      'external directory rename did not reconcile',
+    // An unpaired Windows rename can publish the new parent before its
+    // recursive reconciliation publishes descendants. Wait for the complete
+    // subtree, then verify identity and removal of stale entries.
+    const { renamed, renamedChild } = await waitFor(
+      () => {
+        const renamed = childByName(fx, rootEntry.id, 'new-dir');
+        return {
+          renamed,
+          renamedChild: renamed && childByName(fx, renamed.id, 'child.txt'),
+        };
+      },
+      (state) => Boolean(state.renamed && state.renamedChild),
+      'external directory rename did not reconcile its known descendants',
     );
-    const renamedChild = childByName(fx, renamed.id, 'child.txt');
-    assert.ok(renamedChild, 'known descendants must remain visible after directory rename');
     if (renamed.id === oldEntry.id) {
       assert.equal(renamedChild.id, oldChildId, 'paired rename must preserve descendant EntryId');
     } else {
