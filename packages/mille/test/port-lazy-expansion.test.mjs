@@ -781,6 +781,8 @@ test('expanding a folder that lazy hydration touched still walks its whole child
   // subset the hydration happened to create — expand `packages` and you saw
   // the one package with an edit in it, never the rest.
   const dir = tempRoot();
+  let host;
+  let client;
   try {
     // packages/{design-kit,shell-ui,fieldd}; only design-kit is on the
     // hydrated chain.
@@ -791,39 +793,42 @@ test('expanding a folder that lazy hydration touched still walks its whole child
     writeFileSync(join(dir, 'packages', 'shell-ui', 'index.ts'), 'export {};');
     writeFileSync(join(dir, 'packages', 'fieldd', 'index.ts'), 'export {};');
 
-    const host = await createFileExplorerHost({
+    host = await createFileExplorerHost({
       roots: [dir],
       initialWalk: 'roots-only',
       compactFolders: false,
     });
-    const { port1, port2 } = new MessageChannel();
-    host.attachPort(port1);
-    const client = await connectFileExplorer(port2);
-
-    const rootId = await waitFor(() => {
-      const roots = client.getSnapshot().roots();
-      return roots.length === 1 ? roots[0].id : null;
-    });
-    client.setExpanded({ add: [rootId] });
-    const packagesId = await waitFor(() => {
-      const hostSnap = host.local.getSnapshot();
-      for (const id of hostSnap.childrenOf(rootId)) {
-        if (hostSnap.getById(id)?.name === 'packages') return id;
-      }
-      return null;
-    });
 
     // What the SCM companion does for a dirty file: resolve its path, which
-    // hydrates the ancestor chain and nothing else.
+    // hydrates the ancestor chain and nothing else. Establish that fixture
+    // before attaching: startup watcher events may otherwise fill siblings.
     await host.local.getByUri({
       scheme: 'file',
       path: join(dir, 'packages', 'design-kit', 'tokens.css'),
     });
+    const rootId = host.local.getSnapshot().roots()[0].id;
+    const packagesId = await host.local.resolvePath('packages');
+    assert.equal(typeof packagesId, 'number');
     assert.equal(
       host.local.getSnapshot().childrenOf(packagesId).length,
       1,
       'hydration left `packages` holding exactly the chain child',
     );
+
+    // Isolate expansion from host startup repair. The real progressive read
+    // below still starts native watching; its provisional frame must precede
+    // that read, so no background scan can erase the partial-cache fixture.
+    host.local.startWatching = async () => host.local.getTreeVersion();
+    host.local.refreshWorkspaceRoots = async () => host.local.getTreeVersion();
+    const readIds = [];
+    const resyncProgressive = host.local.resyncProgressive.bind(host.local);
+    host.local.resyncProgressive = (id, options) => {
+      readIds.push(id);
+      return resyncProgressive(id, options);
+    };
+    const { port1, port2 } = new MessageChannel();
+    host.attachPort(port1);
+    client = await connectFileExplorer(port2);
 
     // A partial child list may be rendered immediately, but it must remain
     // explicitly pending until the authoritative directory read completes.
@@ -831,9 +836,7 @@ test('expanding a folder that lazy hydration touched still walks its whole child
     port2.on('message', (raw) => {
       if (raw && raw.type === 'delta') expansionFrames.push(raw.body);
     });
-    await new Promise((resolve) => setTimeout(resolve, 30));
-    expansionFrames.length = 0;
-    client.setExpanded({ add: [packagesId] });
+    client.setExpanded({ add: [rootId, packagesId] });
     const provisional = await waitFor(() =>
       expansionFrames.find((body) => body.childSetChanged?.includes(packagesId)),
     );
@@ -855,10 +858,10 @@ test('expanding a folder that lazy hydration touched still walks its whole child
     assert.ok(names.has('shell-ui'), 'expand adds the sibling hydration never saw');
     assert.ok(names.has('fieldd'), 'expand adds every sibling, not just the first');
     await waitFor(() => client.getSnapshot().directoryChildrenLoaded(packagesId));
-
-    await client.dispose();
-    await host.dispose();
+    assert.ok(readIds.includes(packagesId), 'the partially hydrated folder gets its own read');
   } finally {
+    await client?.dispose();
+    await host?.dispose();
     removeTempDir(dir);
   }
 });

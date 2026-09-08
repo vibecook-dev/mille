@@ -2,7 +2,7 @@ import { removeTempDir } from '../../../scripts/test-temp.mjs';
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import test from 'node:test';
 
 import { FileExplorer } from '../dist/index.js';
@@ -30,23 +30,10 @@ function childByName(fx, rootId, name) {
 test('live watcher reconciles external create/modify/rename/delete', async () => {
   const root = await mkdtemp(join(tmpdir(), 'mille-watch-live-'));
   const fx = new FileExplorer({ roots: [root], watchDebounceMs: 40 });
-  const subscriptions = [];
   try {
     await fx.populateFromRoots();
     const rootEntry = fx.getSnapshot().roots()[0];
     assert.ok(rootEntry);
-    const observedKinds = [];
-    let batchCount = 0;
-    let treeChangeCount = 0;
-    subscriptions.push(
-      fx.on('event', (event) => observedKinds.push(event.kind)),
-      fx.on('batch', () => {
-        batchCount += 1;
-      }),
-      fx.on('change:tree', () => {
-        treeChangeCount += 1;
-      }),
-    );
 
     const createdPath = join(root, 'external.txt');
     await writeFile(createdPath, 'a');
@@ -80,13 +67,71 @@ test('live watcher reconciles external create/modify/rename/delete', async () =>
       (entry) => entry === null,
       'external delete did not leave the snapshot',
     );
-    await waitFor(
-      () => observedKinds.includes('created') && observedKinds.includes('deleted'),
-      Boolean,
-      'typed watcher event channels did not fire',
+  } finally {
+    await fx.dispose();
+    removeTempDir(root);
+  }
+});
+
+test('typed watcher channels report file creation and removal', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'mille-watch-events-'));
+  const deletedPath = join(root, 'deleted.txt');
+  await writeFile(deletedPath, 'already present when watching starts');
+  const fx = new FileExplorer({ roots: [root], watchDebounceMs: 40 });
+  const subscriptions = [];
+  try {
+    await fx.populateFromRoots();
+    const observedKinds = [];
+    const batchKinds = [];
+    let treeChangeCount = 0;
+    const targetKind = (event) => {
+      const name = event.path && basename(event.path);
+      if (event.kind === 'created' && name === 'created.txt') return 'created';
+      // The native debouncer can reclassify a removal as a metadata hint.
+      // In that case the public event has a path but no current entry.
+      // Exact raw delete classification is covered by the Rust watcher tests.
+      if (
+        name === 'deleted.txt' &&
+        (event.kind === 'deleted' || (event.kind === 'changed' && !event.entry))
+      ) {
+        return 'removed';
+      }
+      return null;
+    };
+    subscriptions.push(
+      fx.on('event', (event) => {
+        const kind = targetKind(event);
+        if (kind) observedKinds.push(kind);
+      }),
+      fx.on('batch', (batch) => batchKinds.push(...batch.map(targetKind).filter(Boolean))),
+      fx.on('change:tree', () => {
+        treeChangeCount += 1;
+      }),
     );
-    assert.ok(batchCount >= 1);
-    assert.ok(treeChangeCount >= 1);
+
+    // Use separate paths so the OS and debouncer cannot combine a rapid
+    // create/rename/delete into a transient file. The
+    // reconciliation test above covers that lifecycle through snapshots.
+    await writeFile(join(root, 'created.txt'), 'events');
+    await waitFor(
+      () => ({ observedKinds, batchKinds, treeChangeCount }),
+      (state) =>
+        state.observedKinds.includes('created') &&
+        state.batchKinds.includes('created') &&
+        state.treeChangeCount > 0,
+      'create did not reach every typed watcher channel',
+    );
+    const changesAfterCreate = treeChangeCount;
+
+    await rm(deletedPath);
+    await waitFor(
+      () => ({ observedKinds, batchKinds, treeChangeCount }),
+      (state) =>
+        state.observedKinds.includes('removed') &&
+        state.batchKinds.includes('removed') &&
+        state.treeChangeCount > changesAfterCreate,
+      'delete did not reach every typed watcher channel',
+    );
   } finally {
     for (const subscription of subscriptions) subscription.dispose();
     await fx.dispose();
