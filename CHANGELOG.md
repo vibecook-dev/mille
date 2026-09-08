@@ -1,5 +1,31 @@
 # mille changelog
 
+## [0.3.4](https://github.com/vibecook-dev/mille/compare/v0.3.3...v0.3.4) (2026-09-08)
+
+
+### Features
+
+* add Electron mesh file browser demo ([815e445](https://github.com/vibecook-dev/mille/commit/815e4451923a3b7d5b7177339798ea342f7fddfc))
+* **engine:** carry an SCM status letter distinct from a count badge ([124027d](https://github.com/vibecook-dev/mille/commit/124027d85930de3461a1e7ba958f5d47cd3183ce))
+* **ui:** add the vibefield theme, which reskins from host design tokens ([8e99cd2](https://github.com/vibecook-dev/mille/commit/8e99cd24ccda1477d76fd78245c92572a47f8bdd))
+
+
+### Bug Fixes
+
+* **engine:** declare compactFolders once in ResolvedExplorerSettings ([f158db7](https://github.com/vibecook-dev/mille/commit/f158db70e59cbbd28fa6255f0f573e9c29eff84e))
+* **engine:** keep a folder expandable when the mirror holds none of its children ([c8c55de](https://github.com/vibecook-dev/mille/commit/c8c55de8f27d6a1de0764730c5a18fcb4a5b8ac8))
+* **explorer:** harden progressive directory loading ([c8e867f](https://github.com/vibecook-dev/mille/commit/c8e867f292afb0fa80d6dbc24bb4dabeed9e62ef))
+* **explorer:** load large workspaces progressively ([29df3cd](https://github.com/vibecook-dev/mille/commit/29df3cd1e19fe9828aebc53d7b76905ca5462290))
+* **explorer:** preserve cancellation and directory loading semantics ([e892f77](https://github.com/vibecook-dev/mille/commit/e892f77c964a9b2abdc9c25831e17789a17c17c4))
+* **host:** preserve compact rows after cached retries ([eef9e3e](https://github.com/vibecook-dev/mille/commit/eef9e3e05a4a536818957169aadd0d5630499016))
+* **host:** recover directory loads across attached windows ([b26440d](https://github.com/vibecook-dev/mille/commit/b26440d49e68377a9fd5adc15051560a1810184a))
+* **host:** walk a lazily hydrated folder's whole child list on expand ([02fc49b](https://github.com/vibecook-dev/mille/commit/02fc49b65e7cbe03113572d7eb025cf34d5f0562))
+* **release:** build the Truffle package before publishing ([84b8574](https://github.com/vibecook-dev/mille/commit/84b8574de6e9f9a021b7d86724cfaf8b339ecdc7))
+* **ui:** hydrate remote folder expansions ([8b0e759](https://github.com/vibecook-dev/mille/commit/8b0e7593a7583bcd3f743086a239bbf58c09a631))
+* **ui:** let a theme's row height reach the tree ([5684e13](https://github.com/vibecook-dev/mille/commit/5684e134b1f87af6a2f692970e13003e5d42c9b5))
+* **ui:** reset file tree state when engine changes ([a3a902d](https://github.com/vibecook-dev/mille/commit/a3a902da4676e3d59d97e5c3ac7dbadaf6dc2e0d))
+* **ui:** stop the icon rules from dimming and hiding decorations ([7fd9351](https://github.com/vibecook-dev/mille/commit/7fd9351496c62754fe58312dd66ad345cd625fe7))
+
 ## [0.3.3](https://github.com/vibecook-dev/mille/compare/v0.3.2...v0.3.3) (2026-08-03)
 
 
