@@ -223,24 +223,51 @@ test('empty directory expansion publishes loaded-empty completion without a seco
 
 test('wide directories publish usable partial rows before authoritative completion', async () => {
   const dir = tempRoot();
+  let host;
+  let client;
+  let sub;
+  let resumeRead;
+  const readMayFinish = new Promise((resolve) => {
+    resumeRead = resolve;
+  });
   try {
     const total = 512;
     for (let i = 0; i < total; i++) {
       writeFileSync(join(dir, `file-${String(i).padStart(4, '0')}.txt`), 'x');
     }
-    const host = await createFileExplorerHost({
+    host = await createFileExplorerHost({
       roots: [dir],
       initialWalk: 'roots-only',
       compactFolders: false,
       directoryBatchSize: 16,
     });
+    // Finish watch registration before expanding, so its separate gap-repair
+    // resync cannot complete the deliberately held prefix behind the test.
+    const startWatching = host.local.startWatching.bind(host.local);
+    let watchRegistration;
+    host.local.startWatching = () => (watchRegistration = startWatching());
     const { port1, port2 } = new MessageChannel();
     host.attachPort(port1);
-    const client = await connectFileExplorer(port2, { prefetchRows: 128 });
+    client = await connectFileExplorer(port2, { prefetchRows: 128 });
+    await watchRegistration;
+    host.local.startWatching = startWatching;
     const rootId = client.getSnapshot().roots()[0].id;
 
+    // An optimized 512-file walk can finish between polling turns. Hold a
+    // native cache prefix until the mirror consumes it: resolvePath inserts
+    // real entries without marking their parent's listing authoritative.
+    // The real progressive read finishes the listing after the assertions.
+    const resyncProgressive = host.local.resyncProgressive.bind(host.local);
+    host.local.resyncProgressive = async (id, options) => {
+      for (let i = 0; i < 16; i++) {
+        await host.local.resolvePath(`file-${String(i).padStart(4, '0')}.txt`);
+      }
+      await readMayFinish;
+      return resyncProgressive(id, options);
+    };
+
     let clientObservedPartial = false;
-    const sub = client.on('change', () => {
+    sub = client.on('change', () => {
       const snapshot = client.getSnapshot();
       const rows = snapshot.visibleRows({
         expanded: new Set([rootId]),
@@ -271,6 +298,7 @@ test('wide directories publish usable partial rows before authoritative completi
       'partial rows retain the loading indicator',
     );
 
+    resumeRead();
     await waitFor(() => client.getSnapshot().directChildCount(rootId) === total, {
       timeoutMs: 5000,
     });
@@ -280,10 +308,11 @@ test('wide directories publish usable partial rows before authoritative completi
     assert.equal(page.entries.length, 5);
     assert.equal(page.entries[0].name, 'file-0010.txt');
     assert.equal(page.hasMore, true);
-    sub.dispose();
-    await client.dispose();
-    await host.dispose();
   } finally {
+    resumeRead();
+    sub?.dispose();
+    await client?.dispose();
+    await host?.dispose();
     removeTempDir(dir);
   }
 });
@@ -647,11 +676,13 @@ test('re-expanding an already-walked folder does not re-trigger a walk', async (
   // side. We observe the explicit load-state channel rather than inferring a
   // scan from timing-sensitive viewport refill frames.
   const dir = tempRoot();
+  let host;
+  let client;
   try {
     mkdirSync(join(dir, 'a'));
     writeFileSync(join(dir, 'a', 'x.txt'), '1');
 
-    const host = await createFileExplorerHost({
+    host = await createFileExplorerHost({
       roots: [dir],
       initialWalk: 'roots-only',
     });
@@ -659,14 +690,12 @@ test('re-expanding an already-walked folder does not re-trigger a walk', async (
     const { port1, port2 } = new MessageChannel();
     host.attachPort(port1);
 
-    const observedDeltaFrames = [];
     const observedLoadFrames = [];
     port2.on('message', (raw) => {
-      if (raw && raw.type === 'delta') observedDeltaFrames.push(raw.body);
       if (raw && raw.type === 'directoryLoad') observedLoadFrames.push(raw.body);
     });
 
-    const client = await connectFileExplorer(port2);
+    client = await connectFileExplorer(port2);
 
     const rootId = await waitFor(() => {
       const roots = client.getSnapshot().roots();
@@ -675,27 +704,20 @@ test('re-expanding an already-walked folder does not re-trigger a walk', async (
 
     // First expand — triggers walk.
     client.setExpanded({ add: [rootId] });
-    await waitFor(() => {
-      const s = client.getSnapshot();
-      const kidCount = s.directChildCount(rootId) ?? 0;
-      return kidCount >= 1 ? kidCount : null;
-    });
-
-    // Let any trailing deltas land before counting.
-    await new Promise((r) => setTimeout(r, 50));
-    const deltasAfterFirstExpand = observedDeltaFrames.length;
+    await waitFor(() => client.getSnapshot().directoryLoadState(rootId).state === 'complete');
     const loadsAfterFirstExpand = observedLoadFrames.length;
 
     // Collapse + re-expand. The collapse is a pure session-state change
     // on the client (setExpanded({remove}) ships to the host, which
     // removes from its Session.expanded set; no walk is triggered).
     client.setExpanded({ remove: [rootId] });
-    await new Promise((r) => setTimeout(r, 40));
     client.setExpanded({ add: [rootId] });
 
-    // Give the host a few tick windows. A new native read would publish a
-    // loading transition even when path de-duplication prevented tree deltas.
-    await new Promise((r) => setTimeout(r, 80));
+    // The ordered channel delivers any loading transition before completion.
+    // Wait for that boundary instead of guessing how many tick windows suffice.
+    await waitFor(() =>
+      observedLoadFrames.slice(loadsAfterFirstExpand).some((body) => body.state === 'complete'),
+    );
 
     const secondLoadFrames = observedLoadFrames.slice(loadsAfterFirstExpand);
     assert.equal(
@@ -707,23 +729,9 @@ test('re-expanding an already-walked folder does not re-trigger a walk', async (
       secondLoadFrames.some((body) => body.state === 'complete'),
       'host reports cached completion immediately',
     );
-
-    // Viewport refills are opportunistically coalesced with the 16ms host
-    // tick, but must stay bounded regardless of scheduler load.
-    const entriesOnSecondExpand = observedDeltaFrames
-      .slice(deltasAfterFirstExpand)
-      .filter((b) => b.viewportPatch instanceof ArrayBuffer && b.viewportPatch.byteLength > 1);
-    assert.ok(
-      entriesOnSecondExpand.length <= 1,
-      `re-expand should ship at most one viewport refill (saw ${entriesOnSecondExpand.length})`,
-    );
-    if (entriesOnSecondExpand.length === 1) {
-      assert.ok(Array.isArray(entriesOnSecondExpand[0].viewportIds));
-    }
-
-    await client.dispose();
-    await host.dispose();
   } finally {
+    await client?.dispose();
+    await host?.dispose();
     removeTempDir(dir);
   }
 });

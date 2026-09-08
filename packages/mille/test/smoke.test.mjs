@@ -147,15 +147,22 @@ test('visibleRows/visibleRowCount work on an empty snapshot', () => {
 
 test('emitReadyForTests + onReady fire end-to-end through the TSFN', async () => {
   const dir = mkTmp();
+  const fx = new FileExplorer({ roots: [dir] });
+  let subId;
+  let timer;
   try {
-    const fx = new FileExplorer({ roots: [dir] });
     let fired = 0;
-    const subId = fx.onReady(() => {
-      fired += 1;
+    const ready = new Promise((resolve, reject) => {
+      timer = setTimeout(() => reject(new Error('ready listener timed out after 5000ms')), 5000);
+      subId = fx.onReady(() => {
+        fired += 1;
+        resolve();
+      });
     });
     fx.emitReadyForTests();
-    // TSFN dispatch is async. Give the libuv queue a couple of ticks.
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    // TSFN dispatch uses the event loop; a busy runner may not process it
+    // within a fixed sleep even though delivery is correct.
+    await ready;
     assert.equal(fired, 1, 'ready listener should have fired exactly once');
     // off() expects a number — subscription ids are bigints at the API layer.
     const removed = fx.off(Number(subId));
@@ -163,6 +170,9 @@ test('emitReadyForTests + onReady fire end-to-end through the TSFN', async () =>
     // Double-off is idempotent.
     assert.equal(fx.off(Number(subId)), false);
   } finally {
+    clearTimeout(timer);
+    if (subId !== undefined) fx.off(Number(subId));
+    await fx.dispose();
     removeTempDir(dir);
   }
 });
