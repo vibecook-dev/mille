@@ -207,6 +207,9 @@ interface Session {
    * state of a client too old to send them.
    */
   ackedVersion: number;
+  /** Latest acknowledged synchronization id. Starts at zero until the first
+   * ack; undefined identifies an older client that only echoes versions. */
+  ackedId: number | undefined;
   /**
    * Whether this session is believed capable of acknowledging at all.
    *
@@ -258,8 +261,9 @@ class FileExplorerHostImpl implements FileExplorerHost {
   private readonly sessions = new Map<number, Session>();
   /** Callbacks waiting for sessions to catch up; see `flushTickAcked`. */
   private readonly ackWaiters = new Set<() => void>();
-  /** Marks the next tick's deltas as needing an ack from every session. */
-  private ackRequestedForNextTick = false;
+  /** Identifies the next tick's acknowledgement request for every session. */
+  private ackIdForNextTick: number | undefined;
+  private nextAckId = 1;
   private nextSessionId = 1;
   private disposed = false;
   /** Shared cancellable loads keyed by expanded directory. */
@@ -475,6 +479,7 @@ class FileExplorerHostImpl implements FileExplorerHost {
       handshook: false,
       lastRootIds: [],
       ackedVersion: -1,
+      ackedId: 0,
       ackCapable: true,
       ownedOperationIds: new Set<string>(),
       resyncTimes: [],
@@ -805,7 +810,9 @@ class FileExplorerHostImpl implements FileExplorerHost {
           coarseSubtrees: coarse,
           subtreeDirty,
           subtreeResynced,
-          ...(this.ackRequestedForNextTick ? { ackRequested: true } : {}),
+          ...(this.ackIdForNextTick !== undefined
+            ? { ackRequested: true, ackId: this.ackIdForNextTick }
+            : {}),
           ...(cs.projectionChanged
             ? {
                 visibility: {
@@ -866,13 +873,23 @@ class FileExplorerHostImpl implements FileExplorerHost {
         void this.handleCall(session, f.body as { reqId: number; method: string; args: unknown[] });
         return;
       case 'ack': {
-        const version = (f.body as { version?: unknown })?.version;
-        if (typeof version === 'number' && version > session.ackedVersion) {
+        const { version, ackId } = (f.body ?? {}) as { version?: unknown; ackId?: unknown };
+        if (typeof version === 'number' && Number.isSafeInteger(version) && version >= 0) {
           // Any ack proves the session speaks the protocol, so restore its
           // standing even if an earlier synchronization point timed out on a
           // momentarily busy renderer.
           session.ackCapable = true;
-          session.ackedVersion = version;
+          session.ackedVersion = Math.max(session.ackedVersion, version);
+          if (
+            typeof ackId === 'number' &&
+            Number.isSafeInteger(ackId) &&
+            ackId > 0 &&
+            ackId < this.nextAckId
+          ) {
+            session.ackedId = Math.max(session.ackedId ?? 0, ackId);
+          } else if (ackId === undefined && session.ackedId === 0) {
+            session.ackedId = undefined;
+          }
           this.notifyAckWaiters();
         }
         return;
@@ -1032,6 +1049,7 @@ class FileExplorerHostImpl implements FileExplorerHost {
     // Completion lives in the immutable native snapshot. Active tasks are
     // shared by interested sessions and carry explicit cancellation/error
     // state over the port.
+    const completedLoads: number[] = [];
     for (const id of skipLoad ? [] : (body.add ?? [])) {
       const expandable = snap.getById(id);
       // Stale/forged ids can race removal or arrive from an untrusted port.
@@ -1053,7 +1071,7 @@ class FileExplorerHostImpl implements FileExplorerHost {
         snap.directoryChildrenLoaded(id) &&
         (!snap.compactFolders || !this.compactChainNeedsLoad(snap, id))
       ) {
-        this.sendDirectoryLoad(session, id, 0, 'complete');
+        completedLoads.push(id);
         continue;
       }
       this.joinDirectoryLoad(session, id, snap.compactFolders);
@@ -1098,6 +1116,10 @@ class FileExplorerHostImpl implements FileExplorerHost {
         subtreeResynced: [],
       }),
     );
+    // Cached retries still have to clear retained errors in other windows.
+    // Publish this window's rows first; the helper refreshes its peers before
+    // broadcasting a new completion generation.
+    this.completeDirectoryLoads(completedLoads, session);
   }
 
   /** True when compact-folder projection still needs a disk listing to know
@@ -1136,14 +1158,21 @@ class FileExplorerHostImpl implements FileExplorerHost {
     task = {
       rootId: id,
       generation: this.nextDirectoryLoadGeneration++,
-      interestedSessions: new Set([session.id]),
+      interestedSessions: new Set(),
       compactFolders,
       operationId: null,
       cancelled: false,
       promise: null,
     };
     this.directoryLoads.set(id, task);
-    this.sendDirectoryLoad(session, id, task.generation, 'loading');
+    // A retry reads shared native state. Peers that kept the directory open
+    // after an earlier failure need the new generation, its result, and the
+    // final compact projection just as much as the initiating window does.
+    for (const peer of this.sessions.values()) {
+      if (!peer.handshook || !peer.expanded.has(id)) continue;
+      task.interestedSessions.add(peer.id);
+      this.sendDirectoryLoad(peer, id, task.generation, 'loading');
+    }
     // Never run a native reconciliation or flush re-entrantly while handling
     // setExpanded. The initial bounded structural/viewport frame must be the
     // first expansion frame on the wire; progressive pages follow it.
@@ -1228,17 +1257,74 @@ class FileExplorerHostImpl implements FileExplorerHost {
     if (task.operationId !== null) this.explorer.cancelOperation(task.operationId);
   }
 
-  /** Supersede a progressive task after another authoritative resync wins. */
-  private completeDirectoryLoadTask(id: number): void {
-    const task = this.directoryLoads.get(id);
-    if (task === undefined) return;
-    task.cancelled = true;
-    this.directoryLoads.delete(id);
-    if (task.operationId !== null) this.explorer.cancelOperation(task.operationId);
-    for (const sessionId of task.interestedSessions) {
-      const session = this.sessions.get(sessionId);
-      if (session === undefined || !session.handshook || !session.expanded.has(id)) continue;
-      this.sendDirectoryLoad(session, id, task.generation, 'complete');
+  /** Recover every open listing actually covered by an authoritative resync.
+   * Failed tasks have already left directoryLoads, so the expanded session
+   * ids, rather than the active-task map, identify affected mirrors. */
+  private completeDirectoryLoadsAfterResync(rootIds: readonly number[], recursive: boolean): void {
+    const snapshot = this.explorer.getSnapshot();
+    const roots = new Set(rootIds);
+    const compactAncestors = new Set<number>();
+    if (snapshot.compactFolders) {
+      // The visible expansion owns the whole compact chain, even when the
+      // caller refreshes a folder inside it. Its ancestors can recover if
+      // the coverage check below confirms their chain is now fully known.
+      for (const rootId of roots) {
+        let parentId = snapshot.getById(rootId)?.parentId ?? null;
+        while (parentId !== null && !compactAncestors.has(parentId)) {
+          compactAncestors.add(parentId);
+          parentId = snapshot.getById(parentId)?.parentId ?? null;
+        }
+      }
+    }
+    const expanded = new Set<number>();
+    for (const session of this.sessions.values()) {
+      if (session.handshook) for (const id of session.expanded) expanded.add(id);
+    }
+    const completed: number[] = [];
+    for (const id of expanded) {
+      let cursor: number | null = id;
+      const seen = new Set<number>();
+      while (cursor !== null && !roots.has(cursor) && recursive && !seen.has(cursor)) {
+        seen.add(cursor);
+        cursor = snapshot.getById(cursor)?.parentId ?? null;
+      }
+      if (!compactAncestors.has(id) && (cursor === null || !roots.has(cursor))) continue;
+      // A shallow read of the parent cannot complete a compact-chain task
+      // that is still waiting on an unlisted descendant. Recursive walks can
+      // also leave ignored/symlink descendants unlisted; check actual coverage.
+      if (
+        !snapshot.directoryChildrenLoaded(id) ||
+        (snapshot.compactFolders && this.compactChainNeedsLoad(snapshot, id))
+      )
+        continue;
+
+      completed.push(id);
+    }
+    this.completeDirectoryLoads(completed);
+  }
+
+  /** Supersede active or failed loads after their native listing is complete. */
+  private completeDirectoryLoads(ids: readonly number[], refreshedSession?: Session): void {
+    if (ids.length === 0) return;
+    for (const id of ids) {
+      const task = this.directoryLoads.get(id);
+      if (task !== undefined) {
+        task.cancelled = true;
+        this.directoryLoads.delete(id);
+        if (task.operationId !== null) this.explorer.cancelOperation(task.operationId);
+      }
+    }
+    // Recovery supersedes any retained failure generation, including one
+    // from a task that no longer exists on the host.
+    const generation = this.nextDirectoryLoadGeneration++;
+    for (const session of this.sessions.values()) {
+      if (!session.handshook) continue;
+      const completed = ids.filter((id) => session.expanded.has(id));
+      if (completed.length === 0) continue;
+      // A recursive/workspace refresh can recover many open folders. Hydrate
+      // the viewport once per session, not once per completed directory.
+      if (session !== refreshedSession) this.handleSetExpanded(session, { add: completed }, true);
+      for (const id of completed) this.sendDirectoryLoad(session, id, generation, 'complete');
     }
   }
 
@@ -1520,9 +1606,14 @@ class FileExplorerHostImpl implements FileExplorerHost {
       return;
     }
 
-    this.ackRequestedForNextTick = true;
-    const posted = this.tick();
-    this.ackRequestedForNextTick = false;
+    const ackId = this.nextAckId++;
+    this.ackIdForNextTick = ackId;
+    let posted: boolean;
+    try {
+      posted = this.tick();
+    } finally {
+      this.ackIdForNextTick = undefined;
+    }
 
     // A quiet tick put nothing on the wire, so no ack can arrive. Yield once
     // (matching `flushTickNow`) instead of waiting out the fallback timeout —
@@ -1536,8 +1627,16 @@ class FileExplorerHostImpl implements FileExplorerHost {
     // Sessions already known not to acknowledge are excluded rather than
     // waited on: they cannot satisfy the condition, so including them turns
     // every synchronization point into a full `timeoutMs` stall.
+    // Tree versions alone cannot distinguish two no-op refreshes. Require
+    // this frame's id as well, unless the peer demonstrated the older,
+    // version-only acknowledgement protocol.
     const pending = (): Session[] =>
-      sessions.filter((s) => this.sessions.has(s.id) && s.ackCapable && s.ackedVersion < target);
+      sessions.filter(
+        (s) =>
+          this.sessions.has(s.id) &&
+          s.ackCapable &&
+          (s.ackedVersion < target || (s.ackedId !== undefined && s.ackedId < ackId)),
+      );
     const satisfied = (): boolean => pending().length === 0;
     if (satisfied()) {
       await new Promise<void>((resolve) => setImmediate(resolve));
@@ -1798,9 +1897,12 @@ class FileExplorerHostImpl implements FileExplorerHost {
             ? (requested.parentId ?? id)
             : id;
         const version = await this.explorer.resync(id, { recursive });
+        // Drain raw changes before the final projected structure and recovery
+        // state. The acknowledged marker follows both on the ordered channel.
+        this.tick();
+        this.completeDirectoryLoadsAfterResync([markerId], recursive && markerId === id);
         this.markSubtreeResynced(markerId);
         await this.flushTickAcked();
-        this.completeDirectoryLoadTask(markerId);
         return version;
       }
       case 'resyncWorkspace': {
@@ -1809,11 +1911,12 @@ class FileExplorerHostImpl implements FileExplorerHost {
           .roots()
           .map((root) => root.id);
         const version = await this.explorer.resyncWorkspace();
+        this.tick();
+        this.completeDirectoryLoadsAfterResync(rootIds, true);
         for (const rootId of rootIds) {
           this.markSubtreeResynced(rootId);
         }
         await this.flushTickAcked();
-        for (const rootId of rootIds) this.completeDirectoryLoadTask(rootId);
         return version;
       }
       case 'resolvePath': {

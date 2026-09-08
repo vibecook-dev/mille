@@ -100,6 +100,8 @@ export interface AckMsg {
   body: {
     /** `treeVersion` of the most recent delta this client has applied. */
     version: number;
+    /** Echo the delta's acknowledgement id, when supplied by the host. */
+    ackId?: number;
   };
 }
 
@@ -252,6 +254,12 @@ export interface DeltaMsg {
      * Ordinary churn leaves this unset and stays one-way.
      */
     ackRequested?: boolean;
+    /**
+     * Identifies this synchronization point even when the tree version did
+     * not advance (for example, clearing a retained directory-load error).
+     * New clients echo it in `ack`; older clients keep acknowledging versions.
+     */
+    ackId?: number;
   };
 }
 

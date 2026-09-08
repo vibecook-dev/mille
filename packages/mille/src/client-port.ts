@@ -737,6 +737,7 @@ export class PortFileExplorer {
       case 'delta': {
         const body = f.body as InboundDelta & {
           ackRequested?: boolean;
+          ackId?: number;
           version?: number;
         };
         this.handleDelta(body);
@@ -747,7 +748,10 @@ export class PortFileExplorer {
         if (body?.ackRequested === true) {
           try {
             this.channel.send(
-              frame('ack', { version: this.working.treeVersion }) as ClientToHostMessage,
+              frame('ack', {
+                version: this.working.treeVersion,
+                ...(body.ackId !== undefined ? { ackId: body.ackId } : {}),
+              }) as ClientToHostMessage,
             );
           } catch {
             /* a dead port fails the host's wait by timeout, not by throw */
