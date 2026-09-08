@@ -1077,6 +1077,11 @@ class FileExplorerHostImpl implements FileExplorerHost {
       this.joinDirectoryLoad(session, id, snap.compactFolders);
     }
 
+    // A separate native read may have populated this cache without draining
+    // its raw changes yet. Flush those before publishing the final compact
+    // rows, or the next tick can overwrite their pathSegments after completion.
+    if (completedLoads.length > 0) this.tick();
+
     const childLists = new Map<number, readonly number[]>();
     const newDirectChildCounts: Record<string, number> = {};
     const childSetIds: number[] = [];

@@ -262,6 +262,9 @@ test('retrying an already-cached directory also recovers its failed peer', async
     await f.host.local.resync(f.rootId, { recursive: true });
     f.clients[0].setExpanded({ add: [f.rootId] });
     await waitFor(() => f.clients.every((client) => f.state(client) === 'complete'));
+    // Flush any pending native changes as well: a later raw delta must not
+    // erase the compact projection that the cached retry just published.
+    await f.clients[0].resync(f.otherId, { recursive: true });
     for (const client of f.clients) {
       const rows = client
         .getSnapshot()
