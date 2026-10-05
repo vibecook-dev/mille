@@ -2026,11 +2026,13 @@ version = "0.3.4"
 dependencies = [
  "bincode",
  "mille-core",
+ "mille-git",
  "napi",
  "napi-build",
  "napi-derive",
  "parking_lot",
  "serde",
+ "serde_json",
  "tokio",
  "tokio-util",
  "windows-sys 0.61.2",

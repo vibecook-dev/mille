@@ -124,6 +124,12 @@ export interface BuildIdentity {
    * this; `'unknown'` means the binary predates the field.
    */
   readonly nativePanicStrategy: string;
+  /**
+   * Optional cargo features compiled into the loaded binary — `'git'` for a
+   * `build:napi:git*` artifact, `'panic-probe'` for the test-only probes.
+   * Empty for a published default binary and for binaries that predate it.
+   */
+  readonly nativeFeatures: readonly string[];
   readonly protocolVersion: number;
   readonly platform: NodeJS.Platform;
   readonly arch: string;
@@ -152,6 +158,7 @@ export function buildIdentity(): BuildIdentity {
     nativeProfile: nativeInfo.profile,
     nativeTarget: nativeInfo.target,
     nativePanicStrategy: nativeInfo.panicStrategy ?? 'unknown',
+    nativeFeatures: Object.freeze([...(('features' in nativeInfo && nativeInfo.features) || [])]),
     protocolVersion: PROTOCOL_VERSION,
     platform: process.platform,
     arch: process.arch,

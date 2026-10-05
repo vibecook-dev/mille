@@ -804,6 +804,30 @@ impl GitEngine {
     }
 }
 
+/// Deliberate panics for the binding's panic-boundary suite (SPEC §18.4).
+/// Behind the `panic-probe` feature; never in a published build.
+#[cfg(feature = "panic-probe")]
+impl GitEngine {
+    /// Panic synchronously, inside this crate's code.
+    #[doc(hidden)]
+    pub fn panic_probe_sync(&self) -> u32 {
+        panic!("probe: synchronous panic inside mille-git");
+    }
+
+    /// Panic inside a task on the engine runtime — the path a gix panic in a
+    /// status, diff or log takes. The task boundary in `spawn` turns it into
+    /// an `EUNKNOWN` error; it must never abort the host.
+    #[doc(hidden)]
+    pub async fn panic_probe_async(&self) -> Result<()> {
+        self.spawn(async { probe_panic() }).await
+    }
+}
+
+#[cfg(feature = "panic-probe")]
+fn probe_panic() -> Result<()> {
+    panic!("probe: asynchronous panic inside a mille-git task");
+}
+
 /// Which §12.1 read limit an operation counts against.
 #[derive(Copy, Clone)]
 enum Permits {

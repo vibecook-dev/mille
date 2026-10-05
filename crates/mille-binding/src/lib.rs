@@ -12,6 +12,12 @@ pub mod cancel;
 pub mod error;
 pub mod events;
 pub mod explorer;
+// The git engine (SPEC mille-git §18) — absent from the default build, so
+// FileTree-only embedders never link gix.
+#[cfg(feature = "git")]
+pub mod git;
+#[cfg(feature = "git")]
+pub mod git_types;
 pub mod io;
 pub mod journal;
 pub mod mutations;
@@ -45,6 +51,10 @@ pub struct NativeBuildInfo {
     /// test can assert this about the artifact that actually ships, which is
     /// not the artifact the test suite normally loads.
     pub panic_strategy: String,
+    /// Optional cargo features compiled in (`"git"`, `"panic-probe"`). Lets a
+    /// test or a host tell a git-enabled `.node` from the default one without
+    /// probing for classes — `isNativeGitAvailable()` must agree with it.
+    pub features: Vec<String>,
 }
 
 #[napi(js_name = "buildInfo", catch_unwind)]
@@ -62,6 +72,14 @@ pub fn build_info() -> NativeBuildInfo {
         } else {
             "unwind".to_string()
         },
+        features: [
+            (cfg!(feature = "git"), "git"),
+            (cfg!(feature = "panic-probe"), "panic-probe"),
+        ]
+        .into_iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, name)| name.to_string())
+        .collect(),
     }
 }
 

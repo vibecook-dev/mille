@@ -15,10 +15,21 @@ path = "src/lib.rs"
 # Test-only entry points that deliberately panic, so the suite can assert a
 # native panic surfaces as a catchable JS error instead of killing the host
 # process. Never enabled for published artifacts — see `build:napi:probe`.
-panic-probe = []
+#
+# With `git` also on, it carries `mille-git`'s probe too: a panic inside the
+# git engine's own code and runtime, so the feature-gated module is not the
+# one exception path the panic boundary leaves unproved (SPEC mille-git §18.4).
+panic-probe = ["mille-git?/panic-probe"]
+# The git engine (`GitEngine`, SPEC mille-git §18). Off by default and off in
+# every published platform package until its size is measured (§32.1):
+# FileTree-only embedders must not link gix. `build:napi:git*` turn it on.
+git = ["dep:mille-git", "dep:serde_json"]
 
 [dependencies]
 mille-core = { path = "../mille-core" }
+mille-git = { path = "../mille-git", optional = true }
+# Git results cross napi as JSON text (see `src/git.rs`); FileTree never does.
+serde_json = { version = "1", optional = true }
 bincode.workspace = true
 napi.workspace = true
 napi-derive.workspace = true

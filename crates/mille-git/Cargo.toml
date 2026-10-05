@@ -10,6 +10,13 @@ description = "Git engine for mille: gix reads, git CLI writes, per-worktree que
 [lib]
 path = "src/lib.rs"
 
+[features]
+# Test-only `GitEngine::panic_probe_*`: deliberate panics inside this crate,
+# so the binding's panic-boundary suite can prove a panic in the git engine
+# reaches JS as an error (SPEC mille-git §18.4). Never on in a published build;
+# the binding's own `panic-probe` feature turns it on.
+panic-probe = []
+
 # v1 MUST NOT depend on `mille-core` (a future `gitd` links this crate alone),
 # nor on napi, git2/libgit2-sys or anything JS (SPEC mille-git §8.1).
 [dependencies]

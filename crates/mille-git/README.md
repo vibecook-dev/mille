@@ -5,8 +5,15 @@ operation queue per open worktree, and watches on the resolved gitdir. Pure Rust
 binding exposes it behind its `git` feature (off by default; FileTree embedders never link gix).
 
 The design is `draft/mille-git-spec.md` (SPEC mille-git), which is normative for §7–§24. This
-crate implements its PRs 1–5; the napi binding, the TypeScript `GitService` and the playground
-migration (PRs 6a–9) are later work.
+crate implements its PRs 1–5. PR 6a exposes it through napi: `crates/mille-binding/src/git.rs`
+behind the binding's `git` feature, wrapped by `@vibecook/mille/git` (`packages/mille/src/git/`).
+The playground migration (PRs 8–9) is later work.
+
+```bash
+pnpm --filter @vibecook/mille run build:napi:git:debug   # or :git (release), :git:probe (+ panic probes)
+pnpm --filter @vibecook/mille run build:ts
+MILLE_EXPECT_GIT=1 node --test packages/mille/test/git-engine.test.mjs
+```
 
 ## Layout
 
@@ -221,3 +228,47 @@ Each item names the section it departs from and why. None reopens a §31/§32 de
     and capped at 10 000 rows without a separate truncated count, since Appendix A returns a bare
     `CommitFile[]`.
 
+### The binding (PR 6a onward)
+
+40. **Results cross napi as JSON text; only inputs are `#[napi(object)]` mirrors** (§18.1, §27.3's
+    `git_types.rs`). This crate's types already serialize in Appendix A's camelCase, so one
+    `serde_json::to_string` is the conversion and `@vibecook/mille/git` parses it. Mirrors would
+    copy ~15 types field by field, and napi's serde path turns any `u64` above `u32::MAX` into a
+    `BigInt` (`generation`, `tookMs`, a large file's `bytes`) where JSON keeps a number. It is also
+    the frame the MessagePort transport (PR 8) needs anyway. Contents (`readObject`,
+    `readWorktreeFile`) cross as a `Buffer`; the wrapper returns valid UTF-8 as a `string`.
+41. **Cancellation crosses napi as an `operationId` plus `cancelOperation(id)`**, the explorer's
+    existing pattern, not an `AbortSignal` parameter (Appendix A, §12.5). napi-rs 3.8's
+    `AbortSignal` is `!Send`, overwrites the signal's `onabort`, and never fires for a signal that
+    was already aborted. Each cancellable entry point is a sync function that registers its token
+    on the JS thread before returning a promise, so an abort issued at any later instant finds it.
+    The TypeScript wrapper still takes `signal`; a pre-aborted one rejects `ECANCELED` without a
+    native call.
+42. **Runtime-sharing decision: the binding does not use `with_runtime`.** Each napi `GitEngine`
+    owns the crate's two-worker runtime (deviation 10). napi-rs exposes no handle to its own
+    runtime, drops it when the Node environment exits and builds a new one when an Electron
+    renderer reloads, so a captured `Handle` could outlive its runtime and leave every queued
+    status silently cancelled. The engine's watchers and queue schedule work long after the JS call
+    that started them, and its gix blocking work stays out of the explorer's blocking pool. Cost:
+    two idle threads per engine; playground builds one.
+43. **Events are per-channel methods** — `onStatus(worktree, cb)`, `onWorktrees(worktree, cb)`,
+    `onWarning(cb)`, `off(id)` — as the explorer's are, rather than one `on(event)` (§18.1); the
+    wrapper and the transport present the `on`/`onStatus` shapes. There is **no `'error'` channel**:
+    degradation is a `'warning'` and failures reject their call, and Appendix A's `GitTransport.on`
+    has no `'error'` either. Listeners are **weak** threadsafe functions, so an engine subscription
+    never keeps a Node process alive on its own.
+44. **`buildInfo().features`** (`buildIdentity().nativeFeatures` in TypeScript) reports the cargo
+    features compiled in, and `isNativeGitAvailable()` must agree with it (T-FEAT-OFF/ON). The
+    native loader moved to `packages/mille/src/native-loader.ts` so the git entry can ask "is there
+    a binary?" without `native.ts`'s import-time throw — §17.5's "MUST NOT throw".
+45. **Additive surface**: napi/TS `refresh(worktree, paths | null)` and `setStatusBackend` (deviation
+    15), the `idleRescanMs` option (deviation 18), `gitPath`, and a third build script,
+    `build:napi:git:probe` (`panic-probe,git`, what CI's `test-git` job loads).
+46. **The §18.4 git panic probes** are `__gitPanicProbeSync` / `__gitPanicProbeAsync`, present only
+    with `--features panic-probe,git`: the binding's `panic-probe` feature turns on this crate's
+    (`mille-git?/panic-probe`). The async one panics inside a task on the engine runtime and must
+    reject `GIT|EUNKNOWN`, never abort.
+47. **CI**: a `test-git` job runs clippy over the binding with `panic-probe,git` and the whole JS suite
+    against the `build:napi:git:probe` binary with `MILLE_EXPECT_GIT=1` (a missing engine fails
+    instead of skipping). `cargo test -p mille-git` is not repeated there: `test-rust`'s workspace
+    `cargo test` already runs it.

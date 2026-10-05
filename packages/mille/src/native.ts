@@ -16,91 +16,17 @@
 // module — `FileExplorer`, `FileReadStream`, `version`. Phase 6's
 // higher-level wrappers (commits 6.4+) layer typed surfaces on top.
 
-import { existsSync, readFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
+import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { tryLoadNative } from './native-loader.js';
+
+export type { NativeLoadSource } from './native-loader.js';
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const require = createRequire(import.meta.url);
 
-function isMusl(): boolean {
-  // glibc-linked Node populates `glibcVersionRuntime` in the process
-  // report header; musl-linked Node leaves it undefined. This is the
-  // same heuristic @napi-rs/cli's loader uses.
-  try {
-    const report = (
-      process as unknown as {
-        report?: { getReport(): { header?: { glibcVersionRuntime?: string } } };
-      }
-    ).report?.getReport();
-    return !report?.header?.glibcVersionRuntime;
-  } catch {
-    return false;
-  }
-}
-
-export type NativeLoadSource = 'local' | 'platform-package';
-
-interface LoadedNative {
-  readonly module: unknown;
-  readonly source: NativeLoadSource;
-  readonly resolvedPath: string;
-}
-
-function loadLocal(): LoadedNative | null {
-  // Dev build path: the `.node` is emitted next to api.d.ts (one dir up
-  // from dist/). napi-rs names Linux/Windows binaries with an ABI suffix
-  // (`-gnu` / `-musl` / `-msvc`); Darwin is just `platform-arch`.
-  const base = `mille.${process.platform}-${process.arch}`;
-  const names = [
-    `${base}.node`,
-    `${base}-gnu.node`,
-    `${base}-musl.node`,
-    `${base}-msvc.node`,
-  ];
-  const roots = [join(__dirname, '..'), join(__dirname, '..', '..')];
-  for (const root of roots) {
-    for (const name of names) {
-      const c = join(root, name);
-      if (existsSync(c)) {
-        return { module: require(c), source: 'local', resolvedPath: c };
-      }
-    }
-  }
-  return null;
-}
-
-function loadFromPlatformPackage(): LoadedNative | null {
-  // Order matters only for linux: musl must be probed before gnu
-  // because musl binaries can't dlopen into glibc Node and vice versa.
-  const triples: Record<string, Record<string, string[]>> = {
-    darwin: { arm64: ['darwin-arm64'], x64: ['darwin-x64'] },
-    win32: { x64: ['win32-x64-msvc'], arm64: ['win32-arm64-msvc'] },
-    linux: {
-      x64: isMusl() ? ['linux-x64-musl'] : ['linux-x64-gnu'],
-      arm64: isMusl() ? ['linux-arm64-musl'] : ['linux-arm64-gnu'],
-    },
-  };
-  const attempts = triples[process.platform]?.[process.arch] ?? [];
-  for (const triple of attempts) {
-    try {
-      const request = `@vibecook/mille-${triple}`;
-      const resolvedPath = require.resolve(request);
-      return {
-        module: require(resolvedPath),
-        source: 'platform-package',
-        resolvedPath,
-      };
-    } catch {
-      // Each per-triple package is an optionalDependency, so missing
-      // modules are expected on mismatched hosts. Fall through.
-    }
-  }
-  return null;
-}
-
-const loadedNative = loadLocal() ?? loadFromPlatformPackage();
+const loadedNative = tryLoadNative();
 if (!loadedNative) {
   throw new Error(
     `@vibecook/mille: failed to load native binary for ` +
@@ -121,6 +47,8 @@ export interface NativeBinding {
     readonly profile: string;
     readonly target: string;
     readonly panicStrategy?: string;
+    /** Optional cargo features compiled in, e.g. `['git']`. Absent before 0.3.5. */
+    readonly features?: readonly string[];
   };
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   FileExplorer: any;
