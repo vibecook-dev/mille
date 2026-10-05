@@ -45,5 +45,26 @@ export {
   type RemoteChannelConnection,
   type WebSocketConstructorLike,
 } from './remote/client.js';
-export * from './remote/protocol.js';
+export {
+  MAX_REMOTE_CREDENTIAL_LENGTH,
+  REMOTE_SERVICE,
+  REMOTE_SERVICE_VERSION,
+  RemoteOpenError,
+  isRemoteServiceMessage,
+  parseOpenRequest,
+  ping,
+  pong,
+  rejection,
+  type OpenWorkspaceAccepted,
+  type OpenWorkspaceLimits,
+  type OpenWorkspaceRejectCode,
+  type OpenWorkspaceRejected,
+  type OpenWorkspaceRequest,
+  type RemoteAccess,
+  type RemoteOpenErrorCode,
+  type RemotePing,
+  type RemotePong,
+  type RemoteServiceMessage,
+  type RequestProblem,
+} from './remote/protocol.js';
 export { relayExplorerChannel, type RelayExplorerChannelOptions } from './remote/relay.js';
