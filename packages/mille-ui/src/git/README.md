@@ -21,6 +21,50 @@ Git decoration companion for the `mille-ui` file tree. Registers a
 - `resolveGitDir(dotGit)` — follows that redirect. Exported for hosts
   that need the real gitdir for their own bookkeeping.
 
+## Engine client vs shell client
+
+Two backends satisfy the same `GitClient` contract.
+
+| | Engine (`createGitServiceClient`) | Shell (`createShellGitClient`) |
+|--|--|--|
+| Status | gix in the native `GitEngine`, one queue per worktree | `git status --porcelain=v2 -z` per call |
+| Freshness | explorer `'event'` hints + gitdir watch (worktree-only saves included) | `.git/HEAD` + `.git/index` only |
+| Where | any process holding a `GitService` (renderer-safe adapter) | Node only (`/git/node`) |
+| Needs | a `.node` built with `build:napi:git` | a `git` binary |
+
+The engine path, as a host wires it (SPEC mille-git §17.2, §19.1):
+
+```ts
+import { bindExplorer, createGitService, createInProcessGitTransport,
+         isNativeGitAvailable } from '@vibecook/mille/git';        // Node / utility only
+import { createGitServiceClient, registerGitDecorations } from '@vibecook/mille-ui/git';
+
+if (isNativeGitAvailable()) {
+  const transport = await createInProcessGitTransport({ allowedRoots: [rootPath] });
+  const service = createGitService(transport);
+  await service.open(rootPath);
+  bindExplorer(transport, host.local);              // worktree saves → status
+  registerGitDecorations({ fx: host.local, client: createGitServiceClient(service, rootPath),
+                           rootPath, registrar: (p) => host.registerDecorationProvider(p) });
+} else {
+  // feature-off binaries: keep the shell client
+}
+```
+
+- **Types live here, the engine does not.** `GitService`, `GitTransport` and every
+  snapshot / diff / log type are exported from `@vibecook/mille-ui/git` and are
+  renderer-safe; `@vibecook/mille/git` holds the native engine and the factories and is
+  never imported by renderer code. `test-types/git-service-compat.ts` fails `typecheck`
+  if the engine's private copy of the contract drifts from this one.
+- **The adapters** — `createGitServiceClient`, `createGitServiceHistoryClient`,
+  `createGitServiceScmClient` (`engine-client.ts`) — speak only `GitService`, so they
+  work over an in-process transport or a MessagePort one. The `GitClient` collapses XY
+  exactly as the shell client does and drops rows outside the explorer root; history
+  reads `readObject` / `readWorktreeFile`; `revert` restores **index** bytes. Construct
+  them with the same spelling of the root that `open` was given.
+- **The shell clients stay** (≥ one major after the engine ships, §24) for binaries built
+  without the `git` feature and hosts without a native engine.
+
 ## Shell client
 
 ```ts

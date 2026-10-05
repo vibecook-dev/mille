@@ -72,3 +72,11 @@ export type {
   StatusXy,
   WorktreeId,
 } from './service-types.js';
+
+// SPEC mille-git §17.2 — adapters from a `GitService` onto the clients the
+// tree and the history views consume. Renderer-safe, like the contract.
+export {
+  createGitServiceClient,
+  createGitServiceHistoryClient,
+  createGitServiceScmClient,
+} from './engine-client.js';

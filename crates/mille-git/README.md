@@ -323,3 +323,28 @@ Each item names the section it departs from and why. None reopens a §31/§32 de
     and an uncaught throw from a native callback would take a utility process down.
 61. **Additive contract fields**: `GitWarning`, `GitEngineOptions.idleRescanMs`, `DiffLine.truncated`
     (deviation 32).
+
+### The adapters (PR 7)
+
+62. **`shell-client.ts` changes in PR 7**, whose plan says shell clients stay untouched: deviation 14
+    sent the fix here. The `u` record's path is found by counting its ten fixed fields, so
+    `conflict file.ts` no longer becomes `file.ts`. A parity test feeds `v2-mixed.z` to the shell
+    client and `v2-mixed.expected.json` to the engine adapter and requires identical badges; it fails
+    on the old parser.
+63. **The `GitClient` adapter caches only while it has listeners**: one engine subscription serves
+    every `onChange` listener and holds the newest snapshot (older generations never replace it);
+    the last unsubscribe drops both. Without listeners `getStatus` asks `service.status`, which the
+    engine answers from its published snapshot when idle (deviation 19).
+64. **Map keys are `checkoutRoot + '/' + row path` on every platform** (§10.4's POSIX join); each
+    value's `path` is relative to the explorer root, which is what `registerGitDecorations` joins
+    back onto `rootPath`. Rows outside the root, or merely sharing its prefix (`src` vs `srcfoo`),
+    are dropped.
+65. **History and SCM translate paths through the opened identity**: explorer-root-relative in,
+    checkout-relative to the engine, so an explorer root inside a monorepo checkout works (the offset
+    is fetched once); a `rootPath` override must lie inside the checkout. Paths are validated
+    lexically before any call, with the shell clients' `path escapes workspace root` message.
+    `ENOTAREPO`, `ENOGIT`, `ENOENT`, `EACCES`, `EUNKNOWN` and `EUNSUPPORTED` become `[]` / `null`, as
+    the shell clients' non-zero exits do; `EINVAL`, `ECANCELED` and the rest throw.
+66. **Spellings compare lexically** (renderer-safe code cannot realpath; drive-letter paths
+    case-insensitively). Construct an adapter with the spelling `open` was given: the identity keeps
+    the first opener's spelling (deviation 8).

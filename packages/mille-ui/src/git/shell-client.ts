@@ -188,16 +188,14 @@ function parsePorcelainV2(
       // `! path` — skip ignored; UIs render ignored state separately.
       continue;
     } else if (tag === 'u') {
-      // Unmerged: `u XY sub m1 m2 m3 mW h1 h2 h3 path`
-      // Parse XY at fixed offsets 2..4; path is the last space-
-      // separated field.
-      if (line.length < 5) continue;
-      const x = line[2];
-      const y = line[3];
-      const pathIdx = line.lastIndexOf(' ');
-      if (x === undefined || y === undefined || pathIdx < 4) continue;
-      const rel = line.slice(pathIdx + 1);
-      if (rel.length === 0) continue;
+      // Unmerged: `u XY sub m1 m2 m3 mW h1 h2 h3 path` — ten fixed fields,
+      // then the path, which may itself contain spaces. Counting the fields
+      // (as for `1` and `2`) rather than taking the last space-separated
+      // token is what keeps `conflict file.ts` from becoming `file.ts`
+      // (SPEC mille-git T-PORC; the golden in crates/mille-git covers it).
+      const parsed = parseRecord(line, 10);
+      if (parsed === null) { warn(`mille-ui/git: malformed 'u' line: ${line}`); continue; }
+      const rel = parsed.path;
       // Unmerged is always a conflict, regardless of XY letters.
       result.set(path.resolve(rootPath, rel), {
         path: rel,
@@ -225,14 +223,25 @@ function parseOneOrTwoLine(
   line: string,
   variant: 1 | 2,
 ): { x: string; y: string; path: string } | null {
-  // Fixed prefix: `1 XY ` or `2 XY ` — the XY pair is at indices 2 and 3.
+  // Fields before path: tag(0) XY(1) sub(2) mH(3) mI(4) mW(5) hH(6) hI(7) [rc(8)] path
+  return parseRecord(line, variant === 1 ? 8 : 9);
+}
+
+/**
+ * Split a `1` / `2` / `u` record into its XY pair and the path that follows
+ * `fieldsBeforePath` space-separated fields. The path is everything after
+ * them, spaces included.
+ */
+function parseRecord(
+  line: string,
+  fieldsBeforePath: number,
+): { x: string; y: string; path: string } | null {
+  // Fixed prefix: `<tag> XY ` — the XY pair is at indices 2 and 3.
   if (line.length < 5) return null;
   const x = line[2];
   const y = line[3];
   if (x === undefined || y === undefined) return null;
   // Count spaces to find the start of the path field.
-  // Fields before path: tag(0) XY(1) sub(2) mH(3) mI(4) mW(5) hH(6) hI(7) [rc(8)] path
-  const fieldsBeforePath = variant === 1 ? 8 : 9;
   let spacesSeen = 0;
   let idx = 0;
   while (idx < line.length && spacesSeen < fieldsBeforePath) {
