@@ -55,6 +55,21 @@ pub enum EntryKind {
     Unavailable = 4,
 }
 
+impl EntryKind {
+    /// The kind a `#[repr(u8)]` discriminant names, as it crosses NAPI;
+    /// `None` for a value no kind uses.
+    pub fn from_discriminant(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(Self::File),
+            1 => Some(Self::Directory),
+            2 => Some(Self::Symlink),
+            3 => Some(Self::Unknown),
+            4 => Some(Self::Unavailable),
+            _ => None,
+        }
+    }
+}
+
 /// One row in the flat-array model. Fields match `api.d.ts` Entry exactly.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
@@ -192,5 +207,20 @@ mod tests {
         assert_eq!(EntryKind::Symlink as u8, 2);
         assert_eq!(EntryKind::Unknown as u8, 3);
         assert_eq!(EntryKind::Unavailable as u8, 4);
+    }
+
+    #[test]
+    fn entry_kind_round_trips_its_discriminant() {
+        for kind in [
+            EntryKind::File,
+            EntryKind::Directory,
+            EntryKind::Symlink,
+            EntryKind::Unknown,
+            EntryKind::Unavailable,
+        ] {
+            assert_eq!(EntryKind::from_discriminant(kind as u32), Some(kind));
+        }
+        assert_eq!(EntryKind::from_discriminant(5), None);
+        assert_eq!(EntryKind::from_discriminant(u32::MAX), None);
     }
 }

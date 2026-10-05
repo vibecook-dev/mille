@@ -3298,8 +3298,9 @@ impl FileExplorer {
     /// against a fresh in-memory snapshot. Returns hits sorted by score
     /// descending; ties break on ascending entry id.
     ///
-    /// The client-port path (search-over-the-wire) is Phase 10+ and
-    /// is not wired here — this method is local-mode only.
+    /// Over a channel, the host fronts this with a bounded, policy-gated
+    /// `search` call (packages/mille/src/host.ts); this method itself is
+    /// unbounded unless `limit` is set.
     #[napi(catch_unwind)]
     pub fn search(&self, query: String, options: Option<SearchOptionsJs>) -> Vec<SearchHitJs> {
         let snap = self.store.snapshot();
@@ -3308,6 +3309,14 @@ impl FileExplorer {
                 limit: o.limit.map(|n| n as usize),
                 include_ignored: o.include_ignored.unwrap_or(false),
                 case_sensitive: o.case_sensitive.unwrap_or(false),
+                // An out-of-range kind matches nothing rather than failing the
+                // whole search: it can only ever have narrowed the result.
+                kinds: o.kinds.map(|kinds| {
+                    kinds
+                        .into_iter()
+                        .filter_map(mille_core::EntryKind::from_discriminant)
+                        .collect()
+                }),
             })
             .unwrap_or_default();
 

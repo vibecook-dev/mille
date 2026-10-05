@@ -176,6 +176,12 @@ export interface SearchOptions {
   readonly limit?: number;
   readonly includeIgnored?: boolean;
   readonly caseSensitive?: boolean;
+  /**
+   * Only entries of these kinds match (`0` file, `1` directory, … — the
+   * `Entry.kind` values). Applied in the engine before the limit, so a
+   * directories-only search fills its page with directories.
+   */
+  readonly kinds?: readonly number[];
 }
 
 export interface SearchHit {
@@ -352,7 +358,12 @@ type NativeFx = {
   emitReadyForTests(): void;
   search(
     query: string,
-    options?: { limit?: number; includeIgnored?: boolean; caseSensitive?: boolean },
+    options?: {
+      limit?: number;
+      includeIgnored?: boolean;
+      caseSensitive?: boolean;
+      kinds?: number[];
+    },
   ): Array<{ entry: Entry; score: number; matchedIndices: number[] }>;
   dispose(): Promise<void>;
 };
@@ -1274,21 +1285,22 @@ export class FileExplorer {
    * entry's `name` in the current snapshot via the nucleo matcher.
    * Returns hits sorted by score descending (ties broken by entry id).
    *
-   * Local-mode only: runs synchronously on the main thread. The
-   * `AbortSignal` field on api.d.ts `SearchOptions` is accepted but
-   * ignored here — nothing to abort in a sub-millisecond sync call.
-   * The client-port path would front this with a 'call' message over
-   * the wire; not wired in this commit.
+   * Runs synchronously on the calling thread. The `AbortSignal` field on
+   * api.d.ts `SearchOptions` is accepted but ignored here — nothing to
+   * abort in a synchronous call. A port client reaches the same engine
+   * through the host's bounded, policy-gated `search` call.
    */
   search(query: string, options?: SearchOptions): readonly SearchHit[] {
     const nativeOpts: {
       limit?: number;
       includeIgnored?: boolean;
       caseSensitive?: boolean;
+      kinds?: number[];
     } = {};
     if (options?.limit !== undefined) nativeOpts.limit = options.limit;
     if (options?.includeIgnored !== undefined) nativeOpts.includeIgnored = options.includeIgnored;
     if (options?.caseSensitive !== undefined) nativeOpts.caseSensitive = options.caseSensitive;
+    if (options?.kinds !== undefined) nativeOpts.kinds = [...options.kinds];
     const hits = this.nativeFx.search(query, nativeOpts);
     // napi-rs already rewrites to camelCase + plain arrays; just pass through.
     return hits;
