@@ -1,0 +1,199 @@
+{
+  "//": "Golden for parsePorcelainV2 with XY preserved (SPEC mille-git T-PORC). Shared by the Rust parser and the JS parser. T maps to M; an unknown glyph reads as \".\" and a row with two empty slots is skipped; ! rows and # headers are not entries; the x record is a warning.",
+  "warnings": 1,
+  "entries": [
+    {
+      "path": "src/a.ts",
+      "xy": {
+        "index": ".",
+        "worktree": "M"
+      },
+      "staged": false,
+      "untracked": false,
+      "conflicted": false
+    },
+    {
+      "path": "src/staged.ts",
+      "xy": {
+        "index": "M",
+        "worktree": "."
+      },
+      "staged": true,
+      "untracked": false,
+      "conflicted": false
+    },
+    {
+      "path": "src/both.ts",
+      "xy": {
+        "index": "M",
+        "worktree": "M"
+      },
+      "staged": true,
+      "untracked": false,
+      "conflicted": false
+    },
+    {
+      "path": "added.ts",
+      "xy": {
+        "index": "A",
+        "worktree": "."
+      },
+      "staged": true,
+      "untracked": false,
+      "conflicted": false
+    },
+    {
+      "path": "gone.ts",
+      "xy": {
+        "index": ".",
+        "worktree": "D"
+      },
+      "staged": false,
+      "untracked": false,
+      "conflicted": false
+    },
+    {
+      "path": "removed.ts",
+      "xy": {
+        "index": "D",
+        "worktree": "."
+      },
+      "staged": true,
+      "untracked": false,
+      "conflicted": false
+    },
+    {
+      "path": "intent.ts",
+      "xy": {
+        "index": ".",
+        "worktree": "A"
+      },
+      "staged": false,
+      "untracked": false,
+      "conflicted": false
+    },
+    {
+      "path": "type.sh",
+      "xy": {
+        "index": "M",
+        "worktree": "."
+      },
+      "staged": true,
+      "untracked": false,
+      "conflicted": false
+    },
+    {
+      "path": "type2.sh",
+      "xy": {
+        "index": ".",
+        "worktree": "M"
+      },
+      "staged": false,
+      "untracked": false,
+      "conflicted": false
+    },
+    {
+      "path": "half-unknown.ts",
+      "xy": {
+        "index": ".",
+        "worktree": "M"
+      },
+      "staged": false,
+      "untracked": false,
+      "conflicted": false
+    },
+    {
+      "path": "dir with space/file name.ts",
+      "xy": {
+        "index": ".",
+        "worktree": "M"
+      },
+      "staged": false,
+      "untracked": false,
+      "conflicted": false
+    },
+    {
+      "path": "new name.ts",
+      "origPath": "old name.ts",
+      "xy": {
+        "index": "R",
+        "worktree": "."
+      },
+      "staged": true,
+      "untracked": false,
+      "conflicted": false
+    },
+    {
+      "path": "moved.ts",
+      "origPath": "src/moved.ts",
+      "xy": {
+        "index": "R",
+        "worktree": "M"
+      },
+      "staged": true,
+      "untracked": false,
+      "conflicted": false
+    },
+    {
+      "path": "copy.ts",
+      "origPath": "orig.ts",
+      "xy": {
+        "index": "C",
+        "worktree": "."
+      },
+      "staged": true,
+      "untracked": false,
+      "conflicted": false
+    },
+    {
+      "path": "conflict file.ts",
+      "xy": {
+        "index": "U",
+        "worktree": "U"
+      },
+      "staged": false,
+      "untracked": false,
+      "conflicted": true
+    },
+    {
+      "path": "both-added.ts",
+      "xy": {
+        "index": "A",
+        "worktree": "A"
+      },
+      "staged": false,
+      "untracked": false,
+      "conflicted": true
+    },
+    {
+      "path": "deleted-by-us.ts",
+      "xy": {
+        "index": "D",
+        "worktree": "U"
+      },
+      "staged": false,
+      "untracked": false,
+      "conflicted": true
+    },
+    {
+      "path": "untracked dir/nested.ts",
+      "xy": {
+        "index": ".",
+        "worktree": "?"
+      },
+      "staged": false,
+      "untracked": true,
+      "conflicted": false
+    },
+    {
+      "path": "with space.ts",
+      "xy": {
+        "index": ".",
+        "worktree": "?"
+      },
+      "staged": false,
+      "untracked": true,
+      "conflicted": false
+    }
+  ]
+}

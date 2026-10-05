@@ -8,13 +8,30 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::Instant;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
-use crate::identity::{Discovered, GitIdentity};
+use crate::identity::{Discovered, GitIdentity, GitRepoKind};
 use crate::paths;
+use crate::status::{self, StatusBackend, StatusSnapshot};
+use crate::warning::WarningCode;
+use crate::Inner;
+
+/// The published status of one session.
+struct StatusState {
+    /// The last merged set, uncapped — what the next path-limited run
+    /// merges into, so the row cap never loses rows across merges.
+    all: Option<Arc<StatusSnapshot>>,
+    /// `all` with the row cap applied: what callers see.
+    published: Option<Arc<StatusSnapshot>>,
+    generation: u64,
+    /// §21.3: gix by default; a session can be pinned to the CLI.
+    backend: StatusBackend,
+}
 
 pub(crate) struct Session {
     /// Realpath of the checkout root (or of the caller path for
@@ -27,6 +44,7 @@ pub(crate) struct Session {
     /// Fired by the last `close` (and by engine drop): in-flight reads stop,
     /// timers stop re-arming.
     pub(crate) cancel: CancellationToken,
+    status: Mutex<StatusState>,
 }
 
 impl Session {
@@ -36,7 +54,118 @@ impl Session {
             identity: RwLock::new(discovered.identity),
             repo: discovered.repo,
             cancel: CancellationToken::new(),
+            status: Mutex::new(StatusState {
+                all: None,
+                published: None,
+                generation: 0,
+                backend: StatusBackend::Gix,
+            }),
         }
+    }
+
+    pub(crate) fn kind(&self) -> GitRepoKind {
+        self.identity.read().kind
+    }
+
+    pub(crate) fn set_backend(&self, backend: StatusBackend) {
+        self.status.lock().backend = backend;
+    }
+
+    /// Merge `run` into the session's set (§10.6), cap it, publish it.
+    pub(crate) fn publish(
+        &self,
+        mut run: StatusSnapshot,
+        hints: Option<&[String]>,
+        cap: usize,
+    ) -> Arc<StatusSnapshot> {
+        let mut state = self.status.lock();
+        state.generation += 1;
+        run.generation = state.generation;
+        let merged = Arc::new(status::merge_status(state.all.as_deref(), run, hints));
+        let mut capped = StatusSnapshot::clone(&merged);
+        status::apply_row_cap(&mut capped, cap);
+        let published = Arc::new(capped);
+        state.all = Some(merged);
+        state.published = Some(published.clone());
+        published
+    }
+
+    /// Compute one status run (full when `hints` is `None`) and publish it.
+    ///
+    /// Never fails: not-a-repo and bare publish an empty snapshot, a gix
+    /// failure degrades to the CLI, and a CLI failure publishes an empty
+    /// result with a warning (§23) — decorations must not throw.
+    pub(crate) async fn run_status(
+        self: &Arc<Self>,
+        inner: &Inner,
+        hints: Option<Vec<String>>,
+        interrupt: Arc<AtomicBool>,
+    ) -> Arc<StatusSnapshot> {
+        let started = Instant::now();
+        let cap = inner.options.status_row_cap;
+        let root = self.identity.read().worktree_path.clone();
+        if self.kind() != GitRepoKind::Worktree {
+            let identity = self.refresh_head();
+            return self.publish(StatusSnapshot::empty(identity, 0), None, cap);
+        }
+        let prefer_gix = self.status.lock().backend == StatusBackend::Gix;
+        let mut backend = StatusBackend::Gix;
+        let mut entries = None;
+        if let (true, Some(repo)) = (prefer_gix, self.repo.clone()) {
+            let pathspecs = hints.clone();
+            let computed = tokio::task::spawn_blocking(move || {
+                status::gix_status(&repo.to_thread_local(), pathspecs.as_deref(), interrupt)
+            })
+            .await;
+            match computed {
+                Ok(Ok(rows)) => entries = Some(rows),
+                Ok(Err(message)) => inner.warn(
+                    WarningCode::DegradedCli,
+                    format!("gix status failed: {message}"),
+                    &root,
+                ),
+                Err(join) => inner.warn(
+                    WarningCode::DegradedCli,
+                    format!("gix status panicked: {join}"),
+                    &root,
+                ),
+            }
+        }
+        let entries = match entries {
+            Some(rows) => rows,
+            None => {
+                backend = StatusBackend::Cli;
+                match status::cli_status(&inner.git, &root, hints.as_deref()).await {
+                    Ok((rows, parse_warnings)) => {
+                        for warning in parse_warnings {
+                            inner.warn(WarningCode::Parse, warning, &root);
+                        }
+                        rows
+                    }
+                    Err(err) => {
+                        let code = if err.kind() == crate::GitErrorKind::NoGit {
+                            WarningCode::NoGit
+                        } else {
+                            WarningCode::DegradedCli
+                        };
+                        inner.warn(code, format!("git status fallback failed: {err}"), &root);
+                        Vec::new()
+                    }
+                }
+            }
+        };
+        let identity = self.refresh_head();
+        let run = StatusSnapshot {
+            worktree_path: identity.worktree_path.clone(),
+            identity,
+            entries,
+            truncated: None,
+            took_ms: started.elapsed().as_millis() as u64,
+            path_limited: false,
+            generation: 0,
+            status_backend: backend,
+        };
+        self.publish(run, hints.as_deref(), cap)
     }
 
     pub(crate) fn identity(&self) -> GitIdentity {

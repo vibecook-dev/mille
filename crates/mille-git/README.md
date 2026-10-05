@@ -17,6 +17,9 @@ migration (PRs 6a–9) are later work.
 | `src/identity.rs` | checkout-root discovery, `GitIdentity`, the CLI identity fallback |
 | `src/session.rs` | per-checkout sessions, refcounted de-dupe by realpath |
 | `src/containment.rs` | `assert_path_under_root`, `assert_safe_revision`, the `allowedRoots` gate |
+| `src/status.rs` | gix status → `StatusSnapshot`, `UntrackedFiles::Files`, row cap, the §10.6 merge |
+| `src/porcelain.rs` | `git status --porcelain=v2 -z` parser (the CLI fallback), golden-tested |
+| `src/warning.rs` | the `'warning'` channel: `ENOGIT` once, `PARSE`, `WATCH`, `DEGRADED_CLI` |
 | `src/cli.rs` | the git CLI seam: no shell, alias-guarded argv, filtered env, graceful cancel |
 | `src/paths.rs` | lexical / realpath / POSIX-relative spelling helpers |
 | `src/error.rs` | `GitError`, `GitErrorKind` and their `E*` wire codes |
@@ -26,6 +29,10 @@ migration (PRs 6a–9) are later work.
 ```bash
 cargo test -p mille-git          # temp repos via the real git CLI; skips cleanly without git
 ```
+
+`tests/fixtures/porcelain/` holds the porcelain-v2 `-z` goldens (T-PORC). They are shared with the
+JavaScript parser: `v2-mixed.z` is raw `git status` output, `v2-mixed.expected.json` the XY-preserving
+entries both parsers must produce.
 
 Every repository a test touches is created with `git init` inside a `tempfile` directory and
 configured locally (no signing, explicit `core.hooksPath`) so a developer's global git config
@@ -78,3 +85,31 @@ Each item names the section it departs from and why. None reopens a §31/§32 de
     runs every operation on it, so callers can await from any executor; `GitEngine::with_runtime`
     adopts an existing one (the binding's). Dropping the engine shuts the runtime down in the
     background rather than blocking.
+11. **§10.6: a hinted path covers its descendants.** "Delete every hinted path that came back
+    clean" is applied to rows *under* a hinted path too, exactly as the pathspec the hint becomes
+    matches them. A deleted untracked directory hinted as `gen` therefore clears `gen/out.js`
+    instead of leaving it until the idle rescan. For a file hint the two readings are identical.
+12. **§10.6 T-MERGE-RENAME cannot hold for a `to`-only hint, and the test says so.** The spec has
+    the rename reported as `{ path: b.ts, origPath: a.ts }` "whether H is `{b.ts}` or
+    `{a.ts, b.ts}`". Under the pathspec `-- b.ts` the deletion side is outside the pathspec, so
+    neither gix nor git can pair it: `git status --porcelain=v2 -- b.ts` prints `1 A. … b.ts`
+    (checked against git 2.50). The merge rule itself is implemented as written (and unit-tested
+    with an injected rename row); the integration test asserts what a run can actually see — a
+    `to`-only hint keeps the old row, a `{from, to}` hint drops it, a full run agrees. In practice a
+    staged rename always moves the index, and the gitdir `index` watch (PR 3) runs a full status.
+    The binding's "hint only `to` and rely on §10.6" fallback (§11.2.1) is therefore a no-op until
+    that full run.
+13. **§10.2 `staged` is false for untracked and conflicted rows; untracked `xy` is `.?`.** The spec
+    defines `staged` as "index slot !== '.'" and calls an untracked row's `xy` "unused". A concrete
+    value is needed: untracked rows carry `{ index: '.', worktree: '?' }`, and conflicted rows keep
+    git's pair (`UU`, `AA`, `DU`, …) in `xy` — so the formula alone would call every conflict
+    "staged". Neither untracked nor unmerged paths have anything a commit would take as-is.
+14. **The porcelain `u` record's path is found by counting its ten fixed fields**, as the parser
+    already does for `1` and `2` records, not with `lastIndexOf(' ')` as `shell-client.ts` does.
+    The TypeScript parser truncates an unmerged path containing a space (`conflict file.ts` becomes
+    `file.ts`); the shared golden includes that case, so PR 7's parser lift should fix it there.
+15. **Added API: `refresh(worktree, paths)` and `set_status_backend(worktree, backend)`.**
+    `refresh` runs a full or path-limited status now and returns what it published (the queue in
+    PR 3 makes it "hint and await"); `set_status_backend` is §21.3's per-session `statusBackend`
+    flag. Both are additive.
+

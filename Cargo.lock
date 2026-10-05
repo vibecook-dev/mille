@@ -2075,6 +2075,7 @@ dependencies = [
  "notify",
  "parking_lot",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",

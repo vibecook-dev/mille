@@ -17,10 +17,14 @@ mod error;
 mod gitdir;
 mod identity;
 mod paths;
+mod porcelain;
 mod session;
+mod status;
+mod warning;
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,6 +39,12 @@ pub use containment::{
 pub use error::{GitError, GitErrorKind, Result};
 pub use gitdir::{find_dot_git, resolve_git_dir, MAX_DOT_GIT_WALK};
 pub use identity::{GitIdentity, GitRepoKind};
+pub use porcelain::parse_porcelain_v2;
+pub use status::{
+    apply_row_cap, merge_status, sort_entries, status_thread_limit, StatusBackend, StatusEntry,
+    StatusLetter, StatusSnapshot, StatusXy, MAX_HINT_PATHS,
+};
+pub use warning::{GitWarning, WarningCallback, WarningCode};
 
 use cli::GitCli;
 use containment::AllowList;
@@ -100,6 +110,7 @@ pub(crate) struct Inner {
     pub(crate) git: GitCli,
     pub(crate) handle: Handle,
     pub(crate) registry: Mutex<Registry>,
+    pub(crate) warnings: warning::Warnings,
 }
 
 /// The engine: a registry of per-checkout sessions plus the runtime their
@@ -153,6 +164,7 @@ impl GitEngine {
             options,
             handle,
             registry: Mutex::new(Registry::default()),
+            warnings: warning::Warnings::default(),
         })
     }
 
@@ -220,6 +232,54 @@ impl GitEngine {
         self.inner.registry.lock().real_root_of(worktree)
     }
 
+    /// The current status snapshot: whole-repo, XY preserved, sorted and
+    /// capped. Never fails for not-a-repo, bare or a missing git binary — it
+    /// returns an empty snapshot (and warns) instead (§23).
+    pub async fn status(&self, worktree: &Path) -> Result<Arc<StatusSnapshot>> {
+        self.refresh(worktree, None).await
+    }
+
+    /// Run status now — full when `paths` is `None`, else limited to those
+    /// worktree-relative POSIX paths and merged per §10.6 — and return the
+    /// snapshot it published. Unsafe paths are dropped from the hint set.
+    pub async fn refresh(
+        &self,
+        worktree: &Path,
+        paths: Option<Vec<String>>,
+    ) -> Result<Arc<StatusSnapshot>> {
+        let session = self.inner.session(worktree)?;
+        let inner = self.inner.clone();
+        let hints = paths.map(|p| {
+            p.into_iter()
+                .filter(|p| is_safe_workspace_relative_path(p))
+                .collect()
+        });
+        self.spawn(async move {
+            Ok(session
+                .run_status(&inner, hints, Arc::new(AtomicBool::new(false)))
+                .await)
+        })
+        .await
+    }
+
+    /// Pin a session's status backend (§21.3): `Cli` when gix measures
+    /// slower than CLI + fsmonitor on a repository; `Gix` is the default.
+    pub fn set_status_backend(&self, worktree: &Path, backend: StatusBackend) -> Result<()> {
+        self.inner.session(worktree)?.set_backend(backend);
+        Ok(())
+    }
+
+    /// Subscribe to the `'warning'` channel (§22.2). Returns an id for
+    /// [`unsubscribe_warnings`](Self::unsubscribe_warnings).
+    pub fn subscribe_warnings(&self, callback: WarningCallback) -> u64 {
+        self.inner.warnings.subscribe(callback)
+    }
+
+    /// Remove a warning subscriber.
+    pub fn unsubscribe_warnings(&self, id: u64) {
+        self.inner.warnings.unsubscribe(id);
+    }
+
     /// How many sessions are open (after de-dupe). Diagnostic.
     #[doc(hidden)]
     pub fn session_count(&self) -> usize {
@@ -256,6 +316,11 @@ impl Drop for GitEngine {
 }
 
 impl Inner {
+    pub(crate) fn warn(&self, code: WarningCode, message: impl Into<String>, worktree: &Path) {
+        self.warnings
+            .emit(code, message, Some(worktree.to_path_buf()));
+    }
+
     pub(crate) fn session(&self, worktree: &Path) -> Result<Arc<Session>> {
         self.registry.lock().lookup(worktree).ok_or_else(|| {
             GitError::invalid(format!("worktree is not open: {}", worktree.display()))
