@@ -75,7 +75,10 @@ wss.on('connection', (socket) => {
   `openTimeoutMs` (10 s); heartbeats ping after `heartbeatMs` (20 s) of
   silence and close after `idleTimeoutMs` (60 s). Heartbeats never reach the
   host. A result too large for one frame (`readText` of a big file) answers
-  `EFBIG` and the session carries on. `serveRemoteSession(channel, options)`
+  `EFBIG` and the session carries on. A viewport (limit plus overscan) is
+  capped at the grant's `maxViewportRows`, 2,048 rows by default; a larger
+  request is clamped and the client gets a `VIEWPORT_CLAMPED` warning, and
+  `accepted.limits.maxViewportRows` says the cap up front. `serveRemoteSession(channel, options)`
   is the same logic on any channel — a framed Duplex, a MessagePort.
 - **One host per export.** A session sees every root of the host it attaches
   to, so give each export its own host. Keep `followSymlinks: false` on any

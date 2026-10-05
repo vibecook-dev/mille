@@ -63,7 +63,9 @@ const reportPath = reportIndex === -1 ? undefined : process.argv[reportIndex + 1
 
 const TICKET = 'bench-ticket';
 const PHASES = ['attach', 'expand', 'page', 'bulk'];
-const POLICY = { access: 'read-only', allowSearch: true };
+// The bulk phase asks for the whole folder in one viewport, past the 2,048-row
+// default a remote session gets, so the grant names a cap that admits it.
+const POLICY = { access: 'read-only', allowSearch: true, maxViewportRows: ENTRIES * 2 + 64 };
 
 // ─── fixture ────────────────────────────────────────────────────────────
 

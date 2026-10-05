@@ -33,6 +33,8 @@ import type {
   ExplorerSessionPolicy,
 } from '../channel/types.js';
 import type { ClientToHostMessage, HostToClientMessage } from '../protocol.js';
+import { viewportRowCap } from '../channel/policy.js';
+import { resolveSessionContext } from '../channel/types.js';
 import {
   resolveLimits,
   type FramedStreamLimits,
@@ -248,6 +250,9 @@ function effectivePolicy(
         ...(granted.allowSearch === true || granted.access === 'admin'
           ? { allowSearch: true }
           : null),
+        ...(granted.maxViewportRows === undefined
+          ? null
+          : { maxViewportRows: granted.maxViewportRows }),
       },
     };
   }
@@ -551,6 +556,9 @@ export function serveRemoteSession(
 
     const sessionId = randomId();
     const workspaceInstanceId = verdict.workspaceInstanceId ?? workspaceInstanceIdFor(verdict.host);
+    const maxViewportRows = viewportRowCap(
+      resolveSessionContext({ kind: 'remote', policy: effective.policy }),
+    );
     info = {
       sessionId,
       exportId: parsed.exportId,
@@ -581,6 +589,7 @@ export function serveRemoteSession(
         maxFileBytes: effective.policy.maxFileBytes ?? DEFAULT_REMOTE_MAX_FILE_BYTES,
         heartbeatMs,
         idleTimeoutMs,
+        ...(maxViewportRows === undefined ? null : { maxViewportRows }),
       },
     };
     try {

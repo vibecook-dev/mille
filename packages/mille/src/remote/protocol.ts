@@ -52,6 +52,12 @@ export interface OpenWorkspaceLimits {
   readonly maxFileBytes: number;
   readonly heartbeatMs: number;
   readonly idleTimeoutMs: number;
+  /**
+   * The most rows one viewport may span in this session (limit plus overscan
+   * both sides); larger requests are clamped with a `VIEWPORT_CLAMPED`
+   * warning. Absent from servers that predate it, and for unbounded sessions.
+   */
+  readonly maxViewportRows?: number;
 }
 
 export interface OpenWorkspaceAccepted {

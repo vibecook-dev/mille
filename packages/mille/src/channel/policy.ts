@@ -151,6 +151,28 @@ export function effectiveCapabilities(ctx: ResolvedSessionContext, native: numbe
 /** Max concurrent owned operations per session (SPEC §20.2). */
 export const MAX_OWNED_OPERATIONS = 64;
 
+/**
+ * The viewport a non-admin session gets when its policy names none.
+ *
+ * A viewport ships one full entry record per row in a single delta, and the
+ * host builds it on its own thread, so an unbounded request is both a large
+ * frame and a long stall for every other session. 2,048 rows is several
+ * screens of a tall window plus overscan, and half the client mirror's
+ * default capacity; at the entry codec's ~60 bytes a row plus the name, a
+ * full viewport patch stays near 2 MiB even with 1 KiB names, far inside the
+ * 32 MiB frame.
+ */
+export const DEFAULT_REMOTE_MAX_VIEWPORT_ROWS = 2048;
+
+/** The row cap a session's viewport runs under; `undefined` means unbounded. */
+export function viewportRowCap(ctx: ResolvedSessionContext): number | undefined {
+  const declared = ctx.policy.maxViewportRows;
+  if (declared !== undefined && Number.isFinite(declared)) {
+    return Math.max(1, Math.trunc(declared));
+  }
+  return ctx.policy.access === 'admin' ? undefined : DEFAULT_REMOTE_MAX_VIEWPORT_ROWS;
+}
+
 /** Hits one channel `search` returns when the caller names no limit. */
 export const DEFAULT_SEARCH_LIMIT = 100;
 

@@ -31,6 +31,7 @@ import {
   DEFAULT_SEARCH_LIMIT,
   MAX_SEARCH_LIMIT,
   MAX_SEARCH_QUERY_LENGTH,
+  viewportRowCap,
 } from './channel/policy.js';
 import { encodeClientEntries } from './entry-codec.js';
 import { encodeChildLists } from './child-list-codec.js';
@@ -239,7 +240,7 @@ interface Session {
    */
   resyncTimes: number[];
   /** Teardown for the message listener + port. Replaced during attach. */
-  detach: () => void;
+  detach: (reason?: string) => void;
 }
 
 interface DirectoryLoadTask {
@@ -497,10 +498,10 @@ class FileExplorerHostImpl implements FileExplorerHost {
     // never the shared host (SPEC NFR-005).
     const closeSub = channel.onClose(() => this.detachSession(id));
 
-    session.detach = (): void => {
+    session.detach = (reason?: string): void => {
       messageSub.dispose();
       closeSub.dispose();
-      channel.close();
+      channel.close(reason);
     };
     this.sessions.set(id, session);
     this.ensureTick();
@@ -981,6 +982,13 @@ class FileExplorerHostImpl implements FileExplorerHost {
       requestedPrefetch !== undefined && Number.isFinite(requestedPrefetch)
         ? Math.min(0xffff_ffff, Math.max(0, Math.trunc(requestedPrefetch)))
         : 100;
+    // The prefetch becomes a viewport on a headless client's first
+    // expansion, so it answers to the same cap.
+    const prefetchCap = viewportRowCap(session.context);
+    const requestedPrefetchRows = session.prefetchRows;
+    if (prefetchCap !== undefined && requestedPrefetchRows > prefetchCap) {
+      session.prefetchRows = prefetchCap;
+    }
     const snap = this.explorer.getSnapshot();
     const roots = snap.roots().map((e) => e.id);
     const rootEntries = roots
@@ -1014,6 +1022,12 @@ class FileExplorerHostImpl implements FileExplorerHost {
         },
       }),
     );
+    if (requestedPrefetchRows !== session.prefetchRows) {
+      this.warnViewportClamped(session, {
+        requested: { prefetchRows: requestedPrefetchRows },
+        granted: { prefetchRows: session.prefetchRows },
+      });
+    }
   }
 
   private handleSetExpanded(
@@ -1362,8 +1376,19 @@ class FileExplorerHostImpl implements FileExplorerHost {
     const normalize = (value: number): number =>
       Number.isFinite(value) ? Math.min(0xffff_ffff, Math.max(0, Math.trunc(value))) : 0;
     const offset = normalize(body.offset);
-    const limit = normalize(body.limit);
-    const overscan = normalize(body.overscan ?? 0);
+    let limit = normalize(body.limit);
+    let overscan = normalize(body.overscan ?? 0);
+    // SPEC §20.2-style bound: a non-admin session's window — limit plus
+    // overscan on both sides — never exceeds its cap. Clamp rather than
+    // refuse, so the visible rows still arrive, and say so: rows past the
+    // cap stay placeholders on the client, and it should know why.
+    const cap = viewportRowCap(session.context);
+    if (cap !== undefined && limit + 2 * overscan > cap) {
+      const requested = { offset, limit, overscan };
+      limit = Math.min(limit, cap);
+      overscan = Math.min(overscan, Math.floor((cap - limit) / 2));
+      this.warnViewportClamped(session, { requested, granted: { offset, limit, overscan } });
+    }
     session.viewport = { offset, limit, overscan };
 
     const snap = this.explorer.getSnapshot();
@@ -2067,7 +2092,13 @@ class FileExplorerHostImpl implements FileExplorerHost {
       // healthy. A result can be answered with an error instead; anything
       // else (a delta, a snapshot) would leave the mirror out of step, so
       // that session ends. A closed port lands here too, and detaches.
-      if (session.channel.state === 'open' && this.answerUnsendableResult(session, msg, error)) {
+      if (session.channel.state === 'open') {
+        if (this.answerUnsendableResult(session, msg, error)) return;
+        // Ending the session is the only safe answer, but not a silent one:
+        // the close carries why, so the client is not left guessing.
+        const type = (msg as { type?: unknown } | null)?.type;
+        const reason = error instanceof Error ? error.message : String(error);
+        this.detachSession(session.id, `could not send ${String(type)}: ${reason}`);
         return;
       }
       this.detachSession(session.id);
@@ -2102,16 +2133,30 @@ class FileExplorerHostImpl implements FileExplorerHost {
     }
   }
 
+  /** Tell a session its viewport (or prefetch) request was cut to its cap. */
+  private warnViewportClamped(
+    session: Session,
+    detail: { requested: Record<string, number>; granted: Record<string, number> },
+  ): void {
+    this.send(
+      session,
+      frame('warning', {
+        code: 'VIEWPORT_CLAMPED',
+        detail: JSON.stringify({ ...detail, maxViewportRows: viewportRowCap(session.context) }),
+      }),
+    );
+  }
+
   private sendError(session: Session, code: string, message: string): void {
     this.send(session, frame('error', { code, message }));
   }
 
-  private detachSession(id: number): void {
+  private detachSession(id: number, reason?: string): void {
     const session = this.sessions.get(id);
     if (!session) return;
     for (const expandedId of session.expanded)
       this.releaseDirectoryLoad(session, expandedId, false);
-    session.detach();
+    session.detach(reason);
     // SPEC §23.3 — releasing the claims here is what stops a session that
     // dropped mid-transfer from reserving its operation ids forever.
     session.ownedOperationIds.clear();

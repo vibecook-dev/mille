@@ -40,6 +40,7 @@ export {
 
 // A `mille.remote` session on any host channel: the open request, the
 // credential check, the policy from the grant, heartbeats kept off the host.
+export { DEFAULT_REMOTE_MAX_VIEWPORT_ROWS } from './channel/policy.js';
 export {
   DEFAULT_REMOTE_MAX_FILE_BYTES,
   serveRemoteSession,

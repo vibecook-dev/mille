@@ -911,6 +911,12 @@ export interface ExplorerSessionPolicy {
   readonly allowWorkspaceResync?: boolean;
   /** Filename search over the channel: a whole-tree scan per call, so opt-in remotely. */
   readonly allowSearch?: boolean;
+  /**
+   * Most rows one viewport may span (limit plus overscan both sides, and the
+   * handshake's prefetchRows). Larger requests are clamped with a
+   * `VIEWPORT_CLAMPED` warning. Unset: admin unbounded, others 2,048.
+   */
+  readonly maxViewportRows?: number;
 }
 
 /**
