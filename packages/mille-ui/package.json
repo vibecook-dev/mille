@@ -111,7 +111,7 @@
     "build": "tsc --build && node scripts/build-tokens.mjs",
     "build:material": "node scripts/build-material.mjs",
     "prepublishOnly": "node scripts/build-material.mjs && pnpm run build",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p test-types",
     "test": "node ../../scripts/run-tests.mjs",
     "size": "size-limit",
     "size:why": "size-limit --why",

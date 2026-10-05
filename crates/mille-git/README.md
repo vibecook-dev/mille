@@ -295,3 +295,31 @@ Each item names the section it departs from and why. None reopens a §31/§32 de
 53. **T-HINT-ROUTE end to end uses an explicit symlink** (explorer and engine on a symlinked
     spelling, two checkouts under one explorer root) rather than macOS's `/var` alone, so Linux CI
     runs it too; the realpath / overflow-A-only cases stay the cargo tests of deviation 17.
+
+### The TypeScript service (PR 6c onward)
+
+54. **Transport event bodies are named** (`GitTransportEvents`): `'status'` carries
+    `{ worktree, snapshot }`, `'worktrees'` `{ worktree, worktrees }`, `'warning'` a `GitWarning`;
+    Appendix A types them `unknown`. The in-process transport forwards a worktree's events from a
+    successful `open(w)` until the matching `close(w)`, refcounted per spelling, so
+    `onStatus(w, …)` hears exactly the worktree it opened.
+55. **The RPC is a named table** (`GitCallTable` in `@vibecook/mille/git`): every `GitService` verb
+    plus `hintPaths`, args plain and structured-cloneable, the abort signal in `call`'s `opts`, never
+    in `args`. `createGitService` speaks only this table, which is what PR 8's MessagePort frames.
+56. **`bindExplorer(transport, fx)` returns its unbinder** and is `EUNSUPPORTED` for a transport that
+    is not in-process: across a process split the routing must stay in the explorer's process and
+    forward relatives over `hintPaths`, which pairs with the MessagePort transport (PR 8).
+57. **`GitService.dispose()` closes its transport** (the service owns it), and closing the in-process
+    transport disposes its engine.
+58. **`GitError` exists in both packages and `isGitError` is structural** (`name === 'GitError'` with a
+    string `code`). Appendix A declares one class, but the engine package may not import the contract
+    package and an error that crossed a MessagePort is rebuilt, so `instanceof` can never be relied on.
+59. **A type-level drift check ties the two copies of Appendix A**:
+    `packages/mille-ui/test-types/git-service-compat.ts`, run by `mille-ui`'s `typecheck`
+    (`tsc -p test-types`), asserts every shape is mutually assignable and that `createGitService`
+    takes the contract's transport and returns the contract's service. Planted mismatches fail it.
+60. **Listener exceptions are swallowed** in the engine wrapper, the transport and the service fan-out,
+    as `client-port.ts` and the shell client already do: one bad subscriber must not block the others,
+    and an uncaught throw from a native callback would take a utility process down.
+61. **Additive contract fields**: `GitWarning`, `GitEngineOptions.idleRescanMs`, `DiffLine.truncated`
+    (deviation 32).

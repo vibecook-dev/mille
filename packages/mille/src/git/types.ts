@@ -180,3 +180,93 @@ export type GitErrorCode =
   | 'ETIMEOUT'
   | 'ELOCKED'
   | 'EUNKNOWN';
+
+/** The git RPC's version, independent of the explorer's `PROTOCOL_VERSION`. */
+export const GIT_PROTOCOL_VERSION = 1;
+
+/** Transport events and their bodies. */
+export interface GitTransportEvents {
+  /** A snapshot of a worktree the transport opened, keyed by `open`'s path. */
+  readonly status: { readonly worktree: WorktreeId; readonly snapshot: StatusSnapshot };
+  readonly worktrees: {
+    readonly worktree: WorktreeId;
+    readonly worktrees: readonly GitWorktree[];
+  };
+  readonly warning: GitWarning;
+}
+
+/** §19.3. Structurally identical to `@vibecook/mille-ui/git`'s. */
+export interface GitTransport {
+  call(method: string, args: unknown, opts?: { signal?: AbortSignal }): Promise<unknown>;
+  on(event: 'status' | 'worktrees' | 'warning', cb: (body: unknown) => void): () => void;
+  close(): void;
+}
+
+/** §17.1. Structurally identical to `@vibecook/mille-ui/git`'s. */
+export interface GitService {
+  open(worktreePath: string): Promise<GitIdentity>;
+  close(worktreePath: string): Promise<void>;
+  identity(worktreePath: string): Promise<GitIdentity>;
+  status(worktreePath: string): Promise<StatusSnapshot>;
+  onStatus(worktreePath: string, cb: (s: StatusSnapshot) => void): () => void;
+  diff(worktreePath: string, req: DiffRequest): Promise<DiffResult>;
+  log(worktreePath: string, req?: LogRequest): Promise<LogPage>;
+  commitFiles(worktreePath: string, sha: string): Promise<readonly CommitFile[]>;
+  readObject(worktreePath: string, req: ReadObjectRequest): Promise<string | Uint8Array | null>;
+  readWorktreeFile(
+    worktreePath: string,
+    path: string,
+    opts?: { signal?: AbortSignal },
+  ): Promise<string | Uint8Array | null>;
+  stage(
+    worktreePath: string,
+    paths: readonly string[],
+    opts?: { signal?: AbortSignal },
+  ): Promise<void>;
+  unstage(
+    worktreePath: string,
+    paths: readonly string[],
+    opts?: { signal?: AbortSignal },
+  ): Promise<void>;
+  restore(
+    worktreePath: string,
+    paths: readonly string[],
+    opts?: { signal?: AbortSignal },
+  ): Promise<void>;
+  commit(worktreePath: string, req: CommitRequest): Promise<string>;
+  worktrees(worktreePath: string): Promise<readonly GitWorktree[]>;
+  onWorktrees(worktreePath: string, cb: (w: readonly GitWorktree[]) => void): () => void;
+  advisePerformanceConfig(worktreePath: string): Promise<Readonly<Record<string, string>>>;
+  dispose(): Promise<void>;
+}
+
+/**
+ * The RPC table `createGitService` speaks over `GitTransport.call` — what a
+ * MessagePort transport frames (PR 8) and what the in-process transport
+ * dispatches. Args are plain cloneable objects; an abort signal travels in
+ * `call`'s `opts`, never in `args`. `hintPaths` is the one verb with no
+ * `GitService` method: the explorer host's routed hints (§18.1).
+ */
+export interface GitCallTable {
+  open: { args: { worktree: string }; result: GitIdentity };
+  close: { args: { worktree: string }; result: void };
+  identity: { args: { worktree: string }; result: GitIdentity };
+  status: { args: { worktree: string }; result: StatusSnapshot };
+  diff: { args: { worktree: string; request: Omit<DiffRequest, 'signal'> }; result: DiffResult };
+  log: { args: { worktree: string; request: Omit<LogRequest, 'signal'> }; result: LogPage };
+  commitFiles: { args: { worktree: string; sha: string }; result: CommitFile[] };
+  readObject: {
+    args: { worktree: string; request: Omit<ReadObjectRequest, 'signal'> };
+    result: string | Uint8Array | null;
+  };
+  readWorktreeFile: { args: { worktree: string; path: string }; result: string | Uint8Array | null };
+  stage: { args: { worktree: string; paths: string[] }; result: void };
+  unstage: { args: { worktree: string; paths: string[] }; result: void };
+  restore: { args: { worktree: string; paths: string[] }; result: void };
+  commit: { args: { worktree: string; request: Omit<CommitRequest, 'signal'> }; result: string };
+  worktrees: { args: { worktree: string }; result: GitWorktree[] };
+  advisePerformanceConfig: { args: { worktree: string }; result: Record<string, string> };
+  hintPaths: { args: { worktree: string; paths: string[] | null }; result: void };
+}
+
+export type GitCallMethod = keyof GitCallTable;

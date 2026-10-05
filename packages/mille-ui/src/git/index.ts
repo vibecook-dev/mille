@@ -41,3 +41,34 @@ export type {
   SpawnLike,
 } from './shell-client.js';
 export type { WatchDotGitOptions } from './watch-dotgit.js';
+
+// SPEC mille-git §17 — the `GitService` contract. Renderer-safe: ADE code
+// imports these types from here and receives an instance from its host; the
+// native engine and the factories live in `@vibecook/mille/git` (Node only).
+export { GIT_PROTOCOL_VERSION, GitError, isGitError } from './service-types.js';
+export type {
+  CommitFile,
+  CommitRequest,
+  DiffHunk,
+  DiffLine,
+  DiffRequest,
+  DiffResult,
+  DiffSpec,
+  GitEngineOptions,
+  GitErrorCode,
+  GitIdentity,
+  GitRepoKind,
+  GitService,
+  GitTransport,
+  GitTransportEvents,
+  GitWarning,
+  GitWorktree,
+  LogCommit,
+  LogPage,
+  LogRequest,
+  ReadObjectRequest,
+  StatusEntry,
+  StatusSnapshot,
+  StatusXy,
+  WorktreeId,
+} from './service-types.js';

@@ -13,6 +13,16 @@
 export { GitEngine, isNativeGitAvailable } from './engine.js';
 export type { NativeGitEngine } from './engine.js';
 export { GitError, isGitError } from './error.js';
+export { createGitService } from './service.js';
+export { bindExplorer, createInProcessGitTransport } from './transport.js';
+export { GIT_PROTOCOL_VERSION } from './types.js';
+export type {
+  GitCallMethod,
+  GitCallTable,
+  GitService,
+  GitTransport,
+  GitTransportEvents,
+} from './types.js';
 export type {
   CommitFile,
   CommitRequest,
