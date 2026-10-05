@@ -156,6 +156,12 @@ fn process_batch(
         public_events.push(to_public_event(store, event, before.as_deref()));
     }
 
+    // `'event'` is the per-path signal every OS change produces, including the
+    // ones that leave the store untouched — content-only saves, saves under a
+    // lazy folder the walker never visited. That makes it the F3 signal for
+    // the git engine (SPEC mille-git §11.1): its native subscriber
+    // (`git.rs`, `bind_explorer`) hears these synchronously, here, still under
+    // `policy_gate`, and only arms a debounce. Nothing here calls git.
     for event in &public_events {
         events.emit_event(clone_event(event));
     }

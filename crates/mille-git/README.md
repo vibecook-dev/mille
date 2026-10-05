@@ -272,3 +272,26 @@ Each item names the section it departs from and why. None reopens a §31/§32 de
     against the `build:napi:git:probe` binary with `MILLE_EXPECT_GIT=1` (a missing engine fails
     instead of skipping). `cargo test -p mille-git` is not repeated there: `test-rust`'s workspace
     `cargo test` already runs it.
+48. **`bindExplorer` returns a subscription id** (TypeScript: an unbinder); `off(id)` and `dispose`
+    unbind. §18.1 sketches `-> Result<()>` and Appendix A `bindExplorer(transport, fx): void`;
+    something has to undo a binding. The two native listeners hold the engine, the explorer's bus
+    and its store weakly, so either side may be disposed first.
+49. **The `ChangeTree` supplement is bounded** (§11.2 rule 4). `ChangeTree` also fires from JS-thread
+    calls that move no file (projection settings, root changes, lazy hydration), and mapping plus
+    realpath'ing every id there could stall the event loop. Past `MAX_HINT_PATHS` (512) ids the
+    listener maps nothing and hints each explorer root as a coarse path. Every change the watcher
+    saw has already arrived as an `'event'`; the gap is a `resync` that finds more than 512 changes
+    inside a checkout nested *under* an explorer root, which the forbidden inverted rule leaves to
+    the next hint or gitdir event.
+50. **Native explorer listeners contain their own panics** (`catch_unwind`): they run on the
+    explorer's watcher thread, and a git bug unwinding it would end every future watcher event.
+51. **T-NATIVE-SUB's Rust unit test** (`events.rs`) is type-checked by clippy but cannot run —
+    mille-binding is a cdylib against N-API, like every test already in that crate. The executed
+    proof is `packages/mille/test/git-bind.test.mjs`: raw native explorers with zero JS listeners,
+    `idleRescanMs` beyond the test, and status that changes only if a native hint arrived.
+52. **Which explorer events hint**: `created` / `changed` / `deleted`, `renamed` (both names, `from`
+    recovered through the old parent's path), and the `'warning'` a degraded rename reconciles from
+    disk; `overflow` is a coarse full status for the checkouts containing it.
+53. **T-HINT-ROUTE end to end uses an explicit symlink** (explorer and engine on a symlinked
+    spelling, two checkouts under one explorer root) rather than macOS's `/var` alone, so Linux CI
+    runs it too; the realpath / overflow-A-only cases stay the cargo tests of deviation 17.

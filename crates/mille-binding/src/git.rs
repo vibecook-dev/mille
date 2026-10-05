@@ -50,19 +50,24 @@
 //! N-API and cannot link a Rust test binary.
 
 use std::collections::HashMap;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
+use mille_core::{EntryId, EntryStore};
 use mille_git::{CancellationToken, GitEngine, GitError, GitErrorKind, OpOptions, StatusBackend};
 use napi::bindgen_prelude::{Buffer, Env, Error, PromiseRaw, Result, Status, Unknown};
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 
+use crate::events::{Channel, EventBus};
+use crate::explorer::FileExplorer;
 use crate::git_types::{
     CommitRequestJs, DiffRequestJs, GitEngineOptionsJs, LogRequestJs, ReadObjectRequestJs,
 };
+use crate::types::{ChangeNoticeJs, FileSystemEventJs};
 
 /// A JSON-text listener: `(json: string) => void`, weak (see module docs).
 type JsonListener = ThreadsafeFunction<String, Unknown<'static>, String, Status, false, true>;
@@ -102,16 +107,116 @@ enum Subscription {
     Status(PathBuf, u64),
     Worktrees(PathBuf, u64),
     Warning(u64),
+    /// A `bindExplorer`: two native listeners on that explorer's bus. Held
+    /// weakly — a binding must not keep a disposed explorer's state alive.
+    Explorer {
+        bus: Weak<EventBus>,
+        event: u64,
+        change_tree: u64,
+    },
 }
 
 impl Subscription {
-    fn cancel(self, engine: &GitEngine) {
-        match self {
-            Subscription::Status(worktree, id) => engine.unsubscribe_status(&worktree, id),
-            Subscription::Worktrees(worktree, id) => engine.unsubscribe_worktrees(&worktree, id),
-            Subscription::Warning(id) => engine.unsubscribe_warnings(id),
+    fn cancel(self, engine: Option<&GitEngine>) {
+        match (self, engine) {
+            (
+                Subscription::Explorer {
+                    bus,
+                    event,
+                    change_tree,
+                },
+                _,
+            ) => {
+                if let Some(bus) = bus.upgrade() {
+                    bus.unsubscribe(event);
+                    bus.unsubscribe(change_tree);
+                }
+            }
+            (Subscription::Status(worktree, id), Some(engine)) => {
+                engine.unsubscribe_status(&worktree, id)
+            }
+            (Subscription::Worktrees(worktree, id), Some(engine)) => {
+                engine.unsubscribe_worktrees(&worktree, id)
+            }
+            (Subscription::Warning(id), Some(engine)) => engine.unsubscribe_warnings(id),
+            (_, None) => {}
         }
     }
+}
+
+/// Run a native explorer listener's body so a bug in it can never unwind the
+/// thread that emitted the event — the explorer's watcher thread, whose death
+/// would silently end every future watcher event for the explorer.
+fn contained(work: impl FnOnce()) {
+    let _ = catch_unwind(AssertUnwindSafe(work));
+}
+
+/// §11.2 rule 3 and §11.2.1: one `'event'` → routed worktree-relative hints.
+/// Routing (realpath, longest checkout prefix, strip to POSIX, drop `.git`
+/// and lock noise) is `GitEngine::hint_os_paths`'s; this only picks the paths.
+fn hint_event(engine: &GitEngine, store: &EntryStore, event: &FileSystemEventJs) {
+    let Some(path) = event.path.as_deref() else {
+        return; // `'error'` carries none
+    };
+    match event.kind.as_str() {
+        // An overflow names a subtree whose events were lost: full status for
+        // every session whose checkout contains it — never one merely under it.
+        "overflow" => engine.hint_coarse_os_path(Path::new(path)),
+        "renamed" => {
+            // `path` is `to`; `old_name` is a basename only. Recover `from`
+            // through the old parent's path so the deletion side is hinted
+            // too. When the old parent is unknown (a lazy, unwalked folder)
+            // only `to` is hinted and the §10.6 merge drops the stale row.
+            let mut paths = vec![PathBuf::from(path)];
+            if let (Some(parent), Some(name)) = (event.old_parent_id, event.old_name.as_deref()) {
+                if let Some(dir) = store.path_for_id(EntryId(parent as u64)) {
+                    paths.push(dir.join(name));
+                }
+            }
+            engine.hint_os_paths(&paths);
+        }
+        // created / changed / deleted, and the `'warning'` a degraded rename
+        // reconciles from disk: the path changed in some way.
+        _ => engine.hint_os_paths(&[PathBuf::from(path)]),
+    }
+}
+
+/// §11.2 rule 4, the supplement: `ChangeTree` ids → paths (no write lock;
+/// `path_for_id` is a map read) → the same routing. Coarse subtrees full-scan
+/// the checkouts that contain them.
+///
+/// `ChangeTree` also fires from JS-thread calls that move no file
+/// (projection settings, root changes, lazy hydration), so this stays bounded:
+/// past `MAX_HINT_PATHS` ids it maps nothing and hints each explorer root as
+/// coarse instead — a full status for the checkouts containing a root. Every
+/// change the watcher saw has already arrived as an `'event'`; what this can
+/// add is a `resync` that found changes the watcher missed.
+fn hint_change(engine: &GitEngine, store: &EntryStore, notice: &ChangeNoticeJs) {
+    for id in &notice.coarse_subtrees {
+        if let Some(path) = store.path_for_id(EntryId(*id as u64)) {
+            engine.hint_coarse_os_path(&path);
+        }
+    }
+    let count = notice.changed_ids.len() + notice.child_set_changed.len();
+    if count == 0 {
+        return;
+    }
+    if count > mille_git::MAX_HINT_PATHS {
+        let snapshot = store.snapshot();
+        for root in snapshot.roots() {
+            if let Some(path) = store.path_for_id(*root) {
+                engine.hint_coarse_os_path(&path);
+            }
+        }
+        return;
+    }
+    let paths: Vec<PathBuf> = notice
+        .changed_ids
+        .iter()
+        .chain(&notice.child_set_changed)
+        .filter_map(|id| store.path_for_id(EntryId(*id as u64)))
+        .collect();
+    engine.hint_os_paths(&paths);
 }
 
 /// A cancellable call's token, registered under its `operationId` for as long
@@ -599,9 +704,8 @@ impl GitEngineJs {
         let Some(subscription) = self.subscriptions.lock().remove(&subscription_id) else {
             return false;
         };
-        if let Some(engine) = self.engine.read().clone() {
-            subscription.cancel(&engine);
-        }
+        let engine = self.engine.read().clone();
+        subscription.cancel(engine.as_deref());
         true
     }
 
@@ -620,11 +724,70 @@ impl GitEngineJs {
         for token in self.operations.lock().values() {
             token.cancel();
         }
-        if let Some(engine) = engine {
-            for subscription in subscriptions {
-                subscription.cancel(&engine);
-            }
+        for subscription in subscriptions {
+            subscription.cancel(engine.as_deref());
         }
+    }
+
+    /// Hear a same-process `FileExplorer`'s watcher (SPEC mille-git §11.2,
+    /// PR 6b). Returns a subscription id; `off(id)` unbinds, as does `dispose`.
+    ///
+    /// **Same-process only, and optional.** It needs the live explorer, so it
+    /// is for a host that runs both in one process (playground's utility).
+    /// Without it only the gitdir watch refreshes status — the shell client's
+    /// freshness: staging, commits and branch switches, but not a worktree-only
+    /// save. A host that cannot bind forwards routed paths through `hintPaths`
+    /// instead; F3 needs one of the two (§18.1). `@vibecook/mille/git`'s
+    /// `bindExplorer(transport, fx)` is the helper hosts call; it ends here.
+    ///
+    /// Why it is built the way it is:
+    ///
+    /// - It takes no `takePendingChanges`: that `ChangeSet` drain belongs to
+    ///   the host's delta coalescer, and a second consumer would empty every
+    ///   session's deltas (T-DELTA, AC-014). It listens instead, natively, on
+    ///   the explorer's `'event'` and `'change:tree'` channels — with no JS
+    ///   listener in the path, so a paused event loop cannot drop a hint.
+    /// - `'event'` OS paths are the worktree-save signal. `ChangeTree` +
+    ///   `pathForId` misses content-only saves and saves under folders the
+    ///   walker never visited (T-HINT-LAZY), so it is only the supplement.
+    /// - The listeners run on the watcher thread while `process_batch` holds
+    ///   `policy_gate`. They only route and arm the session's debounce timer:
+    ///   no status, no store `write_lock`, no `policy_gate`, no gix, no
+    ///   runtime. The status run happens later, on the engine's own runtime.
+    /// - Relatives, never OS paths, reach the queue: routing realpaths each
+    ///   path and strips the longest matching checkout root (§11.2.1), so
+    ///   `/var` vs `/private/var` and two checkouts side by side both hold.
+    #[napi(js_name = "bindExplorer", catch_unwind)]
+    pub fn bind_explorer(&self, explorer: &FileExplorer) -> Result<u32> {
+        let engine = Arc::downgrade(&self.engine()?);
+        let store: Weak<EntryStore> = Arc::downgrade(&explorer.store);
+
+        let (event_engine, event_store) = (engine.clone(), store.clone());
+        let event =
+            explorer
+                .events
+                .subscribe_native_event(Arc::new(move |event: &FileSystemEventJs| {
+                    let (Some(engine), Some(store)) =
+                        (event_engine.upgrade(), event_store.upgrade())
+                    else {
+                        return;
+                    };
+                    contained(|| hint_event(&engine, &store, event));
+                }));
+        let change_tree = explorer.events.subscribe_native_change(
+            Channel::ChangeTree,
+            Arc::new(move |notice: &ChangeNoticeJs| {
+                let (Some(engine), Some(store)) = (engine.upgrade(), store.upgrade()) else {
+                    return;
+                };
+                contained(|| hint_change(&engine, &store, notice));
+            }),
+        );
+        Ok(self.remember(Subscription::Explorer {
+            bus: Arc::downgrade(&explorer.events),
+            event,
+            change_tree,
+        }))
     }
 }
 

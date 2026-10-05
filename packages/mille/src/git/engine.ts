@@ -75,9 +75,7 @@ export interface NativeGitEngine {
   onWarning(listener: JsonListener): number;
   off(subscriptionId: number): boolean;
   dispose(): void;
-  /** PR 6b — register native explorer callbacks (same process only). */
-  bindExplorer?(explorer: unknown): number;
-  unbindExplorer?(bindingId: number): boolean;
+  bindExplorer(explorer: unknown): number;
 }
 
 // `undefined` is napi's `None`, so optional fields may be passed through as-is.
@@ -129,6 +127,26 @@ function decodeContents(bytes: Buffer | null | undefined): string | Uint8Array |
   }
 }
 
+/**
+ * The napi `FileExplorer` behind `fx`: the typed wrapper from
+ * `@vibecook/mille` keeps it in `nativeFx`; a raw native explorer is itself.
+ */
+function nativeExplorerOf(fx: unknown): unknown {
+  const wrapped = (fx as { nativeFx?: unknown } | null)?.nativeFx;
+  const candidate = wrapped ?? fx;
+  if (
+    candidate === null ||
+    typeof candidate !== 'object' ||
+    typeof (candidate as { takePendingChanges?: unknown }).takePendingChanges !== 'function'
+  ) {
+    throw new GitError(
+      'EINVAL',
+      'bindExplorer needs a FileExplorer from @vibecook/mille in this process',
+    );
+  }
+  return candidate;
+}
+
 function defined<T extends Record<string, unknown>>(value: T): T {
   for (const key of Object.keys(value)) {
     if (value[key] === undefined) delete value[key];
@@ -146,12 +164,9 @@ function listen<T>(cb: (value: T) => void): JsonListener {
     }
     try {
       cb(value);
-    } catch (err) {
-      // A throwing listener must not unwind into the native call path; keep
-      // it visible as an uncaught error instead of swallowing it.
-      queueMicrotask(() => {
-        throw err;
-      });
+    } catch {
+      // Swallowed, as the explorer's listeners are (`client-port.ts`): a
+      // listener bug must not crash the host process from a native callback.
     }
   };
 }
@@ -367,6 +382,21 @@ export class GitEngine {
   /** Worktree-list changes of an open worktree's repository. */
   onWorktrees(worktreePath: string, cb: (worktrees: GitWorktree[]) => void): () => void {
     return this.#subscribe(() => this.#native.onWorktrees(worktreePath, listen(cb)));
+  }
+
+  /**
+   * Hear a same-process explorer's watcher: every OS path it reports is
+   * routed to the open checkout that contains it and hinted as a
+   * worktree-relative path (§11.2). Without this (or `hintPaths` forwarding)
+   * only the gitdir watch refreshes status, so a worktree-only save goes
+   * unseen. Takes nothing from the explorer's `takePendingChanges`.
+   *
+   * `fx` is a `FileExplorer` from `@vibecook/mille` (e.g. `host.local`) or the
+   * raw native one. Returns the unbinder; `dispose()` also unbinds.
+   */
+  bindExplorer(fx: unknown): () => void {
+    const nativeFx = nativeExplorerOf(fx);
+    return this.#subscribe(() => this.#native.bindExplorer(nativeFx));
   }
 
   /** The engine's `'warning'` channel: degraded states, never thrown (§22.2). */
