@@ -164,7 +164,7 @@ function reconstruct(value: unknown, attachments: readonly Uint8Array[]): unknow
  * Throws `FrameProtocolError` when the message cannot be represented or
  * would exceed a limit — the caller decides whether that closes the channel.
  */
-export function encodeFrame(message: unknown, limits: FramedStreamLimits): Uint8Array {
+export function encodeFrame(message: unknown, limits: FramedStreamLimits): Uint8Array<ArrayBuffer> {
   const attachments: Uint8Array[] = [];
   const metadata = extract(message, { attachments, limits, ancestors: new Set<object>() });
 

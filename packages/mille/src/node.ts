@@ -28,8 +28,24 @@ export {
   type FramedStreamLimitsInput,
 } from './stream/limits.js';
 
-// Exported for tests and for anyone building a non-Duplex transport on the
-// same wire format (a WebSocket, say). Not part of the supported surface
-// yet — the framing is versioned, but these signatures are not.
+// The same framing over a WebSocket: one codec frame per binary message.
+// The host side lives here because it pairs with `createFileExplorerHost`;
+// the browser-safe client side is `@vibecook/mille/remote`.
+export {
+  createWebSocketHostChannel,
+  type WebSocketHostChannel,
+  type WebSocketServerSocketLike,
+} from './websocket/host.js';
+export type { WebSocketChannelOptions, WebSocketExplorerChannel } from './websocket/channel.js';
+export {
+  WEBSOCKET_CLOSE,
+  explorerCloseCodeFor,
+  webSocketCloseCodeFor,
+} from './websocket/close-codes.js';
+
+// Exported for tests and for anyone building a transport of their own on the
+// same wire format. Not part of the supported surface — the framing is
+// versioned, but these signatures are not. A WebSocket no longer needs them:
+// use the adapters above.
 export { encodeFrame, decodeFrame, parseHeader, type FrameHeader } from './stream/codec.js';
 export { FrameDecoder } from './stream/decoder.js';

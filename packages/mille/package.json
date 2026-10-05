@@ -35,6 +35,10 @@
       "types": "./dist/client-port.d.ts",
       "import": "./dist/client-port.js"
     },
+    "./remote": {
+      "types": "./dist/remote-client.d.ts",
+      "import": "./dist/remote-client.js"
+    },
     "./provider": {
       "types": "./dist/provider.d.ts",
       "import": "./dist/provider.js"
@@ -91,7 +95,8 @@
     "@types/react": "^19.2.0",
     "fast-check": "^4.7.0",
     "react": "^19.2.0",
-    "typescript": "~6.0.0"
+    "typescript": "~6.0.0",
+    "ws": "^8.22.0"
   },
   "peerDependencies": {
     "react": ">=18"
