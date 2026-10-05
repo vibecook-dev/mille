@@ -33,9 +33,27 @@ export {
 // the browser-safe client side is `@vibecook/mille/remote`.
 export {
   createWebSocketHostChannel,
+  serveWebSocketSession,
   type WebSocketHostChannel,
   type WebSocketServerSocketLike,
 } from './websocket/host.js';
+
+// A `mille.remote` session on any host channel: the open request, the
+// credential check, the policy from the grant, heartbeats kept off the host.
+export {
+  DEFAULT_REMOTE_MAX_FILE_BYTES,
+  serveRemoteSession,
+  type RemoteAuthorizeResult,
+  type RemoteOpenContext,
+  type RemoteSession,
+  type RemoteSessionGrant,
+  type RemoteSessionHost,
+  type RemoteSessionInfo,
+  type RemoteSessionLogger,
+  type RemoteSessionRefusal,
+  type ServeRemoteSessionOptions,
+} from './remote/server.js';
+export * from './remote/protocol.js';
 export type { WebSocketChannelOptions, WebSocketExplorerChannel } from './websocket/channel.js';
 export {
   WEBSOCKET_CLOSE,

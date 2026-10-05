@@ -14,6 +14,11 @@
 
 import type { ClientToHostMessage, HostToClientMessage } from '../protocol.js';
 import {
+  serveRemoteSession,
+  type RemoteSession,
+  type ServeRemoteSessionOptions,
+} from '../remote/server.js';
+import {
   WebSocketFramedChannel,
   type WebSocketChannelOptions,
   type WebSocketExplorerChannel,
@@ -111,4 +116,35 @@ export function createWebSocketHostChannel(
     serverTransport(socket),
     options,
   );
+}
+
+/**
+ * Serve one `mille.remote` session on an accepted server-side WebSocket:
+ * wrap it, wait for the open request, authorize its credential, and only
+ * then attach it to the host the grant names. See `serveRemoteSession`.
+ *
+ * ```ts
+ * wss.on('connection', (socket) => {
+ *   serveWebSocketSession(socket, {
+ *     authorize: ({ exportId, credential }) => {
+ *       const ticket = tickets.take(credential); // single use, checked server-side
+ *       if (ticket?.exportId !== exportId) return null; // ACCESS_DENIED
+ *       return { host: hosts.get(exportId), policy: { access: ticket.access } };
+ *     },
+ *   });
+ * });
+ * ```
+ */
+export function serveWebSocketSession(
+  socket: WebSocketServerSocketLike,
+  options: ServeRemoteSessionOptions,
+): RemoteSession {
+  const logger = options.logger;
+  const channel = createWebSocketHostChannel(socket, {
+    ...options.limits,
+    logger: {
+      warn: (message) => logger?.warn?.('channel_warning', { message }),
+    },
+  });
+  return serveRemoteSession(channel, options);
 }
