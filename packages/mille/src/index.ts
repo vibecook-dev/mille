@@ -48,7 +48,12 @@ export {
   PortFileExplorer,
   PortMirrorSnapshot,
 } from './client-port.js';
-export type { ExplorerConnectionEvent } from './client-port.js';
+export type {
+  ExplorerConnectionEvent,
+  PortSearchHit,
+  PortSearchOptions,
+  PortSearchResults,
+} from './client-port.js';
 export {
   createMessagePortClientChannel,
   createMessagePortHostChannel,

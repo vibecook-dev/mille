@@ -129,7 +129,7 @@ export function createWebSocketHostChannel(
  *     authorize: ({ exportId, credential }) => {
  *       const ticket = tickets.take(credential); // single use, checked server-side
  *       if (ticket?.exportId !== exportId) return null; // ACCESS_DENIED
- *       return { host: hosts.get(exportId), policy: { access: ticket.access } };
+ *       return { host: hosts.get(exportId), policy: { access: ticket.access, allowSearch: true } };
  *     },
  *   });
  * });

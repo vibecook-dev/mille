@@ -23,6 +23,29 @@
  */
 export const PROTOCOL_VERSION = 1;
 
+import type { ClientEntry } from './mirror.js';
+
+/**
+ * The result body of `call('search', [query, options])`.
+ *
+ * `hits` are score-ordered ids; `entries` carries each hit and its ancestors
+ * (deduplicated), so a client can show a hit's path and reveal it in the
+ * tree without another round trip — the chain `resolvePath` also returns.
+ * `clipped` means the engine had more hits than the page: it is a fact the
+ * host observed (it asks the engine for one more than the limit), not a
+ * guess from a full page.
+ */
+export interface SearchCallResult {
+  readonly version: number;
+  readonly clipped: boolean;
+  readonly hits: readonly {
+    readonly id: number;
+    readonly score: number;
+    readonly matchedIndices: readonly number[];
+  }[];
+  readonly entries: readonly ClientEntry[];
+}
+
 /**
  * Common envelope for every message on the wire.
  */

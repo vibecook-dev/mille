@@ -28,6 +28,9 @@ import {
   authorizeDecorations,
   authorizeMutation,
   effectiveCapabilities,
+  DEFAULT_SEARCH_LIMIT,
+  MAX_SEARCH_LIMIT,
+  MAX_SEARCH_QUERY_LENGTH,
 } from './channel/policy.js';
 import { encodeClientEntries } from './entry-codec.js';
 import { encodeChildLists } from './child-list-codec.js';
@@ -39,6 +42,7 @@ import {
   type DecorationOnWire,
   type DecorationsFrameBody,
   type HostToClientMessage,
+  type SearchCallResult,
 } from './protocol.js';
 import { createMessagePortHostChannel } from './channel/message-port.js';
 import { resolveSessionContext } from './channel/types.js';
@@ -1999,6 +2003,53 @@ class FileExplorerHostImpl implements FileExplorerHost {
         }
         return { id, version: snapshot.treeVersion, entries };
       }
+      case 'search': {
+        const [query, rawOptions] = args;
+        if (typeof query !== 'string') {
+          throw new FileSystemError('EINVAL', 'search requires a query string');
+        }
+        if (query.length > MAX_SEARCH_QUERY_LENGTH) {
+          throw new FileSystemError(
+            'EINVAL',
+            `search query exceeds ${MAX_SEARCH_QUERY_LENGTH} characters`,
+          );
+        }
+        const { limit, engine } = parseSearchOptions(rawOptions);
+        // One more than the page, so `clipped` is observed rather than guessed.
+        const found = this.explorer.search(query, { ...engine, limit: limit + 1 });
+        const snapshot = this.explorer.getSnapshot();
+        // Same boundary as resolvePath: a restricted session must not learn
+        // about entries beyond a symlink another session hydrated.
+        const restricted = session.context.policy.access !== 'admin';
+        const hits: { id: number; score: number; matchedIndices: number[] }[] = [];
+        const entries = new Map<number, ClientEntry>();
+        for (const hit of found) {
+          if (hits.length === limit) break;
+          const id = hit.entry.id;
+          if (snapshot.getById(id) === null) continue;
+          if (restricted && crossesSymlink(snapshot, id)) continue;
+          hits.push({ id, score: hit.score, matchedIndices: [...hit.matchedIndices] });
+          // The hit and its ancestors, each shipped once: a chain stops at
+          // the first entry an earlier hit already brought.
+          let cursor: EntryId | null = id;
+          let guard = 0;
+          while (cursor !== null && !entries.has(cursor) && guard < 10_000) {
+            const entry = snapshot.getById(cursor);
+            if (entry === null) break;
+            entries.set(cursor, entryToClient(entry));
+            session.knownIds.add(cursor);
+            cursor = entry.parentId ?? null;
+            guard += 1;
+          }
+        }
+        const result: SearchCallResult = {
+          version: snapshot.treeVersion,
+          clipped: found.length > limit,
+          hits,
+          entries: [...entries.values()],
+        };
+        return result;
+      }
       default:
         throw new Error(`unknown method: ${method}`);
     }
@@ -2078,6 +2129,48 @@ function toWireDecoration(d: Decoration): DecorationOnWire {
   if (d.tooltip !== undefined) out.tooltip = d.tooltip;
   if (d.propagate !== undefined) out.propagate = d.propagate;
   return out;
+}
+
+/**
+ * Validate a channel search's options. A limit above the cap is clamped, not
+ * refused — `clipped` tells the client the page was cut either way.
+ */
+function parseSearchOptions(raw: unknown): {
+  limit: number;
+  engine: { includeIgnored?: boolean; caseSensitive?: boolean; kinds?: number[] };
+} {
+  if (raw === undefined || raw === null) return { limit: DEFAULT_SEARCH_LIMIT, engine: {} };
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new FileSystemError('EINVAL', 'search options must be an object');
+  }
+  const o = raw as Record<string, unknown>;
+  let limit = DEFAULT_SEARCH_LIMIT;
+  if (o.limit !== undefined) {
+    if (typeof o.limit !== 'number' || !Number.isInteger(o.limit) || o.limit < 1) {
+      throw new FileSystemError('EINVAL', 'search limit must be a positive integer');
+    }
+    limit = Math.min(o.limit, MAX_SEARCH_LIMIT);
+  }
+  const engine: { includeIgnored?: boolean; caseSensitive?: boolean; kinds?: number[] } = {};
+  for (const flag of ['includeIgnored', 'caseSensitive'] as const) {
+    const value = o[flag];
+    if (value === undefined) continue;
+    if (typeof value !== 'boolean') {
+      throw new FileSystemError('EINVAL', `search ${flag} must be a boolean`);
+    }
+    engine[flag] = value;
+  }
+  if (o.kinds !== undefined) {
+    if (
+      !Array.isArray(o.kinds) ||
+      o.kinds.length > 8 ||
+      !o.kinds.every((k) => typeof k === 'number' && Number.isInteger(k) && k >= 0 && k <= 4)
+    ) {
+      throw new FileSystemError('EINVAL', 'search kinds must be a short list of entry kinds');
+    }
+    engine.kinds = [...(o.kinds as number[])];
+  }
+  return { limit, engine };
 }
 
 function toErrorPayload(e: unknown): { code: string; message: string; path?: string } {

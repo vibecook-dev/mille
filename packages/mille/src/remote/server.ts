@@ -238,8 +238,18 @@ function effectivePolicy(
   const maxFileBytes = Math.min(granted.maxFileBytes ?? DEFAULT_REMOTE_MAX_FILE_BYTES, frameCap);
   if (requested === 'read-only' && granted.access !== 'read-only') {
     // Asking for less is allowed. A session that asked to be read-only gets
-    // none of the host-global flags either: they all mutate shared state.
-    return { ok: true, policy: { access: 'read-only', maxFileBytes } };
+    // none of the host-global flags either — they all mutate shared state —
+    // but keeps search, which only reads.
+    return {
+      ok: true,
+      policy: {
+        access: 'read-only',
+        maxFileBytes,
+        ...(granted.allowSearch === true || granted.access === 'admin'
+          ? { allowSearch: true }
+          : null),
+      },
+    };
   }
   return { ok: true, policy: { ...granted, maxFileBytes } };
 }

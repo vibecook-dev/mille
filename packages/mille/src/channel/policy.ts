@@ -73,6 +73,9 @@ const CALL_GATES: Readonly<Record<string, Gate>> = {
   reorderRoots: { flag: 'allowWorkspaceRootMutation' },
   updateWorkspaceRoots: { flag: 'allowWorkspaceRootMutation' },
   refreshWorkspaceRoots: { flag: 'allowWorkspaceRootMutation' },
+  // A full scan of the shared tree per call; bounded below, and opt-in for
+  // remote sessions so an export can be browsable without being searchable.
+  search: { flag: 'allowSearch' },
 };
 
 function evaluate(
@@ -147,6 +150,15 @@ export function effectiveCapabilities(ctx: ResolvedSessionContext, native: numbe
 
 /** Max concurrent owned operations per session (SPEC §20.2). */
 export const MAX_OWNED_OPERATIONS = 64;
+
+/** Hits one channel `search` returns when the caller names no limit. */
+export const DEFAULT_SEARCH_LIMIT = 100;
+
+/** The most hits one channel `search` can return; larger limits are clamped. */
+export const MAX_SEARCH_LIMIT = 1000;
+
+/** Longest query a channel `search` accepts. A filename is at most 255 bytes. */
+export const MAX_SEARCH_QUERY_LENGTH = 1024;
 
 /** Entry resync budget per session (SPEC §20.2): 10 per minute. */
 export const RESYNC_LIMIT = 10;

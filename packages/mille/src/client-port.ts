@@ -40,12 +40,13 @@ import {
   validateFrameVersion,
   type ClientToHostMessage,
   type DecorationOnWire,
+  type SearchCallResult,
 } from './protocol.js';
 import { createMessagePortClientChannel, isExplorerChannel } from './channel/message-port.js';
 import type { ExplorerChannelCloseEvent, ExplorerClientChannel } from './channel/types.js';
 import type { Disposable, MessagePortLike } from './types.js';
 import type { ExplorerProjectionSettings } from './explorer-settings.js';
-import type { ResyncOptions, TransferOptions, Uri } from './client.js';
+import type { ResyncOptions, SearchHit, SearchOptions, TransferOptions, Uri } from './client.js';
 import type { UndoDescriptor, UndoResult } from './undo.js';
 import { normalizeUndoDescriptor, normalizeUndoResult } from './undo.js';
 
@@ -69,6 +70,26 @@ type ChangeListener = () => void;
 export interface ExplorerConnectionEvent {
   readonly state: 'online' | 'closed';
   readonly reason?: ExplorerChannelCloseEvent;
+}
+
+/** One search hit over a port: the engine's hit plus where it lives. */
+export interface PortSearchHit extends SearchHit {
+  /** Names from the hit's root down to the hit itself, e.g. `['repo', 'src', 'a.ts']`. */
+  readonly path: readonly string[];
+}
+
+/**
+ * A page of search hits. It is an array — what `FileTree`'s search mode
+ * consumes — that also says whether the host had more hits than it sent.
+ */
+export type PortSearchResults = readonly PortSearchHit[] & {
+  readonly clipped: boolean;
+  readonly treeVersion: number;
+};
+
+/** `SearchOptions` plus the abort signal mille-ui passes. */
+export interface PortSearchOptions extends SearchOptions {
+  readonly signal?: AbortSignal;
 }
 
 /**
@@ -238,6 +259,82 @@ export class PortFileExplorer {
     );
     this.publishSnapshot();
     return payload.id;
+  }
+
+  /**
+   * Filename search on the host's engine, bounded and policy-gated there.
+   *
+   * At most `limit` hits (default 100; the host clamps to 1000) in score
+   * order; `clipped` says the engine had more. Each hit's ancestors arrive
+   * with it, so the mirror can reveal a hit and `path` names it. A session
+   * whose grant lacks `allowSearch` is refused with `EACCES`. An aborted
+   * signal rejects with `ECANCELED`; the host's answer is then dropped.
+   */
+  async search(query: string, options?: PortSearchOptions): Promise<PortSearchResults> {
+    const signal = options?.signal;
+    if (signal?.aborted === true) {
+      throw new FileSystemError('ECANCELED', 'search aborted');
+    }
+    // Only the engine's fields cross the wire. mille-ui passes an
+    // AbortSignal here, which neither a codec nor structured clone carries.
+    const wire: {
+      limit?: number;
+      includeIgnored?: boolean;
+      caseSensitive?: boolean;
+      kinds?: number[];
+    } = {};
+    if (options?.limit !== undefined) wire.limit = options.limit;
+    if (options?.includeIgnored !== undefined) wire.includeIgnored = options.includeIgnored;
+    if (options?.caseSensitive !== undefined) wire.caseSensitive = options.caseSensitive;
+    if (options?.kinds !== undefined) wire.kinds = [...options.kinds];
+
+    const pending = this.call('search', [query, wire]);
+    const raw = signal === undefined ? await pending : await raceAbort(pending, signal);
+    const result = raw as Partial<SearchCallResult> | null;
+    if (
+      result === null ||
+      typeof result !== 'object' ||
+      typeof result.version !== 'number' ||
+      !Array.isArray(result.hits) ||
+      !Array.isArray(result.entries)
+    ) {
+      throw new FileSystemError('EUNSUPPORTED', 'host does not answer search over this channel');
+    }
+
+    const byId = new Map<number, ClientEntry>();
+    for (const entry of result.entries) byId.set(entry.id, entry);
+    this.working = hydrateLookupEntries(
+      this.working,
+      result.entries,
+      result.version,
+      this.mirrorCap,
+    );
+    this.publishSnapshot();
+
+    const hits: PortSearchHit[] = [];
+    for (const hit of result.hits) {
+      const entry = byId.get(hit.id);
+      if (entry === undefined) continue;
+      const path: string[] = [];
+      let cursor: ClientEntry | undefined = entry;
+      let guard = 0;
+      while (cursor !== undefined && guard < 10_000) {
+        path.push(cursor.name);
+        cursor = cursor.parentId === null ? undefined : byId.get(cursor.parentId);
+        guard += 1;
+      }
+      path.reverse();
+      hits.push({
+        entry: clientEntryToEntry(entry),
+        score: hit.score,
+        matchedIndices: hit.matchedIndices,
+        path,
+      });
+    }
+    return Object.assign(hits, {
+      clipped: result.clipped === true,
+      treeVersion: result.version,
+    }) as PortSearchResults;
   }
 
   /**
@@ -1022,6 +1119,24 @@ export async function connectFileExplorerChannel(
   const fx = new PortFileExplorer(channel, options);
   await fx.ready();
   return fx;
+}
+
+/** Settle with `promise`, or reject with ECANCELED once `signal` aborts. */
+function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(new FileSystemError('ECANCELED', 'search aborted'));
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      },
+    );
+  });
 }
 
 // ─── Phase A1 helpers ──────────────────────────────────────────────────

@@ -122,6 +122,12 @@ export interface ExplorerSessionPolicy {
   readonly allowExternalImport?: boolean;
   readonly allowUndo?: boolean;
   readonly allowWorkspaceResync?: boolean;
+  /**
+   * Filename search over the channel. Not host-global state, but a whole-tree
+   * scan on the host's thread per call, so a remote session gets it only when
+   * its grant says so.
+   */
+  readonly allowSearch?: boolean;
 }
 
 /**
@@ -168,6 +174,7 @@ export const LOCAL_ADMIN_POLICY: ExplorerSessionPolicy = {
   allowExternalImport: true,
   allowUndo: true,
   allowWorkspaceResync: true,
+  allowSearch: true,
 };
 
 export function resolveSessionContext(context?: ExplorerSessionContext): ResolvedSessionContext {
