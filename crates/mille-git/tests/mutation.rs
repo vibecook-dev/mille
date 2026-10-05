@@ -5,9 +5,15 @@ mod common;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use common::{has, Published, Repo};
-use mille_git::{CancellationToken, CommitRequest, GitEngine, GitEngineOptions, OpOptions};
+#[cfg(unix)]
+use common::Published;
+use common::{has, Repo};
+#[cfg(unix)]
+use mille_git::CancellationToken;
+use mille_git::{CommitRequest, GitEngine, GitEngineOptions, OpOptions};
 
+/// Only the Unix-only hook tests wait on a subscription.
+#[cfg(unix)]
 const SLOW: Duration = Duration::from_secs(10);
 
 fn repo_with(names: &[&str]) -> Repo {
