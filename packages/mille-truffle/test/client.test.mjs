@@ -198,8 +198,11 @@ test('connectMilleChannel exposes only explorer frames for an Electron relay', a
     });
 
     const leakedServiceFrames = [];
+    const errorFrames = [];
     const observer = opened.channel.onMessage((message) => {
       if (message?.service === 'mille.remote') leakedServiceFrames.push(message);
+      // A pong handed to the host comes back as an EINVAL error frame.
+      if (message?.type === 'error') errorFrames.push(message.body);
     });
     explorer = await connectFileExplorerChannel(opened.channel);
 
@@ -226,8 +229,11 @@ test('connectMilleChannel exposes only explorer frames for an Electron relay', a
         .some((row) => row.name === 'src'),
       'lazy expansion crossed the raw channel',
     );
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    // The server's heartbeat timer ticks at most once a second, whatever
+    // heartbeatMs says; stay idle past it so a ping/pong round really runs.
+    await new Promise((resolve) => setTimeout(resolve, 1300));
     assert.deepEqual(leakedServiceFrames, [], 'service heartbeats stayed below the relay');
+    assert.deepEqual(errorFrames, [], 'no heartbeat reached the explorer host');
     assert.equal(opened.accepted.limits.maxFileBytes, 16 * 1024 * 1024);
     observer.dispose();
   } finally {
