@@ -2061,10 +2061,44 @@ class FileExplorerHostImpl implements FileExplorerHost {
       // body; the channel is typed to the HostToClient union. One cast at
       // the single send site beats threading the union through every caller.
       session.channel.send(msg as HostToClientMessage);
-    } catch {
-      // Port may be closed mid-flight. Detach this session quietly so
-      // the host can keep serving other sessions.
+    } catch (error) {
+      // A channel that is still open refused to *encode* this message — a
+      // framed transport's frame or metadata limit — and is otherwise
+      // healthy. A result can be answered with an error instead; anything
+      // else (a delta, a snapshot) would leave the mirror out of step, so
+      // that session ends. A closed port lands here too, and detaches.
+      if (session.channel.state === 'open' && this.answerUnsendableResult(session, msg, error)) {
+        return;
+      }
       this.detachSession(session.id);
+    }
+  }
+
+  /**
+   * Replace a result too large for the channel with an EFBIG error for the
+   * same request. `readText` is the usual case: its text rides in the
+   * frame's JSON metadata, whose cap (4 MiB by default) is below the file
+   * cap a remote session may be granted.
+   */
+  private answerUnsendableResult(session: Session, msg: unknown, error: unknown): boolean {
+    const f = msg as { type?: unknown; body?: { reqId?: unknown } } | null;
+    const type = f?.type;
+    const reqId = f?.body?.reqId;
+    if ((type !== 'mutateResult' && type !== 'callResult') || typeof reqId !== 'number') {
+      return false;
+    }
+    const reason = error instanceof Error ? error.message : String(error);
+    try {
+      session.channel.send(
+        frame(type, {
+          reqId,
+          result: null,
+          error: { code: 'EFBIG', message: `result too large for this channel: ${reason}` },
+        }) as HostToClientMessage,
+      );
+      return true;
+    } catch {
+      return false;
     }
   }
 

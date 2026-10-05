@@ -438,3 +438,47 @@ test('the file cap always fits in one frame, whatever the grant says', async () 
     removeTempDir(dir);
   }
 });
+
+test('a result too large to frame answers EFBIG and the session survives', async () => {
+  const dir = tempRoot();
+  // 5 MiB of text: inside the 16 MiB file cap, but readText returns it in
+  // the frame's JSON metadata, which is capped at 4 MiB.
+  writeFileSync(join(dir, 'big.log'), 'x'.repeat(5 * 1024 * 1024));
+  const host = await createFileExplorerHost({ roots: [dir], initialWalk: 'roots-only' });
+  const server = await startServer({
+    authorize: () => ({ host, policy: { access: 'read-only' } }),
+  });
+  let fx;
+  try {
+    const conn = await connectWebSocketChannel(server.url, {
+      exportId: 'proj',
+      WebSocket: WsClient,
+    });
+    fx = await connectFileExplorerChannel(conn.channel);
+    const [root] = await rootsOf(fx);
+    await fx.setExpanded({ add: [root.id], remove: [] });
+    fx.setViewport({ offset: 0, limit: 50 });
+    const expanded = new Set([root.id]);
+    await until(
+      () =>
+        fx
+          .getSnapshot()
+          .visibleRows({ offset: 0, limit: 50, expanded })
+          .some((r) => r.name === 'big.log'),
+      'big.log row',
+    );
+    const big = fx
+      .getSnapshot()
+      .visibleRows({ offset: 0, limit: 50, expanded })
+      .find((r) => r.name === 'big.log');
+    await assert.rejects(fx.readText(big.id), (err) => err.code === 'EFBIG');
+    // The session is still there and still answering.
+    assert.equal(server.sessions[0].state, 'open');
+    assert.equal(typeof (await fx.call('getTreeVersion')), 'number');
+  } finally {
+    await fx?.dispose();
+    await server.close();
+    await host.dispose();
+    removeTempDir(dir);
+  }
+});
