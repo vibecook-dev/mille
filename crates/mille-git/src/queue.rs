@@ -106,6 +106,9 @@ struct State {
     started: u64,
     /// Bumped to invalidate the in-flight run (drop-and-replace).
     epoch: u64,
+    /// Blocking operations (mutations) in progress. Status does not start
+    /// while any is active; the last one to finish queues a full run.
+    blocking: usize,
 }
 
 /// One session's status scheduler.
@@ -119,7 +122,7 @@ impl StatusQueue {
     /// run sequence whose publish brings the snapshot up to date.
     pub(crate) fn settle_target(&self) -> Option<u64> {
         let state = self.state.lock();
-        if state.pending.is_some() || state.driver {
+        if state.pending.is_some() || state.driver || state.blocking > 0 {
             Some(state.started + 1)
         } else if state.running {
             Some(state.started)
@@ -154,7 +157,7 @@ impl Session {
         state.urgent |= urgency == Urgency::Now;
         // A running status picks the pending set up when it ends; an armed
         // driver will see it when its timer fires.
-        if state.driver || state.running {
+        if state.driver || state.running || state.blocking > 0 {
             return target;
         }
         state.driver = true;
@@ -197,6 +200,11 @@ impl Session {
             // 2. Take the pending set.
             let (hints, interrupt, epoch, sequence) = {
                 let mut state = self.queue.state.lock();
+                if state.blocking > 0 {
+                    // A mutation owns the worktree; its end queues a full run.
+                    state.driver = false;
+                    return;
+                }
                 let Some(hints) = state.pending.take() else {
                     state.driver = false;
                     return;
@@ -243,7 +251,8 @@ impl Session {
                         ));
                     }
                 }
-                let rerun = state.pending.is_some() && !self.cancel.is_cancelled();
+                let rerun =
+                    state.pending.is_some() && state.blocking == 0 && !self.cancel.is_cancelled();
                 if rerun {
                     // Drop-and-replace: the hints that arrived during the
                     // run have already waited; start them now.
@@ -285,12 +294,60 @@ impl Session {
         });
     }
 
-    /// Stop the in-flight gix walk (session close).
+    /// Stop the in-flight gix walk and make sure it never publishes
+    /// (session close, or a mutation starting).
     pub(crate) fn interrupt_status(&self) {
         let mut state = self.queue.state.lock();
+        Self::invalidate(&mut state);
+    }
+
+    fn invalidate(state: &mut State) {
         state.epoch += 1;
         if let Some(flag) = &state.interrupt {
             flag.store(true, Ordering::Release);
+        }
+    }
+
+    /// Enter a blocking operation (§12.1). Waits for in-flight diff / log
+    /// reads, but **drops** an in-flight status instead of waiting for it, so
+    /// a commit is never stuck behind a cold scan; the dropped status is
+    /// re-queued (as a full run) when the last blocking operation ends.
+    pub(crate) async fn blocking(self: &Arc<Self>, inner: &Arc<Inner>) -> BlockingGuard {
+        {
+            let mut state = self.queue.state.lock();
+            state.blocking += 1;
+            Self::invalidate(&mut state);
+        }
+        // The guard exists before the wait, so a caller that gives up while
+        // waiting still ends the blocking section.
+        let mut guard = BlockingGuard {
+            session: self.clone(),
+            inner: inner.clone(),
+            _write: None,
+        };
+        guard._write = Some(self.ops.clone().write_owned().await);
+        guard
+    }
+}
+
+/// Holds a session's blocking section; dropping it ends the section and
+/// queues the status refresh that every mutation owes (§7.4).
+pub(crate) struct BlockingGuard {
+    session: Arc<Session>,
+    inner: Arc<Inner>,
+    _write: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+}
+
+impl Drop for BlockingGuard {
+    fn drop(&mut self) {
+        self._write.take();
+        let last = {
+            let mut state = self.session.queue.state.lock();
+            state.blocking -= 1;
+            state.blocking == 0
+        };
+        if last {
+            self.session.hint(&self.inner, Hints::Full, Urgency::Now);
         }
     }
 }

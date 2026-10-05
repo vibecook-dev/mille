@@ -59,6 +59,19 @@ pub(crate) fn canonicalize_lenient(path: &Path) -> PathBuf {
     path
 }
 
+/// Like [`canonicalize_lenient`] but never follows the final component.
+///
+/// Git mutations act on a symlink itself (staging a changed link, restoring
+/// it), so containment for them must not resolve the link's target — that
+/// would refuse to stage a tracked link that points outside the repo.
+pub(crate) fn canonicalize_parent_lenient(path: &Path) -> PathBuf {
+    let path = normalize_lexical(path);
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => canonicalize_lenient(parent).join(name),
+        _ => canonicalize_lenient(&path),
+    }
+}
+
 /// Component-wise `starts_with`, case-insensitive on Windows (NTFS and the
 /// default `core.ignorecase=true` agree that `C:\Repo` and `c:\repo` are
 /// one directory).

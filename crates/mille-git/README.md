@@ -24,7 +24,8 @@ migration (PRs 6a–9) are later work.
 | `src/status.rs` | gix status → `StatusSnapshot`, `UntrackedFiles::Files`, row cap, the §10.6 merge |
 | `src/porcelain.rs` | `git status --porcelain=v2 -z` parser (the CLI fallback), golden-tested |
 | `src/warning.rs` | the `'warning'` channel: `ENOGIT` once, `PARSE`, `WATCH`, `DEGRADED_CLI` |
-| `src/cli.rs` | the git CLI seam: no shell, alias-guarded argv, filtered env, graceful cancel |
+| `src/mutation.rs` | stage / unstage / restore (index → worktree), the include-set commit, perf config |
+| `src/cli.rs` | the git CLI seam: no shell, alias-guarded argv, filtered env, graceful cancel, chunking |
 | `src/paths.rs` | lexical / realpath / POSIX-relative spelling helpers |
 | `src/error.rs` | `GitError`, `GitErrorKind` and their `E*` wire codes |
 
@@ -152,4 +153,34 @@ Each item names the section it departs from and why. None reopens a §31/§32 de
     becomes a repository (`git init`). §10.5 only requires that such a session can be subscribed to;
     it stays `none` until closed and re-opened. Watching for `.git` creation would mean watching the
     caller directory — a second worktree watch, which §11.1 forbids.
+24. **Cancellation tokens and POSIX strings in the Rust signatures.** Appendix B's methods take no
+    abort token, but §12.5 requires one on every read and mutation. `CommitRequest.cancel` and
+    `OpOptions { cancel }` (on `stage` / `unstage` / `restore`) carry a
+    `tokio_util::sync::CancellationToken` (re-exported); PR 5's request structs do the same. Paths
+    are `&[String]` / `Vec<String>` — worktree-relative POSIX, exactly what snapshots report —
+    rather than `&[PathBuf]`, which would invite OS spellings into a pathspec (`hint_paths`,
+    `merge_status` too).
+25. **§15.4 step 3 stages only what needs staging.** The literal `git add -- <included>` fails the
+    whole commit ("pathspec did not match") for an included path whose deletion is already staged,
+    and is a no-op for fully staged or clean paths. The plan reads porcelain status inside the
+    blocking section and `git add`s included paths with an unstaged change (or untracked, or
+    unmerged); a rename row counts as included when either of its names is, and an excluded staged
+    rename is unstaged by both names. An include-set with nothing to commit is `EINVAL`.
+26. **Unstaging on an unborn branch uses `git rm --cached`.** §15.3's `restore --staged` and its
+    `reset HEAD` fallback both need a `HEAD`; before the first commit neither works.
+27. **Commit failures are classified.** `EHOOK` when a commit hook (`pre-commit`,
+    `prepare-commit-msg`, `commit-msg`) exists in the effective hooks directory
+    (`git rev-parse --git-path hooks`, so `core.hooksPath` counts), `ELOCKED` when git reports an
+    existing `index.lock`, `ETIMEOUT` past `commitTimeout`, otherwise `EUNKNOWN` — always with
+    git's stderr as the message. A failed commit leaves the include-set staging in place; nothing
+    is rolled back.
+28. **Path lists are chunked at 30 000 characters on every platform**, not only on Windows (§15.1):
+    a few more spawns on a huge selection beat a platform-only branch that CI on macOS never runs.
+29. **Mutation containment realpaths the parent, not the final component.** `allowedRoots` is
+    checked on `realpath(dirname) + basename`, so a tracked symlink can still be staged or
+    restored, while a symlinked *directory* cannot carry a path out of the allow-list (reads in
+    PR 5 follow the final component, per §14.2).
+30. **`advise_performance_config` returns a sorted map** and writes it (with `git config`, inside the
+    blocking section) only when `write_performance_config` is set. `core.fsmonitor` is advised only
+    on macOS and Windows with git ≥ 2.37, where the builtin daemon exists.
 

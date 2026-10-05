@@ -89,6 +89,8 @@ pub(crate) enum LockMode {
     /// status / diff / log / show: `--no-optional-locks` + `GIT_OPTIONAL_LOCKS=0`,
     /// so a stuck `index.lock` left by an agent cannot deadlock a read.
     Read,
+    /// Mutations: git's defaults.
+    Write,
 }
 
 /// Knobs for one invocation.
@@ -112,6 +114,46 @@ impl RunOptions {
             max_stdout: None,
         }
     }
+
+    pub(crate) fn write() -> Self {
+        Self {
+            mode: LockMode::Write,
+            ..Self::read()
+        }
+    }
+
+    pub(crate) fn cancel(mut self, cancel: Option<&CancellationToken>) -> Self {
+        self.cancel = cancel.cloned();
+        self
+    }
+}
+
+/// Windows caps a command line at 32 767 UTF-16 units; VS Code learned to
+/// split path lists at 30 000 characters (`MAX_CLI_LENGTH`). Applied on
+/// every platform: a few more spawns on a huge selection beat a platform
+/// branch nobody tests.
+pub const MAX_PATHS_ARGV_CHARS: usize = 30_000;
+
+/// Split `paths` into argv-sized chunks of at most `budget` characters
+/// (one separator per path counted). A single over-long path still gets a
+/// chunk of its own.
+pub fn chunk_paths(paths: &[String], budget: usize) -> Vec<Vec<String>> {
+    let mut chunks: Vec<Vec<String>> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut used = 0;
+    for path in paths {
+        let cost = path.len() + 1;
+        if !current.is_empty() && used + cost > budget {
+            chunks.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        used += cost;
+        current.push(path.clone());
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 /// What a finished child produced.
@@ -557,6 +599,23 @@ mod tests {
         if std::env::var_os("PATH").is_some() {
             assert!(keys.contains(&"PATH".to_owned()));
         }
+    }
+
+    #[test]
+    fn path_lists_chunk_under_the_argv_budget() {
+        let paths: Vec<String> = (0..10).map(|i| format!("{i:04}")).collect(); // 5 chars each with separator
+        let chunks = chunk_paths(&paths, 12);
+        assert_eq!(
+            chunks.iter().map(Vec::len).collect::<Vec<_>>(),
+            [2, 2, 2, 2, 2]
+        );
+        assert_eq!(chunks.concat(), paths);
+        assert_eq!(
+            chunk_paths(&["x".repeat(50)], 12).len(),
+            1,
+            "an over-long path is still sent"
+        );
+        assert!(chunk_paths(&[], 12).is_empty());
     }
 
     #[test]

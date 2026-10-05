@@ -133,10 +133,19 @@ impl AllowList {
     /// Both ends are realpath'd — a symlinked caller path that resolves
     /// outside every root is refused even when its spelling looks inside.
     pub(crate) fn admits(&self, path: &Path) -> bool {
-        let real = paths::canonicalize_lenient(path);
+        self.admits_real(&paths::canonicalize_lenient(path))
+    }
+
+    /// Like [`admits`](Self::admits) for a path whose final component must
+    /// not be followed (a mutation target that may itself be a symlink).
+    pub(crate) fn admits_entry(&self, path: &Path) -> bool {
+        self.admits_real(&paths::canonicalize_parent_lenient(path))
+    }
+
+    fn admits_real(&self, real: &Path) -> bool {
         self.roots
             .iter()
-            .any(|root| paths::starts_with(&real, &paths::canonicalize_lenient(root)))
+            .any(|root| paths::starts_with(real, &paths::canonicalize_lenient(root)))
     }
 }
 

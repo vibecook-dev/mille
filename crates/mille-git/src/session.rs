@@ -68,6 +68,8 @@ pub(crate) struct Session {
     published_seq: tokio::sync::watch::Sender<u64>,
     status_subscribers: Mutex<Vec<(u64, StatusCallback)>>,
     next_subscriber: AtomicU64,
+    /// Read side: diff / log (PR 5). Write side: blocking mutations.
+    pub(crate) ops: Arc<tokio::sync::RwLock<()>>,
     watch: Mutex<Option<GitdirWatch>>,
     worktrees: Mutex<WorktreeState>,
 }
@@ -89,6 +91,7 @@ impl Session {
             published_seq: tokio::sync::watch::Sender::new(0),
             status_subscribers: Mutex::new(Vec::new()),
             next_subscriber: AtomicU64::new(0),
+            ops: Arc::new(tokio::sync::RwLock::new(())),
             watch: Mutex::new(None),
             worktrees: Mutex::new(WorktreeState::default()),
         }

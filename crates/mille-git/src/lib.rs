@@ -16,6 +16,7 @@ mod containment;
 mod error;
 mod gitdir;
 mod identity;
+mod mutation;
 mod paths;
 mod porcelain;
 mod queue;
@@ -34,7 +35,7 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use tokio::runtime::{Handle, Runtime};
 
-pub use cli::{argv_prefix, ALIAS_GUARDED_VERBS};
+pub use cli::{argv_prefix, chunk_paths, ALIAS_GUARDED_VERBS, MAX_PATHS_ARGV_CHARS};
 pub use containment::{
     assert_path_under_root, assert_real_path_under_root, assert_safe_revision,
     is_safe_workspace_relative_path,
@@ -42,12 +43,14 @@ pub use containment::{
 pub use error::{GitError, GitErrorKind, Result};
 pub use gitdir::{find_dot_git, resolve_git_dir, MAX_DOT_GIT_WALK};
 pub use identity::{GitIdentity, GitRepoKind};
+pub use mutation::{CommitRequest, OpOptions};
 pub use porcelain::parse_porcelain_v2;
 pub use session::{StatusCallback, WorktreesCallback};
 pub use status::{
     apply_row_cap, merge_status, sort_entries, status_thread_limit, StatusBackend, StatusEntry,
     StatusLetter, StatusSnapshot, StatusXy, MAX_HINT_PATHS,
 };
+pub use tokio_util::sync::CancellationToken;
 pub use warning::{GitWarning, WarningCallback, WarningCode};
 pub use worktree_list::GitWorktree;
 
@@ -220,10 +223,20 @@ impl GitEngine {
 
     /// Drop one `open` reference; the last one tears the session down
     /// (watchers stop, in-flight reads abort). Idempotent.
+    ///
+    /// Reads abort at once; a mutation already running is allowed to finish
+    /// (waited for up to `commit_timeout`), so a close never strands a
+    /// half-made commit.
     pub async fn close(&self, worktree: &Path) -> Result<()> {
         let removed = self.inner.registry.lock().release(worktree);
         if let Some(session) = removed {
             session.shutdown();
+            let (ops, timeout) = (session.ops.clone(), self.inner.options.commit_timeout);
+            self.spawn(async move {
+                let _ = tokio::time::timeout(timeout, ops.write_owned()).await;
+                Ok(())
+            })
+            .await?;
         }
         Ok(())
     }
@@ -381,6 +394,79 @@ impl GitEngine {
     /// Remove a warning subscriber.
     pub fn unsubscribe_warnings(&self, id: u64) {
         self.inner.warnings.unsubscribe(id);
+    }
+
+    /// `git add -- <paths>` (worktree-relative POSIX, contained under the
+    /// checkout and `allowedRoots`). Empty `paths` is a no-op success.
+    pub async fn stage(&self, worktree: &Path, paths: &[String], options: OpOptions) -> Result<()> {
+        let (inner, session, paths) = (
+            self.inner.clone(),
+            self.inner.session(worktree)?,
+            paths.to_vec(),
+        );
+        self.spawn(async move {
+            mutation::stage(&inner, &session, &paths, options.cancel.as_ref()).await
+        })
+        .await
+    }
+
+    /// Unstage `paths` (`git restore --staged`, with the `reset` and
+    /// unborn-branch fallbacks). Empty `paths` is a no-op success.
+    pub async fn unstage(
+        &self,
+        worktree: &Path,
+        paths: &[String],
+        options: OpOptions,
+    ) -> Result<()> {
+        let (inner, session, paths) = (
+            self.inner.clone(),
+            self.inner.session(worktree)?,
+            paths.to_vec(),
+        );
+        self.spawn(async move {
+            mutation::unstage(&inner, &session, &paths, options.cancel.as_ref()).await
+        })
+        .await
+    }
+
+    /// Discard worktree changes, restoring **index** bytes (never
+    /// `--source=HEAD`; AC-017). Empty `paths` is a no-op success.
+    pub async fn restore(
+        &self,
+        worktree: &Path,
+        paths: &[String],
+        options: OpOptions,
+    ) -> Result<()> {
+        let (inner, session, paths) = (
+            self.inner.clone(),
+            self.inner.session(worktree)?,
+            paths.to_vec(),
+        );
+        self.spawn(async move {
+            mutation::restore(&inner, &session, &paths, options.cancel.as_ref()).await
+        })
+        .await
+    }
+
+    /// Commit the include-set: stage it, unstage everything else, write the
+    /// message to `git commit -F -`'s stdin. Hooks run. Returns the new
+    /// commit's full hex id (AC-006).
+    pub async fn commit(&self, worktree: &Path, request: CommitRequest) -> Result<String> {
+        let (inner, session) = (self.inner.clone(), self.inner.session(worktree)?);
+        self.spawn(async move { mutation::commit(&inner, &session, request).await })
+            .await
+    }
+
+    /// The config that makes status cheap on an ADE-created worktree
+    /// (§21.2): `core.untrackedCache`, and `core.fsmonitor` where git ≥ 2.37
+    /// has the builtin daemon. Written only with `write_performance_config`.
+    pub async fn advise_performance_config(
+        &self,
+        worktree: &Path,
+    ) -> Result<std::collections::BTreeMap<String, String>> {
+        let (inner, session) = (self.inner.clone(), self.inner.session(worktree)?);
+        self.spawn(async move { mutation::advise_performance_config(&inner, &session).await })
+            .await
     }
 
     /// Test hook: every status run sleeps this long before computing, so a
