@@ -23,6 +23,7 @@
  */
 export const PROTOCOL_VERSION = 1;
 
+import type { ExplorerChannelCloseCode } from './channel/types.js';
 import type { ClientEntry } from './mirror.js';
 
 /**
@@ -349,7 +350,20 @@ export interface WarningMsg {
 
 export interface ErrorMsg {
   type: 'error';
-  body: { code: string; message: string };
+  body: {
+    code: string;
+    message: string;
+    /**
+     * The session is over, not just one request. A MessagePort has no close
+     * event, so a relay whose upstream channel closed says so with this
+     * flag; the client closes its side and fails later calls fast instead
+     * of posting into a port nobody reads. Additive: an older client treats
+     * it as a plain error.
+     */
+    fatal?: boolean;
+    /** Why the upstream channel closed, when `fatal`. */
+    closeCode?: ExplorerChannelCloseCode;
+  };
 }
 
 export type HostToClientMessage =

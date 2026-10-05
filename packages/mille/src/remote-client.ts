@@ -46,3 +46,4 @@ export {
   type WebSocketConstructorLike,
 } from './remote/client.js';
 export * from './remote/protocol.js';
+export { relayExplorerChannel, type RelayExplorerChannelOptions } from './remote/relay.js';

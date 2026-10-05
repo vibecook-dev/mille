@@ -43,7 +43,11 @@ import {
   type SearchCallResult,
 } from './protocol.js';
 import { createMessagePortClientChannel, isExplorerChannel } from './channel/message-port.js';
-import type { ExplorerChannelCloseEvent, ExplorerClientChannel } from './channel/types.js';
+import type {
+  ExplorerChannelCloseCode,
+  ExplorerChannelCloseEvent,
+  ExplorerClientChannel,
+} from './channel/types.js';
 import type { Disposable, MessagePortLike } from './types.js';
 import type { ExplorerProjectionSettings } from './explorer-settings.js';
 import type { ResyncOptions, SearchHit, SearchOptions, TransferOptions, Uri } from './client.js';
@@ -126,6 +130,9 @@ export class PortFileExplorer {
   private handshakeResolve!: () => void;
   private handshakeReject!: (reason: unknown) => void;
   private disposed = false;
+  private closeReported = false;
+  /** Set by a fatal error frame, so close listeners hear the upstream reason. */
+  private announcedClose: ExplorerChannelCloseEvent | undefined;
   /**
    * Phase A1 — decoration providers registered against this client.
    * Each entry retains a `knownIds` set so the client can push
@@ -176,8 +183,12 @@ export class PortFileExplorer {
    * callers hanging, and leave the last snapshot readable — a stale tree
    * is more useful to a UI than a blank one (SPEC §18.3).
    */
-  private handleChannelClose(reason: ExplorerChannelCloseEvent): void {
-    if (this.disposed) return;
+  private handleChannelClose(closeEvent: ExplorerChannelCloseEvent): void {
+    if (this.disposed || this.closeReported) return;
+    this.closeReported = true;
+    // A relay's fatal error frame names the upstream reason; prefer it over
+    // the LOCAL_CLOSE our own channel reports for the close it triggered.
+    const reason = this.announcedClose ?? closeEvent;
     const err = new FileSystemError('ECANCELED', `connection closed: ${reason.code}`);
     this.handshakeReject(err);
     // The handshake promise is often never awaited after ready() resolves;
@@ -879,7 +890,14 @@ export class PortFileExplorer {
         );
         return;
       case 'error':
-        this.handleError(f.body as { code: string; message: string });
+        this.handleError(
+          f.body as {
+            code: string;
+            message: string;
+            fatal?: unknown;
+            closeCode?: unknown;
+          },
+        );
         return;
       case 'warning': {
         const body = f.body as { code?: string; detail?: string };
@@ -1071,7 +1089,23 @@ export class PortFileExplorer {
     }
   }
 
-  private handleError(body: { code: string; message: string }): void {
+  private handleError(body: {
+    code: string;
+    message: string;
+    fatal?: unknown;
+    closeCode?: unknown;
+  }): void {
+    if (body.fatal === true) {
+      // The session is over upstream (a relay's WebSocket closed). Close
+      // this side as well, so pending work rejects now and later calls fail
+      // at send() instead of posting into a port nobody reads.
+      this.announcedClose = {
+        code: isCloseCode(body.closeCode) ? body.closeCode : 'REMOTE_CLOSE',
+        reason: body.message,
+      };
+      this.channel.close(body.message);
+      return;
+    }
     const err = new FileSystemError(body.code as ErrorCode, body.message);
     // Session-level failure. If we haven't handshaken yet, fail ready().
     // Either way, reject every pending request so callers bubble out
@@ -1119,6 +1153,19 @@ export async function connectFileExplorerChannel(
   const fx = new PortFileExplorer(channel, options);
   await fx.ready();
   return fx;
+}
+
+const CLOSE_CODES: ReadonlySet<string> = new Set<ExplorerChannelCloseCode>([
+  'LOCAL_CLOSE',
+  'REMOTE_CLOSE',
+  'TRANSPORT_ERROR',
+  'PROTOCOL_ERROR',
+  'BACKPRESSURE',
+  'AUTH_REJECTED',
+]);
+
+function isCloseCode(value: unknown): value is ExplorerChannelCloseCode {
+  return typeof value === 'string' && CLOSE_CODES.has(value);
 }
 
 /** Settle with `promise`, or reject with ECANCELED once `signal` aborts. */
