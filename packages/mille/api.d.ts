@@ -844,9 +844,14 @@ export interface MessagePortLike {
 //
 // The host and client depend on an ordered, reliable, message-oriented pipe
 // with a close notification — nothing more. `ExplorerChannel` names that
-// contract so a MessagePort (local) and a framed Node Duplex (remote) are
-// interchangeable. Factories for the MessagePort form are exported from the
-// package root; the framed stream form ships from `@vibecook/mille/node`.
+// contract so a MessagePort (local), a framed Node Duplex and a WebSocket
+// (remote) are interchangeable. Factories for the MessagePort form are
+// exported from the package root; the framed stream form and the host side of
+// the WebSocket form (`createWebSocketHostChannel`, `serveWebSocketSession`,
+// `serveRemoteSession` — the credentialed `mille.remote` open) ship from
+// `@vibecook/mille/node`; the browser-safe client side
+// (`createWebSocketClientChannel`, `connectWebSocketChannel`,
+// `openRemoteChannel`, `relayExplorerChannel`) from `@vibecook/mille/remote`.
 
 export type ExplorerChannelState = 'open' | 'closing' | 'closed';
 
@@ -904,6 +909,8 @@ export interface ExplorerSessionPolicy {
   readonly allowExternalImport?: boolean;
   readonly allowUndo?: boolean;
   readonly allowWorkspaceResync?: boolean;
+  /** Filename search over the channel: a whole-tree scan per call, so opt-in remotely. */
+  readonly allowSearch?: boolean;
 }
 
 /**

@@ -889,8 +889,17 @@ import type {
 import { createFileExplorerHost } from '@vibecook/mille/host';
 import type { FileExplorerHost, MessagePortLike } from '@vibecook/mille';
 
-// Renderer
-import { connectFileExplorer, PortFileExplorer, PortMirrorSnapshot } from '@vibecook/mille/client';
+// Renderer (or a renderer Worker) — no node: imports, no native addon
+import { connectFileExplorer, PortFileExplorer, PortMirrorSnapshot } from '@vibecook/mille/port';
+
+// Remote sessions: the browser-safe client half…
+import {
+  connectWebSocketChannel,
+  openRemoteChannel,
+  relayExplorerChannel,
+} from '@vibecook/mille/remote';
+// …and the host half, beside createFileExplorerHost
+import { serveWebSocketSession, serveRemoteSession } from '@vibecook/mille/node';
 
 // React
 import { useFileExplorerSnapshot, useFileExplorerTreeSnapshot } from '@vibecook/mille/react';
