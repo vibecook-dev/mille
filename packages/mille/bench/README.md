@@ -21,6 +21,30 @@ MILLE_PROGRESSIVE_DIRECTORY_COMPLETE_BUDGET_MS=30000 \
 pnpm bench:progressive-directory
 ```
 
+## Transport: MessagePort vs WebSocket
+
+```sh
+pnpm bench:transport
+```
+
+One walked host with a 10,000-entry folder; each run attaches one session per
+transport — an in-process `MessageChannel`, and a loopback WebSocket opened
+through `connectWebSocketChannel` with a credential — and times four phases
+from the client: attach (dial to explorer ready), expand (the whole child-id
+list plus the first 50 rows), a 200-row page at offset 5,000, and a viewport
+over the whole folder (10,000 entry records in one frame). Runs interleave the
+transports, alternate which goes first, and print the 1-minute load average
+beside each run. The `ws−mp` column is the transport's cost: both sides pay
+the same host and client work, so the median difference isolates it better
+than the ratio. The in-process MessagePort is the cheapest a MessagePort ever
+is, so the ratio is an upper bound.
+
+Every phase must complete with identical rows on both transports; timings are
+reporters unless `MILLE_TRANSPORT_WS_RATIO_BUDGET` gates the median ratio.
+`MILLE_TRANSPORT_WS_CLIENT=global` measures Node's own WHATWG WebSocket instead
+of the `ws` client; `MILLE_TRANSPORT_ENTRIES`, `MILLE_TRANSPORT_PAGE` and
+`MILLE_TRANSPORT_RUNS` resize it, and `--report <path>` writes the runs as JSON.
+
 ## Viewport retention
 
 ```sh

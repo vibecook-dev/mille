@@ -86,6 +86,7 @@
     "bench:cross-root": "node bench/cross-root-transfer.mjs",
     "bench:watch:soak": "node bench/watch-soak.mjs",
     "bench:provider": "node bench/provider-memfs.mjs",
+    "bench:transport": "node bench/transport-compare.mjs",
     "artifacts": "napi artifacts",
     "prepublishOnly": "napi prepublish -t npm"
   },
