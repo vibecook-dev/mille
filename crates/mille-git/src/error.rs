@@ -115,6 +115,13 @@ impl GitError {
         Self::new(GitErrorKind::InvalidInput, message)
     }
 
+    pub(crate) fn not_a_repo(worktree: &std::path::Path) -> Self {
+        Self::new(
+            GitErrorKind::NotARepo,
+            format!("not a git repository: {}", worktree.display()),
+        )
+    }
+
     pub(crate) fn canceled() -> Self {
         Self::new(GitErrorKind::Canceled, "git operation aborted")
     }

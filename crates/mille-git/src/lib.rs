@@ -18,13 +18,16 @@ mod gitdir;
 mod identity;
 mod paths;
 mod porcelain;
+mod queue;
+mod route;
 mod session;
 mod status;
 mod warning;
+mod watch;
+mod worktree_list;
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -40,14 +43,17 @@ pub use error::{GitError, GitErrorKind, Result};
 pub use gitdir::{find_dot_git, resolve_git_dir, MAX_DOT_GIT_WALK};
 pub use identity::{GitIdentity, GitRepoKind};
 pub use porcelain::parse_porcelain_v2;
+pub use session::{StatusCallback, WorktreesCallback};
 pub use status::{
     apply_row_cap, merge_status, sort_entries, status_thread_limit, StatusBackend, StatusEntry,
     StatusLetter, StatusSnapshot, StatusXy, MAX_HINT_PATHS,
 };
 pub use warning::{GitWarning, WarningCallback, WarningCode};
+pub use worktree_list::GitWorktree;
 
 use cli::GitCli;
 use containment::AllowList;
+use queue::{Hints, Urgency};
 use session::{Registry, Session};
 
 /// Engine configuration (SPEC mille-git §9.1, Appendix B).
@@ -111,6 +117,7 @@ pub(crate) struct Inner {
     pub(crate) handle: Handle,
     pub(crate) registry: Mutex<Registry>,
     pub(crate) warnings: warning::Warnings,
+    pub(crate) metrics: queue::Metrics,
 }
 
 /// The engine: a registry of per-checkout sessions plus the runtime their
@@ -165,6 +172,7 @@ impl GitEngine {
             handle,
             registry: Mutex::new(Registry::default()),
             warnings: warning::Warnings::default(),
+            metrics: queue::Metrics::default(),
         })
     }
 
@@ -235,31 +243,126 @@ impl GitEngine {
     /// The current status snapshot: whole-repo, XY preserved, sorted and
     /// capped. Never fails for not-a-repo, bare or a missing git binary — it
     /// returns an empty snapshot (and warns) instead (§23).
+    ///
+    /// Returns the published snapshot at once when the queue is idle;
+    /// otherwise waits for the run that settles what is already queued.
     pub async fn status(&self, worktree: &Path) -> Result<Arc<StatusSnapshot>> {
-        self.refresh(worktree, None).await
+        let session = self.inner.session(worktree)?;
+        let target = match (session.queue.settle_target(), session.published()) {
+            (None, Some(snapshot)) => return Ok(snapshot),
+            (None, None) => session.hint(&self.inner, Hints::Full, Urgency::Now),
+            (Some(target), _) => target,
+        };
+        self.spawn(async move { session.wait_published(target).await })
+            .await
     }
 
-    /// Run status now — full when `paths` is `None`, else limited to those
-    /// worktree-relative POSIX paths and merged per §10.6 — and return the
-    /// snapshot it published. Unsafe paths are dropped from the hint set.
+    /// Queue a status run now — full when `paths` is `None`, else limited to
+    /// those worktree-relative POSIX paths and merged per §10.6 — and return
+    /// the snapshot of the run that carried it. Unsafe paths are dropped.
     pub async fn refresh(
         &self,
         worktree: &Path,
         paths: Option<Vec<String>>,
     ) -> Result<Arc<StatusSnapshot>> {
         let session = self.inner.session(worktree)?;
+        let hints = match paths {
+            None => Hints::Full,
+            Some(paths) => {
+                let safe: Vec<String> = paths
+                    .into_iter()
+                    .filter(|p| is_safe_workspace_relative_path(p))
+                    .collect();
+                if safe.is_empty() {
+                    return self.status(worktree).await;
+                }
+                Hints::paths(safe)
+            }
+        };
+        let target = session.hint(&self.inner, hints, Urgency::Now);
+        self.spawn(async move { session.wait_published(target).await })
+            .await
+    }
+
+    /// Path hints from a same-process explorer (SPEC §11.2): `paths` are
+    /// **worktree-relative POSIX** (`None` = full status). Synchronous,
+    /// non-blocking, safe on a notify OS thread with no runtime context —
+    /// it only queues work and arms the debounce. An empty list is a full
+    /// status; unsafe paths are dropped; an unknown worktree is ignored.
+    pub fn hint_paths(&self, worktree: &Path, paths: Option<Vec<String>>) {
+        let Some(session) = self.inner.registry.lock().lookup(worktree) else {
+            return;
+        };
+        let hints = match paths {
+            None => Hints::Full,
+            Some(paths) if paths.is_empty() => Hints::Full,
+            Some(paths) => {
+                let safe: Vec<String> = paths
+                    .into_iter()
+                    .filter(|p| is_safe_workspace_relative_path(p))
+                    .collect();
+                if safe.is_empty() {
+                    return;
+                }
+                Hints::paths(safe)
+            }
+        };
+        session.hint(&self.inner, hints, Urgency::Debounced);
+    }
+
+    /// Route explorer `'event'` OS paths to the sessions that own them
+    /// (§11.2.1): realpath, longest checkout-prefix match, strip to
+    /// worktree-relative POSIX, hint. Paths in no open checkout, inside a
+    /// `.git`, or naming lock files are dropped. Synchronous and
+    /// non-blocking, like [`hint_paths`](Self::hint_paths).
+    pub fn hint_os_paths(&self, paths: &[PathBuf]) {
+        let sessions = self.inner.registry.lock().sessions();
+        for (session, relative) in route::route(&sessions, paths) {
+            session.hint(&self.inner, Hints::paths(relative), Urgency::Debounced);
+        }
+    }
+
+    /// A coarse or overflow explorer event at `path`: full status for every
+    /// session whose checkout root is a prefix of it — never for checkouts
+    /// that merely sit *under* it (§11.2 rule 4).
+    pub fn hint_coarse_os_path(&self, path: &Path) {
+        let sessions = self.inner.registry.lock().sessions();
+        for session in route::coarse_owners(&sessions, path) {
+            session.hint(&self.inner, Hints::Full, Urgency::Debounced);
+        }
+    }
+
+    /// Subscribe to a worktree's published snapshots.
+    pub fn subscribe_status(&self, worktree: &Path, callback: StatusCallback) -> Result<u64> {
+        Ok(self.inner.session(worktree)?.subscribe_status(callback))
+    }
+
+    /// Remove a status subscriber. Unknown ids and worktrees are ignored.
+    pub fn unsubscribe_status(&self, worktree: &Path, id: u64) {
+        if let Ok(session) = self.inner.session(worktree) {
+            session.unsubscribe_status(id);
+        }
+    }
+
+    /// Every worktree of the repository, primary included (§16).
+    pub async fn worktrees(&self, worktree: &Path) -> Result<Vec<GitWorktree>> {
+        let session = self.inner.session(worktree)?;
         let inner = self.inner.clone();
-        let hints = paths.map(|p| {
-            p.into_iter()
-                .filter(|p| is_safe_workspace_relative_path(p))
-                .collect()
-        });
-        self.spawn(async move {
-            Ok(session
-                .run_status(&inner, hints, Arc::new(AtomicBool::new(false)))
-                .await)
-        })
-        .await
+        self.spawn(async move { session.list_worktrees(&inner).await })
+            .await
+    }
+
+    /// Subscribe to worktree-list changes (`git worktree add/remove` by
+    /// anyone), debounced.
+    pub fn subscribe_worktrees(&self, worktree: &Path, callback: WorktreesCallback) -> Result<u64> {
+        Ok(self.inner.session(worktree)?.subscribe_worktrees(callback))
+    }
+
+    /// Remove a worktree-list subscriber.
+    pub fn unsubscribe_worktrees(&self, worktree: &Path, id: u64) {
+        if let Ok(session) = self.inner.session(worktree) {
+            session.unsubscribe_worktrees(id);
+        }
     }
 
     /// Pin a session's status backend (§21.3): `Cli` when gix measures
@@ -278,6 +381,25 @@ impl GitEngine {
     /// Remove a warning subscriber.
     pub fn unsubscribe_warnings(&self, id: u64) {
         self.inner.warnings.unsubscribe(id);
+    }
+
+    /// Test hook: every status run sleeps this long before computing, so a
+    /// test can hold a run in flight.
+    #[doc(hidden)]
+    pub fn set_status_delay_for_test(&self, delay: Duration) {
+        self.inner.metrics.set_status_delay(delay);
+    }
+
+    /// Status runs started by this engine. Diagnostic.
+    #[doc(hidden)]
+    pub fn status_runs_started(&self) -> u64 {
+        self.inner.metrics.runs_started()
+    }
+
+    /// The most status runs this engine ever had in flight at once.
+    #[doc(hidden)]
+    pub fn status_peak_concurrency(&self) -> usize {
+        self.inner.metrics.peak_concurrency()
     }
 
     /// How many sessions are open (after de-dupe). Diagnostic.
@@ -351,7 +473,15 @@ impl Inner {
                 },
             },
         };
-        let (session, _created) = self.registry.lock().insert_or_join(discovered, &caller);
+        let (session, created) = self.registry.lock().insert_or_join(discovered, &caller);
+        if created {
+            // Once per checkout: a second open (a sibling package) shares
+            // this watch and this queue (§9.2 steps 7–8).
+            if session.kind() == GitRepoKind::Worktree {
+                session.set_watch(watch::attach(&session, &self));
+            }
+            session.hint(&self, Hints::Full, Urgency::Now);
+        }
         Ok(session.identity())
     }
 }

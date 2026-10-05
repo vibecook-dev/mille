@@ -120,7 +120,7 @@ async fn the_cli_backend_agrees_with_gix() {
     engine
         .set_status_backend(&repo.root, StatusBackend::Cli)
         .unwrap();
-    let cli = engine.status(&repo.root).await.unwrap();
+    let cli = engine.refresh(&repo.root, None).await.unwrap();
     assert_eq!(cli.status_backend, StatusBackend::Cli);
     assert_eq!(rows(&cli), rows(&gix));
     assert!(cli.generation > gix.generation);
@@ -212,7 +212,7 @@ async fn a_path_limited_refresh_merges_into_the_previous_snapshot() {
     let paths: Vec<_> = merged.entries.iter().map(|e| e.path.as_str()).collect();
     assert_eq!(paths, ["b.ts", "c.ts"]);
 
-    let full = engine.status(&repo.root).await.unwrap();
+    let full = engine.refresh(&repo.root, None).await.unwrap();
     assert!(!full.path_limited);
     assert_eq!(
         full.entries
@@ -223,55 +223,68 @@ async fn a_path_limited_refresh_merges_into_the_previous_snapshot() {
     );
 }
 
-// T-MERGE-RENAME through the engine. A rename is only *reported* when both
-// names are inside the pathspec: under `-- new.ts` alone, git and gix both
-// see an addition (`A`), because the deletion side is outside the pathspec
-// and cannot be paired. So a `to`-only hint leaves the old row until the
-// next full run (which a staged rename always triggers via the index watch);
-// a `{from, to}` hint drops it at once. README "Deviations" item 12.
+// T-MERGE-RENAME through the engine. A staged rename moves the index, so
+// the gitdir watch runs a full status that reports the pair (`RM`, origPath)
+// and drops the old row. Afterwards, a path-limited run on either name alone
+// must not split the pair: the engine widens its pathspec with both names
+// (under `-- new.ts` alone, git itself reports `AM`). README "Deviations" 12.
 #[tokio::test]
-async fn a_rename_drops_its_old_row_once_the_run_can_see_both_names() {
+async fn a_rename_keeps_its_pair_through_path_limited_runs() {
     require_git!();
     let repo = Repo::init();
     repo.write("old.ts", "content that survives the rename\n");
     repo.commit_all("base");
     repo.write("old.ts", "content that survives the rename\nplus an edit\n");
-    let engine = common::engine(&[&repo.root]);
+    let engine = common::quiet_engine(&[&repo.root]);
     engine.open(&repo.root).await.unwrap();
     assert!(find(&engine.status(&repo.root).await.unwrap(), "old.ts").is_some());
-    repo.git(&["mv", "old.ts", "new.ts"]);
+    let mut published = common::Published::subscribe(&engine, &repo.root);
 
+    repo.git(&["mv", "old.ts", "new.ts"]);
+    let full = published
+        .until(std::time::Duration::from_secs(10), |s| {
+            find(s, "new.ts").is_some()
+        })
+        .await
+        .expect("the index watch reported the rename");
+    let pair = |s: &StatusSnapshot| {
+        let row = find(s, "new.ts").unwrap();
+        (
+            row.xy.as_string(),
+            row.orig_path.clone(),
+            find(s, "old.ts").is_none(),
+        )
+    };
+    assert_eq!(
+        pair(&full),
+        ("RM".to_owned(), Some("old.ts".to_owned()), true)
+    );
+
+    repo.write(
+        "new.ts",
+        "content that survives the rename\nplus another edit\n",
+    );
     let to_only = engine
         .refresh(&repo.root, Some(vec!["new.ts".into()]))
         .await
         .unwrap();
-    let new = find(&to_only, "new.ts").expect("the new name is reported");
+    assert!(to_only.path_limited);
     assert_eq!(
-        (new.xy.as_string().as_str(), new.orig_path.as_deref()),
-        ("AM", None),
-        "git agrees: no rename pair"
-    );
-    assert!(
-        find(&to_only, "old.ts").is_some(),
-        "nothing reported old.ts, so the merge keeps it"
+        pair(&to_only),
+        pair(&full),
+        "the pair survives a hint of the new name"
     );
 
-    let both = engine
-        .refresh(&repo.root, Some(vec!["old.ts".into(), "new.ts".into()]))
+    let from_only = engine
+        .refresh(&repo.root, Some(vec!["old.ts".into()]))
         .await
         .unwrap();
-    let new = find(&both, "new.ts").unwrap();
-    assert_eq!(
-        (new.xy.as_string().as_str(), new.orig_path.as_deref()),
-        ("RM", Some("old.ts"))
-    );
-    assert!(
-        find(&both, "old.ts").is_none(),
-        "the renamed-away row is dropped"
-    );
+    assert_eq!(pair(&from_only), pair(&full), "and a hint of the old name");
 
-    let full = engine.status(&repo.root).await.unwrap();
-    assert_eq!(rows(&full), rows(&both));
+    assert_eq!(
+        rows(&engine.refresh(&repo.root, None).await.unwrap()),
+        rows(&from_only)
+    );
 }
 
 // Hints are literal pathspecs: `[id].ts` must not glob-match `d.ts`.
@@ -327,7 +340,7 @@ async fn not_a_repo_is_an_empty_snapshot_not_an_error() {
     let first = engine.status(tmp.path()).await.unwrap();
     assert_eq!(first.identity.kind, GitRepoKind::None);
     assert!(first.entries.is_empty());
-    let second = engine.status(tmp.path()).await.unwrap();
+    let second = engine.refresh(tmp.path(), None).await.unwrap();
     assert!(second.generation > first.generation);
     let json = serde_json::to_value(&*second).unwrap();
     assert!(
@@ -375,7 +388,7 @@ async fn a_missing_git_binary_warns_once() {
         .set_status_backend(&repo.root, StatusBackend::Cli)
         .unwrap();
     for _ in 0..2 {
-        let snapshot = engine.status(&repo.root).await.unwrap();
+        let snapshot = engine.refresh(&repo.root, None).await.unwrap();
         assert!(snapshot.entries.is_empty());
         assert_eq!(snapshot.status_backend, StatusBackend::Cli);
     }

@@ -8,18 +8,29 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use parking_lot::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
+use crate::error::{GitError, Result};
 use crate::identity::{Discovered, GitIdentity, GitRepoKind};
 use crate::paths;
+use crate::queue::StatusQueue;
 use crate::status::{self, StatusBackend, StatusSnapshot};
 use crate::warning::WarningCode;
+use crate::watch::GitdirWatch;
+use crate::worktree_list::{self, GitWorktree};
 use crate::Inner;
+
+/// A status subscriber; called on the engine runtime after each publish.
+pub type StatusCallback = Arc<dyn Fn(Arc<StatusSnapshot>) + Send + Sync>;
+
+/// A worktree-list subscriber; called when `<common>/worktrees/` changed and
+/// the list differs from the last one seen.
+pub type WorktreesCallback = Arc<dyn Fn(&[GitWorktree]) + Send + Sync>;
 
 /// The published status of one session.
 struct StatusState {
@@ -31,6 +42,13 @@ struct StatusState {
     generation: u64,
     /// §21.3: gix by default; a session can be pinned to the CLI.
     backend: StatusBackend,
+}
+
+#[derive(Default)]
+struct WorktreeState {
+    refresh_armed: bool,
+    last: Option<Vec<GitWorktree>>,
+    subscribers: Vec<(u64, WorktreesCallback)>,
 }
 
 pub(crate) struct Session {
@@ -45,6 +63,13 @@ pub(crate) struct Session {
     /// timers stop re-arming.
     pub(crate) cancel: CancellationToken,
     status: Mutex<StatusState>,
+    pub(crate) queue: StatusQueue,
+    /// The sequence number of the last published run; status waiters watch it.
+    published_seq: tokio::sync::watch::Sender<u64>,
+    status_subscribers: Mutex<Vec<(u64, StatusCallback)>>,
+    next_subscriber: AtomicU64,
+    watch: Mutex<Option<GitdirWatch>>,
+    worktrees: Mutex<WorktreeState>,
 }
 
 impl Session {
@@ -60,53 +85,158 @@ impl Session {
                 generation: 0,
                 backend: StatusBackend::Gix,
             }),
+            queue: StatusQueue::default(),
+            published_seq: tokio::sync::watch::Sender::new(0),
+            status_subscribers: Mutex::new(Vec::new()),
+            next_subscriber: AtomicU64::new(0),
+            watch: Mutex::new(None),
+            worktrees: Mutex::new(WorktreeState::default()),
         }
+    }
+
+    pub(crate) fn identity(&self) -> GitIdentity {
+        self.identity.read().clone()
     }
 
     pub(crate) fn kind(&self) -> GitRepoKind {
         self.identity.read().kind
     }
 
+    /// Re-read the cheap HEAD fields (branch switch, commit) from the repo.
+    pub(crate) fn refresh_head(&self) -> GitIdentity {
+        if let Some(repo) = &self.repo {
+            let (head, branch, detached) = crate::identity::read_head(&repo.to_thread_local());
+            let mut identity = self.identity.write();
+            identity.head = head;
+            identity.branch = branch;
+            identity.detached = detached;
+        }
+        self.identity()
+    }
+
     pub(crate) fn set_backend(&self, backend: StatusBackend) {
         self.status.lock().backend = backend;
     }
 
-    /// Merge `run` into the session's set (§10.6), cap it, publish it.
+    /// The last published snapshot, if any run has completed.
+    pub(crate) fn published(&self) -> Option<Arc<StatusSnapshot>> {
+        self.status.lock().published.clone()
+    }
+
+    pub(crate) fn set_watch(&self, watch: Option<GitdirWatch>) {
+        *self.watch.lock() = watch;
+    }
+
+    /// Tear down: stop timers, interrupt the in-flight walk, and drop the
+    /// watcher (which joins notify's thread).
+    pub(crate) fn shutdown(&self) {
+        self.cancel.cancel();
+        self.interrupt_status();
+        let watch = self.watch.lock().take();
+        drop(watch);
+    }
+
+    /// Widen a path-limited run's pathspecs with both names of every known
+    /// rename row it touches. A pathspec that holds only one side of a
+    /// rename cannot see the pair — `git status -- b.ts` reports `A.`, not
+    /// `R.` — so without this, editing a staged rename's new file would
+    /// downgrade its row to an addition and lose `origPath` until the next
+    /// full run. Returns `None` (run full) if widening crosses the
+    /// path-limited ceiling, keeping the run and its merge consistent.
+    pub(crate) fn widen_with_renames(&self, hints: Vec<String>) -> Option<Vec<String>> {
+        let state = self.status.lock();
+        let mut widened: std::collections::BTreeSet<String> = hints.into_iter().collect();
+        if let Some(all) = &state.all {
+            for entry in &all.entries {
+                let Some(orig) = &entry.orig_path else {
+                    continue;
+                };
+                if widened.contains(&entry.path) || widened.contains(orig) {
+                    widened.insert(entry.path.clone());
+                    widened.insert(orig.clone());
+                }
+            }
+        }
+        (widened.len() <= status::MAX_HINT_PATHS).then(|| widened.into_iter().collect())
+    }
+
+    /// Merge `run` into the session's set (§10.6), cap it, publish it as run
+    /// `sequence`.
     pub(crate) fn publish(
         &self,
         mut run: StatusSnapshot,
         hints: Option<&[String]>,
+        sequence: u64,
         cap: usize,
     ) -> Arc<StatusSnapshot> {
-        let mut state = self.status.lock();
-        state.generation += 1;
-        run.generation = state.generation;
-        let merged = Arc::new(status::merge_status(state.all.as_deref(), run, hints));
-        let mut capped = StatusSnapshot::clone(&merged);
-        status::apply_row_cap(&mut capped, cap);
-        let published = Arc::new(capped);
-        state.all = Some(merged);
-        state.published = Some(published.clone());
+        let published = {
+            let mut state = self.status.lock();
+            state.generation += 1;
+            run.generation = state.generation;
+            let merged = Arc::new(status::merge_status(state.all.as_deref(), run, hints));
+            let mut capped = StatusSnapshot::clone(&merged);
+            status::apply_row_cap(&mut capped, cap);
+            let published = Arc::new(capped);
+            state.all = Some(merged);
+            state.published = Some(published.clone());
+            published
+        };
+        self.published_seq.send_replace(sequence);
         published
     }
 
-    /// Compute one status run (full when `hints` is `None`) and publish it.
+    /// Call every status subscriber (outside all locks).
+    pub(crate) fn notify_status(&self, snapshot: &Arc<StatusSnapshot>) {
+        let subscribers: Vec<StatusCallback> = self
+            .status_subscribers
+            .lock()
+            .iter()
+            .map(|(_, cb)| cb.clone())
+            .collect();
+        for callback in subscribers {
+            callback(snapshot.clone());
+        }
+    }
+
+    pub(crate) fn subscribe_status(&self, callback: StatusCallback) -> u64 {
+        let id = self.next_subscriber.fetch_add(1, Ordering::Relaxed) + 1;
+        self.status_subscribers.lock().push((id, callback));
+        id
+    }
+
+    pub(crate) fn unsubscribe_status(&self, id: u64) {
+        self.status_subscribers.lock().retain(|(sub, _)| *sub != id);
+    }
+
+    /// Wait until run `target` (or a later one) has published.
+    pub(crate) async fn wait_published(&self, target: u64) -> Result<Arc<StatusSnapshot>> {
+        let mut seq = self.published_seq.subscribe();
+        tokio::select! {
+            result = seq.wait_for(|published| *published >= target) => {
+                result.map_err(|_| GitError::canceled())?;
+            }
+            _ = self.cancel.cancelled() => return Err(GitError::canceled()),
+        }
+        self.published()
+            .ok_or_else(|| GitError::unknown("status published nothing"))
+    }
+
+    /// Compute one status run (full when `hints` is `None`), unpublished.
     ///
-    /// Never fails: not-a-repo and bare publish an empty snapshot, a gix
-    /// failure degrades to the CLI, and a CLI failure publishes an empty
-    /// result with a warning (§23) — decorations must not throw.
-    pub(crate) async fn run_status(
-        self: &Arc<Self>,
+    /// Never fails: not-a-repo and bare yield an empty run, a gix failure
+    /// degrades to the CLI, and a CLI failure yields an empty result with a
+    /// warning (§23) — decorations must not throw.
+    pub(crate) async fn compute_status(
+        &self,
         inner: &Inner,
         hints: Option<Vec<String>>,
         interrupt: Arc<AtomicBool>,
-    ) -> Arc<StatusSnapshot> {
+    ) -> StatusSnapshot {
         let started = Instant::now();
-        let cap = inner.options.status_row_cap;
         let root = self.identity.read().worktree_path.clone();
         if self.kind() != GitRepoKind::Worktree {
             let identity = self.refresh_head();
-            return self.publish(StatusSnapshot::empty(identity, 0), None, cap);
+            return StatusSnapshot::empty(identity, 0);
         }
         let prefer_gix = self.status.lock().backend == StatusBackend::Gix;
         let mut backend = StatusBackend::Gix;
@@ -155,7 +285,7 @@ impl Session {
             }
         };
         let identity = self.refresh_head();
-        let run = StatusSnapshot {
+        StatusSnapshot {
             worktree_path: identity.worktree_path.clone(),
             identity,
             entries,
@@ -164,28 +294,80 @@ impl Session {
             path_limited: false,
             generation: 0,
             status_backend: backend,
-        };
-        self.publish(run, hints.as_deref(), cap)
-    }
-
-    pub(crate) fn identity(&self) -> GitIdentity {
-        self.identity.read().clone()
-    }
-
-    /// Re-read the cheap HEAD fields (branch switch, commit) from the repo.
-    pub(crate) fn refresh_head(&self) -> GitIdentity {
-        if let Some(repo) = &self.repo {
-            let (head, branch, detached) = crate::identity::read_head(&repo.to_thread_local());
-            let mut identity = self.identity.write();
-            identity.head = head;
-            identity.branch = branch;
-            identity.detached = detached;
         }
-        self.identity()
     }
 
-    pub(crate) fn shutdown(&self) {
-        self.cancel.cancel();
+    /// The worktree list (§16), read through the CLI.
+    pub(crate) async fn list_worktrees(&self, inner: &Inner) -> Result<Vec<GitWorktree>> {
+        if self.kind() == GitRepoKind::None {
+            return Err(GitError::not_a_repo(&self.identity().worktree_path));
+        }
+        let root = self.identity().worktree_path;
+        worktree_list::list_worktrees(&inner.git, &root, &self.real_root).await
+    }
+
+    pub(crate) fn subscribe_worktrees(&self, callback: WorktreesCallback) -> u64 {
+        let id = self.next_subscriber.fetch_add(1, Ordering::Relaxed) + 1;
+        self.worktrees.lock().subscribers.push((id, callback));
+        id
+    }
+
+    pub(crate) fn unsubscribe_worktrees(&self, id: u64) {
+        self.worktrees
+            .lock()
+            .subscribers
+            .retain(|(sub, _)| *sub != id);
+    }
+
+    /// `<common>/worktrees/` changed: refresh the list after the debounce
+    /// and tell subscribers if it differs (§11.4, F5).
+    pub(crate) fn worktrees_changed(self: &Arc<Self>, inner: &Arc<Inner>) {
+        {
+            let mut state = self.worktrees.lock();
+            if state.refresh_armed || self.cancel.is_cancelled() {
+                return;
+            }
+            state.refresh_armed = true;
+        }
+        let (session, engine) = (self.clone(), inner.clone());
+        inner.handle.spawn(async move {
+            tokio::select! {
+                _ = tokio::time::sleep(engine.options.debounce) => {}
+                _ = session.cancel.cancelled() => return,
+            }
+            session.worktrees.lock().refresh_armed = false;
+            // The first `git worktree add` creates `worktrees/` itself; watch
+            // it from now on. (Never from the notify callback: adding a watch
+            // from notify's own thread deadlocks inotify.)
+            if let Some(common) = session.identity().common_dir {
+                let dir = common.join("worktrees");
+                if let (true, Some(watch)) = (dir.is_dir(), session.watch.lock().as_mut()) {
+                    watch.ensure(&dir);
+                }
+            }
+            let list = match session.list_worktrees(&engine).await {
+                Ok(list) => list,
+                Err(err) => {
+                    engine.warn(
+                        WarningCode::Watch,
+                        format!("worktree list refresh failed: {err}"),
+                        &session.real_root,
+                    );
+                    return;
+                }
+            };
+            let subscribers: Vec<WorktreesCallback> = {
+                let mut state = session.worktrees.lock();
+                if state.last.as_ref() == Some(&list) {
+                    return;
+                }
+                state.last = Some(list.clone());
+                state.subscribers.iter().map(|(_, cb)| cb.clone()).collect()
+            };
+            for callback in subscribers {
+                callback(&list);
+            }
+        });
     }
 }
 
@@ -287,6 +469,13 @@ impl Registry {
 
     pub(crate) fn len(&self) -> usize {
         self.by_key.len()
+    }
+
+    pub(crate) fn sessions(&self) -> Vec<Arc<Session>> {
+        self.by_key
+            .values()
+            .map(|entry| entry.session.clone())
+            .collect()
     }
 
     /// The realpath key a spelling resolves to. Diagnostic.

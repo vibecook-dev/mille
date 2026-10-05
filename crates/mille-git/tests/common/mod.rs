@@ -136,3 +136,55 @@ pub fn engine(roots: &[&Path]) -> GitEngine {
 pub fn real(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap()
 }
+
+/// Collect every snapshot a worktree publishes.
+pub struct Published {
+    rx: tokio::sync::mpsc::UnboundedReceiver<std::sync::Arc<mille_git::StatusSnapshot>>,
+}
+
+impl Published {
+    pub fn subscribe(engine: &GitEngine, worktree: &Path) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        engine
+            .subscribe_status(worktree, std::sync::Arc::new(move |s| drop(tx.send(s))))
+            .expect("subscribe");
+        Self { rx }
+    }
+
+    /// Wait (up to `timeout`) for a snapshot satisfying `pred`.
+    pub async fn until(
+        &mut self,
+        timeout: std::time::Duration,
+        pred: impl Fn(&mille_git::StatusSnapshot) -> bool,
+    ) -> Option<std::sync::Arc<mille_git::StatusSnapshot>> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            match tokio::time::timeout_at(deadline, self.rx.recv()).await {
+                Ok(Some(snapshot)) if pred(&snapshot) => return Some(snapshot),
+                Ok(Some(_)) => continue,
+                _ => return None,
+            }
+        }
+    }
+
+    /// Did anything publish within `window`?
+    pub async fn any_within(&mut self, window: std::time::Duration) -> bool {
+        tokio::time::timeout(window, self.rx.recv()).await.is_ok()
+    }
+}
+
+pub fn has(snapshot: &mille_git::StatusSnapshot, path: &str, xy: &str) -> bool {
+    snapshot
+        .entries
+        .iter()
+        .any(|e| e.path == path && e.xy.as_string() == xy)
+}
+
+pub fn quiet_engine(roots: &[&Path]) -> GitEngine {
+    GitEngine::new(GitEngineOptions {
+        allowed_roots: roots.iter().map(|r| r.to_path_buf()).collect(),
+        // Keep the idle full rescan out of tests that count runs.
+        idle_rescan: std::time::Duration::from_secs(3600),
+        ..GitEngineOptions::default()
+    })
+}
