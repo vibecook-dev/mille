@@ -20,6 +20,8 @@ migration (PRs 6a–9) are later work.
 | `src/watch.rs` | gitdir / common-dir / `refs` / `worktrees/` directory watches and event classification |
 | `src/route.rs` | explorer OS paths → realpath longest-prefix → worktree-relative hints (§11.2.1) |
 | `src/worktree_list.rs` | `git worktree list --porcelain` → `GitWorktree` |
+| `src/diff.rs` | one-path diffs: header/stat before load, binary sniff, imara hunks, caps |
+| `src/log.rs` | log pages, `commit_files`, `read_object`, `read_worktree_file` |
 | `src/containment.rs` | `assert_path_under_root`, `assert_safe_revision`, the `allowedRoots` gate |
 | `src/status.rs` | gix status → `StatusSnapshot`, `UntrackedFiles::Files`, row cap, the §10.6 merge |
 | `src/porcelain.rs` | `git status --porcelain=v2 -z` parser (the CLI fallback), golden-tested |
@@ -183,4 +185,39 @@ Each item names the section it departs from and why. None reopens a §31/§32 de
 30. **`advise_performance_config` returns a sorted map** and writes it (with `git config`, inside the
     blocking section) only when `write_performance_config` is set. `core.fsmonitor` is advised only
     on macOS and Windows with git ≥ 2.37, where the builtin daemon exists.
+31. **A path-filtered log page runs `git log`; an unfiltered page walks with gix.** gix 0.87's
+    revision walk has no history simplification (git's default TREESAME pruning of merges), so a
+    gix-filtered walk would list different commits than `FileHistoryClient.getHistory` shows today
+    on merge-heavy histories. The CLI format adds `%P` to §14.1's `%H %h %at %an %s` so `parents`
+    is filled on both paths. An unborn branch is an empty, exhausted page on both.
+32. **`DiffLine` carries `truncated`.** §13.2 step 5 asks for lines over 1 024 characters to be cut
+    "with a flag"; the flag is an additive field (omitted from JSON when false).
+33. **`DiffResult.bytes`** is the larger side's size when the hard-refuse check fires before load,
+    and the patch's size (line text plus two bytes per line) when the auto-render caps fire after
+    the diff. A request's `max_bytes` cannot raise the auto-render cap above `hardRefuseBytes`.
+34. **Working-tree sides are raw bytes.** Diffs and `read_worktree_file` do not run git's
+    clean/smudge filters, textconv or `core.autocrlf` conversion, so a CRLF checkout with
+    `autocrlf=true` shows every line changed in a worktree diff where `git diff` shows none. A gix
+    filter pipeline is the follow-up if ADE needs that parity.
+35. **Which reads `allowedRoots` gates.** Working-tree reads (the worktree side of a diff,
+    `read_worktree_file`) are gated by `allowedRoots` and realpath containment, as §9.2 step 8 says
+    for `readWorktreeFile`. Object reads (index and commit diffs, `read_object`, log,
+    `commit_files`) are contained to the checkout only: status is whole-repo, so a Changes room may
+    show and diff a staged row outside the explorer root.
+36. **Bare repositories**: log, `commit_files`, `read_object` and commit diffs work; worktree and
+    index diffs and `read_worktree_file` are `EUNSUPPORTED`.
+37. **Reads that need gix fail `EUNKNOWN` when only the CLI could open the repository** (the
+    §9.2 step 6 fallback case): diff, `commit_files`, `read_object` and unfiltered log. §14.2's
+    positional `git show <rev>:<path>` fallback for `read_object` is not implemented; the
+    path-filtered log already runs on the CLI.
+38. **Read concurrency limits cover the contents reads too**: `read_object` / `read_worktree_file`
+    count against the diff limit (4, 2 on Windows) and `commit_files` against the log limit (2);
+    §12.1 names only diff and log. Every read holds the read side of the session's operations lock,
+    which is what makes a mutation wait for in-flight reads.
+39. **Signatures follow Appendix A where Appendix B differs**: `read_object` takes a
+    `ReadObjectRequest { path, revision, cancel }`; `commit_files` and `read_worktree_file` take
+    `OpOptions` for the abort token; contents are `ObjectBytes = Vec<u8>` (text vs `Uint8Array` is
+    the TypeScript layer's call, as `getContents` decides today). `commit_files` is sorted by path
+    and capped at 10 000 rows without a separate truncated count, since Appendix A returns a bare
+    `CommitFile[]`.
 

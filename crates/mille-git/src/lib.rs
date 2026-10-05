@@ -13,9 +13,11 @@
 
 mod cli;
 mod containment;
+mod diff;
 mod error;
 mod gitdir;
 mod identity;
+mod log;
 mod mutation;
 mod paths;
 mod porcelain;
@@ -40,9 +42,16 @@ pub use containment::{
     assert_path_under_root, assert_real_path_under_root, assert_safe_revision,
     is_safe_workspace_relative_path,
 };
+pub use diff::{
+    diff_sides, DiffCaps, DiffHunk, DiffLine, DiffLineKind, DiffRequest, DiffResult, DiffSide,
+    DiffSpec, BINARY_SNIFF_BYTES, CONTEXT_LINES, MAX_LINE_CHARS,
+};
 pub use error::{GitError, GitErrorKind, Result};
 pub use gitdir::{find_dot_git, resolve_git_dir, MAX_DOT_GIT_WALK};
 pub use identity::{GitIdentity, GitRepoKind};
+pub use log::{
+    CommitFile, LogCommit, LogPage, LogRequest, ReadObjectRequest, COMMIT_FILES_CAP, MAX_LOG_PAGE,
+};
 pub use mutation::{CommitRequest, OpOptions};
 pub use porcelain::parse_porcelain_v2;
 pub use session::{StatusCallback, WorktreesCallback};
@@ -53,6 +62,11 @@ pub use status::{
 pub use tokio_util::sync::CancellationToken;
 pub use warning::{GitWarning, WarningCallback, WarningCode};
 pub use worktree_list::GitWorktree;
+
+/// Raw file bytes from `read_object` / `read_worktree_file`. Text or binary
+/// is the caller's call (the TypeScript layer returns valid UTF-8 as a
+/// string, as `getContents` does today).
+pub type ObjectBytes = Vec<u8>;
 
 use cli::GitCli;
 use containment::AllowList;
@@ -469,6 +483,286 @@ impl GitEngine {
             .await
     }
 
+    /// A one-path diff with caps (§13): sizes from object headers / `stat`
+    /// first, `tooLarge` before any load at `hard_refuse_bytes`, binary
+    /// detection, hunks only under the auto-render caps.
+    pub async fn diff(&self, worktree: &Path, request: DiffRequest) -> Result<DiffResult> {
+        let cancel = request.cancel.clone();
+        self.read(
+            worktree,
+            Permits::Diff,
+            cancel,
+            move |inner, session| async move {
+                let root = session.identity().worktree_path;
+                assert_path_under_root(&root, &request.path)?;
+                let kind = session.kind();
+                if kind == GitRepoKind::None {
+                    return Err(GitError::not_a_repo(&root));
+                }
+                if kind == GitRepoKind::Bare && request.spec != DiffSpec::Commit {
+                    return Err(GitError::new(
+                        GitErrorKind::Unsupported,
+                        "a bare repository has no index or worktree",
+                    ));
+                }
+                let commit = match (request.spec, request.commit.as_deref()) {
+                    (DiffSpec::Commit, None) => {
+                        return Err(GitError::invalid("a commit diff needs `commit`"))
+                    }
+                    (DiffSpec::Commit, Some(rev)) => Some(assert_safe_revision(rev)?.to_owned()),
+                    _ => None,
+                };
+                if request.spec == DiffSpec::Worktree
+                    && !inner
+                        .allow
+                        .admits(&paths::join_posix(&session.real_root, &request.path))
+                {
+                    return Err(GitError::invalid(format!(
+                        "path is outside allowedRoots: {}",
+                        request.path
+                    )));
+                }
+                let repo = session.repo.clone().ok_or_else(no_gix)?;
+                let options = &inner.options;
+                let caps = DiffCaps {
+                    auto_render_max_bytes: request
+                        .max_bytes
+                        .unwrap_or(options.auto_render_max_bytes)
+                        .min(options.hard_refuse_bytes),
+                    auto_render_max_lines: request
+                        .max_lines
+                        .unwrap_or(options.auto_render_max_lines),
+                    hard_refuse_bytes: options.hard_refuse_bytes,
+                };
+                let real_root = session.real_root.clone();
+                blocking(move || {
+                    let local = repo.to_thread_local();
+                    let path = request.path.as_str();
+                    let blob = |id| diff::BlobSide {
+                        repo: repo.clone(),
+                        id,
+                    };
+                    match request.spec {
+                        DiffSpec::Worktree => {
+                            let old = blob(diff::blob_in_index(&local, path)?);
+                            let new = diff::WorktreeSide {
+                                real_root,
+                                relative: path.to_owned(),
+                            };
+                            diff_sides(path, &old, &new, caps)
+                        }
+                        DiffSpec::Index => {
+                            let old = blob(diff::blob_in_revision(&local, "HEAD", path)?);
+                            let new = blob(diff::blob_in_index(&local, path)?);
+                            diff_sides(path, &old, &new, caps)
+                        }
+                        DiffSpec::Commit => {
+                            let commit = commit.unwrap_or_default();
+                            local.rev_parse_single(commit.as_str()).map_err(|e| {
+                                GitError::invalid(format!("unknown revision {commit}: {e}"))
+                            })?;
+                            let old =
+                                blob(diff::blob_in_revision(&local, &format!("{commit}^"), path)?);
+                            let new = blob(diff::blob_in_revision(&local, &commit, path)?);
+                            diff_sides(path, &old, &new, caps)
+                        }
+                    }
+                })
+                .await
+            },
+        )
+        .await
+    }
+
+    /// A page of history (§14.1): gix's revision walk, or — with a path
+    /// filter — `git log`, whose default history simplification is what
+    /// `FileHistoryClient.getHistory` shows today.
+    pub async fn log(&self, worktree: &Path, request: LogRequest) -> Result<LogPage> {
+        let cancel = request.cancel.clone();
+        self.read(
+            worktree,
+            Permits::Log,
+            cancel,
+            move |inner, session| async move {
+                let root = session.identity().worktree_path;
+                if session.kind() == GitRepoKind::None {
+                    return Err(GitError::not_a_repo(&root));
+                }
+                let revision =
+                    assert_safe_revision(request.revision.as_deref().unwrap_or("HEAD"))?.to_owned();
+                let limit = log::page_limit(request.limit, inner.options.log_page_default);
+                let skip = request.skip.unwrap_or(0);
+                if revision == "HEAD"
+                    && session.repo.is_some()
+                    && session.refresh_head().head.is_none()
+                {
+                    // An unborn branch has no history yet; not an error.
+                    return Ok(LogPage {
+                        commits: Vec::new(),
+                        took_ms: 0,
+                        exhausted: true,
+                    });
+                }
+                match (request.path, session.repo.clone()) {
+                    (Some(path), _) => {
+                        assert_path_under_root(&root, &path)?;
+                        log::log_cli(
+                            &inner.git,
+                            &root,
+                            &revision,
+                            &path,
+                            skip,
+                            limit,
+                            request.cancel.as_ref(),
+                        )
+                        .await
+                    }
+                    (None, Some(repo)) => {
+                        blocking(move || {
+                            log::log_gix(&repo.to_thread_local(), &revision, skip, limit)
+                        })
+                        .await
+                    }
+                    (None, None) => Err(no_gix()),
+                }
+            },
+        )
+        .await
+    }
+
+    /// The files a commit changed versus its first parent (§14.3), sorted,
+    /// capped at [`COMMIT_FILES_CAP`].
+    pub async fn commit_files(
+        &self,
+        worktree: &Path,
+        sha: &str,
+        options: OpOptions,
+    ) -> Result<Vec<CommitFile>> {
+        let sha = assert_safe_revision(sha)?.to_owned();
+        self.read(
+            worktree,
+            Permits::Log,
+            options.cancel,
+            move |_inner, session| async move {
+                if session.kind() == GitRepoKind::None {
+                    return Err(GitError::not_a_repo(&session.identity().worktree_path));
+                }
+                let repo = session.repo.clone().ok_or_else(no_gix)?;
+                blocking(move || log::commit_files(&repo.to_thread_local(), &sha)).await
+            },
+        )
+        .await
+    }
+
+    /// `rev:path` bytes for `getContents` / the revision side of `compare`
+    /// (§14.2). `None` when the revision or path does not resolve, or when
+    /// the object header is at or above `hard_refuse_bytes`.
+    pub async fn read_object(
+        &self,
+        worktree: &Path,
+        request: ReadObjectRequest,
+    ) -> Result<Option<ObjectBytes>> {
+        let cancel = request.cancel.clone();
+        self.read(
+            worktree,
+            Permits::Diff,
+            cancel,
+            move |inner, session| async move {
+                let root = session.identity().worktree_path;
+                assert_path_under_root(&root, &request.path)?;
+                let revision = assert_safe_revision(&request.revision)?.to_owned();
+                if session.kind() == GitRepoKind::None {
+                    return Err(GitError::not_a_repo(&root));
+                }
+                let repo = session.repo.clone().ok_or_else(no_gix)?;
+                let hard_refuse = inner.options.hard_refuse_bytes as u64;
+                blocking(move || log::read_object(&repo, &revision, &request.path, hard_refuse))
+                    .await
+            },
+        )
+        .await
+    }
+
+    /// Working-tree bytes for the working side of `compare` (§14.2): both
+    /// ends realpath'd and contained (checkout root and `allowedRoots`), so
+    /// a symlink cannot read outside. `None` when missing or too large.
+    pub async fn read_worktree_file(
+        &self,
+        worktree: &Path,
+        path: &str,
+        options: OpOptions,
+    ) -> Result<Option<ObjectBytes>> {
+        let path = path.to_owned();
+        self.read(
+            worktree,
+            Permits::Diff,
+            options.cancel,
+            move |inner, session| async move {
+                let root = mutation::require_worktree(&session)?;
+                assert_path_under_root(&root, &path)?;
+                if !inner
+                    .allow
+                    .admits(&paths::join_posix(&session.real_root, &path))
+                {
+                    return Err(
+                        GitError::invalid(format!("path escapes allowedRoots: {path}"))
+                            .with_path(path),
+                    );
+                }
+                let side = diff::WorktreeSide {
+                    real_root: session.real_root.clone(),
+                    relative: path,
+                };
+                let hard_refuse = inner.options.hard_refuse_bytes as u64;
+                blocking(move || log::read_worktree_file(&side, hard_refuse)).await
+            },
+        )
+        .await
+    }
+
+    /// Run a read on the engine runtime: the read side of the session's ops
+    /// lock (mutations exclude reads), a §12.1 concurrency permit, and
+    /// cancellation by the caller's token or by `close`.
+    async fn read<T, F, Fut>(
+        &self,
+        worktree: &Path,
+        permits: Permits,
+        cancel: Option<CancellationToken>,
+        op: F,
+    ) -> Result<T>
+    where
+        F: FnOnce(Arc<Inner>, Arc<Session>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T>> + Send + 'static,
+        T: Send + 'static,
+    {
+        let (inner, session) = (self.inner.clone(), self.inner.session(worktree)?);
+        let caller = cancel.unwrap_or_default();
+        if caller.is_cancelled() {
+            return Err(GitError::canceled());
+        }
+        self.spawn(async move {
+            let closing = session.cancel.clone();
+            let semaphore = match permits {
+                Permits::Diff => session.diff_permits.clone(),
+                Permits::Log => session.log_permits.clone(),
+            };
+            let work = async {
+                let _read = session.ops.clone().read_owned().await;
+                let _permit = semaphore
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| GitError::canceled())?;
+                op(inner, session.clone()).await
+            };
+            tokio::select! {
+                result = work => result,
+                _ = caller.cancelled() => Err(GitError::canceled()),
+                _ = closing.cancelled() => Err(GitError::canceled()),
+            }
+        })
+        .await
+    }
+
     /// Test hook: every status run sleeps this long before computing, so a
     /// test can hold a run in flight.
     #[doc(hidden)]
@@ -508,6 +802,28 @@ impl GitEngine {
             Err(_) => Err(GitError::canceled()),
         }
     }
+}
+
+/// Which §12.1 read limit an operation counts against.
+#[derive(Copy, Clone)]
+enum Permits {
+    Diff,
+    Log,
+}
+
+/// gix work off the runtime's worker threads.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|err| GitError::unknown(format!("mille-git read task failed: {err}")))?
+}
+
+fn no_gix() -> GitError {
+    GitError::unknown(
+        "gix could not open this repository (only the git CLI could); this read needs gix",
+    )
 }
 
 impl Drop for GitEngine {

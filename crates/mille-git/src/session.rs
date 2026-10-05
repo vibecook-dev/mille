@@ -68,8 +68,13 @@ pub(crate) struct Session {
     published_seq: tokio::sync::watch::Sender<u64>,
     status_subscribers: Mutex<Vec<(u64, StatusCallback)>>,
     next_subscriber: AtomicU64,
-    /// Read side: diff / log (PR 5). Write side: blocking mutations.
+    /// Read side: diff / log / object reads. Write side: blocking mutations,
+    /// which therefore wait for in-flight reads (§12.1).
     pub(crate) ops: Arc<tokio::sync::RwLock<()>>,
+    /// §12.1 read concurrency: diff (and contents reads) 4 — 2 on Windows.
+    pub(crate) diff_permits: Arc<tokio::sync::Semaphore>,
+    /// §12.1 read concurrency: log (and commit files) 2.
+    pub(crate) log_permits: Arc<tokio::sync::Semaphore>,
     watch: Mutex<Option<GitdirWatch>>,
     worktrees: Mutex<WorktreeState>,
 }
@@ -92,6 +97,12 @@ impl Session {
             status_subscribers: Mutex::new(Vec::new()),
             next_subscriber: AtomicU64::new(0),
             ops: Arc::new(tokio::sync::RwLock::new(())),
+            diff_permits: Arc::new(tokio::sync::Semaphore::new(if cfg!(windows) {
+                2
+            } else {
+                4
+            })),
+            log_permits: Arc::new(tokio::sync::Semaphore::new(2)),
             watch: Mutex::new(None),
             worktrees: Mutex::new(WorktreeState::default()),
         }
