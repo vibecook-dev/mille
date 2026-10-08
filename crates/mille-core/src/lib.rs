@@ -43,12 +43,20 @@ pub use resume::{
     CURRENT_FORMAT_VERSION,
 };
 
-// TODO: Phase 2 — jwalk-based walker + coalescer
+// Phase 2 walker + coalescer; M10 bounds every read it makes.
 pub mod walker;
 pub use walker::{
     build_ignore_matcher_from_walk, populate_store, populate_store_with_provenance, walk,
-    walk_batched, walk_with_ignore, walk_with_ignore_batched, SymlinkPolicy, WalkOptions,
-    WalkedEntry,
+    walk_batched, walk_bounded, walk_bounded_batched, walk_with_ignore, walk_with_ignore_batched,
+    SymlinkPolicy, UnreadDirectory, WalkOptions, WalkReport, WalkedEntry,
+};
+
+// M10 — time-bounded native reads: helper pool, stall deadline, stuck cap,
+// dataless policy.
+pub mod read_boundary;
+pub use read_boundary::{
+    IgnoreFile, PathStat, ReadBoundary, ReadBoundaryOptions, ReadFailure, ReadHook, ReadKind,
+    ReadProgress,
 };
 
 // TODO: Phase 2 — ripgrep `ignore` crate wrapper

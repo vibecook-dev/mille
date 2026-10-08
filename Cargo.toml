@@ -24,9 +24,6 @@ napi-build = "2.3"
 notify = "6.1"
 notify-debouncer-full = "0.3"
 
-# Parallel directory walking
-jwalk = "0.8"
-
 # Gitignore matching (ripgrep's crate)
 ignore = "0.4"
 

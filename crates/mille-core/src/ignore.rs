@@ -21,7 +21,16 @@ pub const IGNORE_FILE_NAMES: &[&str] = &[".gitignore", ".ignore", ".rgignore"];
 #[derive(Clone, Debug)]
 enum IgnoreSource {
     File(PathBuf),
-    String { root: PathBuf, patterns: String },
+    /// A file's text captured by a bounded read (`read_boundary`), so
+    /// `clone_rules` replays it without touching the disk again.
+    Contents {
+        file: PathBuf,
+        contents: String,
+    },
+    String {
+        root: PathBuf,
+        patterns: String,
+    },
 }
 
 /// Up to this many stacked matchers, `is_ignored` simply tries each one.
@@ -76,6 +85,44 @@ impl IgnoreMatcher {
         Ok(())
     }
 
+    /// Load an ignore file whose text was already read — by the bounded read
+    /// boundary, which must not leave a second, unbounded `open` of the same
+    /// file to the engine thread. Line handling matches `add_from_file`
+    /// exactly (BOM, `\r\n`, all-or-nothing on a bad glob), because both go
+    /// through `GitignoreBuilder::add_line` with the file as the origin.
+    pub fn add_from_contents(&mut self, ignore_file: &Path, contents: &str) -> Result<(), FxError> {
+        let root = ignore_file.parent().ok_or_else(|| {
+            FxError::InvalidInput(format!(
+                "ignore file {:?} has no parent directory",
+                ignore_file
+            ))
+        })?;
+        let invalid = |e: ::ignore::Error| FxError::Io {
+            code: ErrorCode::EINVAL,
+            path: ignore_file.to_path_buf(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()),
+        };
+        let mut builder = GitignoreBuilder::new(root);
+        for (index, line) in contents.lines().enumerate() {
+            // Same as `GitignoreBuilder::add`: git ignores a leading BOM.
+            let line = if index == 0 {
+                line.trim_start_matches('\u{feff}')
+            } else {
+                line
+            };
+            builder
+                .add_line(Some(ignore_file.to_path_buf()), line)
+                .map_err(invalid)?;
+        }
+        let gi = builder.build().map_err(invalid)?;
+        self.push(root.to_path_buf(), gi);
+        self.sources.push(IgnoreSource::Contents {
+            file: ignore_file.to_path_buf(),
+            contents: contents.to_owned(),
+        });
+        Ok(())
+    }
+
     /// Load ignore rules from a string. Primarily for tests and callers who
     /// compute ignores programmatically. `root` is the anchor directory.
     pub fn add_from_string(&mut self, root: &Path, patterns: &str) -> Result<(), FxError> {
@@ -118,6 +165,9 @@ impl IgnoreMatcher {
                 IgnoreSource::File(path) => {
                     let _ = fresh.add_from_file(path);
                 }
+                IgnoreSource::Contents { file, contents } => {
+                    let _ = fresh.add_from_contents(file, contents);
+                }
                 IgnoreSource::String { root, patterns } => {
                     let _ = fresh.add_from_string(root, patterns);
                 }
@@ -126,6 +176,9 @@ impl IgnoreMatcher {
         fresh
     }
 
+    /// The one place a matcher joins the stack, so `by_root` stays in step
+    /// whichever `add_from_*` was used — a rule that bypassed it would be
+    /// invisible to the indexed lookup in `decision` once the stack is long.
     fn push(&mut self, root: PathBuf, gi: Gitignore) {
         self.by_root
             .entry(root.clone())
@@ -140,6 +193,15 @@ impl IgnoreMatcher {
     /// matches don't miss. Matchers are consulted in the order they were
     /// added, and the first one with an opinion decides.
     pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
+        self.decision(path, is_dir).unwrap_or(false)
+    }
+
+    /// The first decisive rule for `path`: `Some(true)` ignored,
+    /// `Some(false)` whitelisted, `None` when no stacked matcher has an
+    /// opinion. Lets a caller consult two matchers as one stack — the walker
+    /// checks the caller's rules, then the nested files it discovered, which
+    /// is the order a single stack would have held them in.
+    pub fn decision(&self, path: &Path, is_dir: bool) -> Option<bool> {
         if self.matchers.len() <= LINEAR_SCAN_MAX {
             return Self::decide(
                 self.matchers
@@ -170,17 +232,17 @@ impl IgnoreMatcher {
         matchers: impl Iterator<Item = &'a (PathBuf, Gitignore)>,
         path: &Path,
         is_dir: bool,
-    ) -> bool {
+    ) -> Option<bool> {
         for (_, gi) in matchers {
             let m = gi.matched_path_or_any_parents(path, is_dir);
             if m.is_ignore() {
-                return true;
+                return Some(true);
             }
             if m.is_whitelist() {
-                return false;
+                return Some(false);
             }
         }
-        false
+        None
     }
 
     pub fn matcher_count(&self) -> usize {
@@ -238,6 +300,44 @@ mod tests {
         assert!(!m.is_ignored(&td.path().join("src/foo.rs"), false));
     }
 
+    /// The bounded walker loads ignore files from text it already read; the
+    /// rules must be the ones `add_from_file` builds from the same bytes.
+    #[test]
+    fn contents_load_matches_file_load() {
+        let td = TempDir::new().unwrap();
+        let text = "\u{feff}# comment\r\n*.log\r\n!keep.log\n/anchored/\n\\#literal\ntrailing\\ \nbuild/\n";
+        let file = td.path().join(".gitignore");
+        fs::write(&file, text).unwrap();
+        let mut from_file = IgnoreMatcher::new();
+        from_file.add_from_file(&file).unwrap();
+        let mut from_text = IgnoreMatcher::new();
+        from_text.add_from_contents(&file, text).unwrap();
+        for (path, is_dir) in [
+            ("a.log", false),
+            ("keep.log", false),
+            ("anchored", true),
+            ("sub/anchored", true),
+            ("#literal", false),
+            ("trailing ", false),
+            ("trailing", false),
+            ("build", true),
+            ("src/build", true),
+            ("src/main.rs", false),
+        ] {
+            let path = td.path().join(path);
+            assert_eq!(
+                from_text.decision(&path, is_dir),
+                from_file.decision(&path, is_dir),
+                "{path:?}"
+            );
+        }
+        // Replaying text-backed rules touches no file.
+        fs::remove_file(&file).unwrap();
+        assert!(from_text
+            .clone_rules()
+            .is_ignored(&td.path().join("a.log"), false));
+    }
+
     #[test]
     fn stacked_matchers_each_apply_under_their_root() {
         let td = TempDir::new().unwrap();
@@ -272,6 +372,7 @@ mod tests {
             path,
             is_dir,
         )
+        .unwrap_or(false)
     }
 
     #[test]

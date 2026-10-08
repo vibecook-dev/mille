@@ -23,6 +23,14 @@ pub enum ErrorCode {
     ECANCELED,
     EUNSUPPORTED,
     EUNKNOWN,
+    // Appended, not alphabetized: the derive numbers variants by position, so
+    // a mid-list insert would renumber every code a binary format recorded.
+    /// A native read made no progress within the explorer's read deadline,
+    /// or a read into the same path is still stuck (see `read_boundary`).
+    ETIMEDOUT,
+    /// The directory is a cloud placeholder whose contents are not on this
+    /// machine (macOS `SF_DATALESS`), and the explorer does not materialize.
+    EDATALESS,
 }
 
 impl ErrorCode {
@@ -43,6 +51,8 @@ impl ErrorCode {
             ErrorCode::ECANCELED => "ECANCELED",
             ErrorCode::EUNSUPPORTED => "EUNSUPPORTED",
             ErrorCode::EUNKNOWN => "EUNKNOWN",
+            ErrorCode::ETIMEDOUT => "ETIMEDOUT",
+            ErrorCode::EDATALESS => "EDATALESS",
         }
     }
 
@@ -220,6 +230,8 @@ mod tests {
             (ErrorCode::ECANCELED, "ECANCELED"),
             (ErrorCode::EUNSUPPORTED, "EUNSUPPORTED"),
             (ErrorCode::EUNKNOWN, "EUNKNOWN"),
+            (ErrorCode::ETIMEDOUT, "ETIMEDOUT"),
+            (ErrorCode::EDATALESS, "EDATALESS"),
         ];
         for (code, name) in all {
             assert_eq!(code.as_str(), name);
