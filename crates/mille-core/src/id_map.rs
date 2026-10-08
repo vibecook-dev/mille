@@ -18,10 +18,11 @@
 // Shape: a bitmap-compressed radix trie on the raw id, five bits per level.
 // `EntryId`s come from a monotonic counter, so live ids are dense and
 // in-order iteration is a plain depth-first walk — the same ascending order
-// `BTreeMap` iterated in, which the resume writer and the reconfigure pass
-// rely on. Nodes store only their occupied slots (a 32-bit occupancy bitmap
-// plus a packed `Vec`), so a sparse key set — directories only, say — costs
-// what it holds rather than 32 slots per key, and an emptied node is pruned.
+// `BTreeMap` iterated in, so nothing that walks a map (the resume writer, the
+// reconfigure pass) sees a different sequence. Nodes store only their
+// occupied slots (a 32-bit occupancy bitmap plus a packed `Vec`), so a sparse
+// key set — directories only, say — costs what it holds rather than 32 slots
+// per key, and an emptied node is pruned.
 //
 // The API mirrors the subset of `BTreeMap` the snapshot used, including
 // `entry(..).or_insert(..)`, so call sites read the same. One difference:
