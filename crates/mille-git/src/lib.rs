@@ -523,7 +523,7 @@ impl GitEngine {
                         request.path
                     )));
                 }
-                let repo = session.repo.clone().ok_or_else(no_gix)?;
+                let repo = session.repo.clone().ok_or_else(|| no_gix("diff"))?;
                 let options = &inner.options;
                 let caps = DiffCaps {
                     auto_render_max_bytes: request
@@ -624,7 +624,7 @@ impl GitEngine {
                         })
                         .await
                     }
-                    (None, None) => Err(no_gix()),
+                    (None, None) => Err(no_gix("a log without a path")),
                 }
             },
         )
@@ -649,7 +649,7 @@ impl GitEngine {
                 if session.kind() == GitRepoKind::None {
                     return Err(GitError::not_a_repo(&session.identity().worktree_path));
                 }
-                let repo = session.repo.clone().ok_or_else(no_gix)?;
+                let repo = session.repo.clone().ok_or_else(|| no_gix("commitFiles"))?;
                 blocking(move || log::commit_files(&repo.to_thread_local(), &sha)).await
             },
         )
@@ -676,7 +676,7 @@ impl GitEngine {
                 if session.kind() == GitRepoKind::None {
                     return Err(GitError::not_a_repo(&root));
                 }
-                let repo = session.repo.clone().ok_or_else(no_gix)?;
+                let repo = session.repo.clone().ok_or_else(|| no_gix("readObject"))?;
                 let hard_refuse = inner.options.hard_refuse_bytes as u64;
                 blocking(move || log::read_object(&repo, &revision, &request.path, hard_refuse))
                     .await
@@ -846,9 +846,14 @@ async fn blocking<T: Send + 'static>(
         .map_err(|err| GitError::unknown(format!("mille-git read task failed: {err}")))?
 }
 
-fn no_gix() -> GitError {
-    GitError::unknown(
-        "gix could not open this repository (only the git CLI could); this read needs gix",
+/// §23: a read that only gix serves, on a repository only the git CLI could
+/// open (§9.2 step 6). Not `EUNKNOWN`: nothing failed unexpectedly — this
+/// engine cannot do that read for this repository, and saying so lets a
+/// caller fall back (the shell clients) instead of reporting an error.
+fn no_gix(read: &str) -> GitError {
+    GitError::new(
+        GitErrorKind::Unsupported,
+        format!("only the git CLI could open this repository; {read} needs gix"),
     )
 }
 

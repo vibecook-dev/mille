@@ -213,10 +213,13 @@ Each item names the section it departs from and why. None reopens a §31/§32 de
     show and diff a staged row outside the explorer root.
 36. **Bare repositories**: log, `commit_files`, `read_object` and commit diffs work; worktree and
     index diffs and `read_worktree_file` are `EUNSUPPORTED`.
-37. **Reads that need gix fail `EUNKNOWN` when only the CLI could open the repository** (the
-    §9.2 step 6 fallback case): diff, `commit_files`, `read_object` and unfiltered log. §14.2's
-    positional `git show <rev>:<path>` fallback for `read_object` is not implemented; the
-    path-filtered log already runs on the CLI.
+37. **Reads that need gix refuse `EUNSUPPORTED` when only the CLI could open the repository**
+    (the §9.2 step 6 fallback case — a SHA-256 repository, since gix is built with `sha1` alone):
+    diff, `commit_files`, `read_object` and unfiltered log, each with the message
+    `only the git CLI could open this repository; <read> needs gix` (`<read>` is `diff`,
+    `commitFiles`, `readObject` or `a log without a path`). §14.2's positional
+    `git show <rev>:<path>` fallback for `read_object` is not implemented; the path-filtered log
+    and status already run on the CLI.
 38. **Read concurrency limits cover the contents reads too**: `read_object` / `read_worktree_file`
     count against the diff limit (4, 2 on Windows) and `commit_files` against the log limit (2);
     §12.1 names only diff and log. Every read holds the read side of the session's operations lock,

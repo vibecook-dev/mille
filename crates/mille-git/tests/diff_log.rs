@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use common::Repo;
 use mille_git::{
     diff_sides, CancellationToken, DiffCaps, DiffLineKind, DiffRequest, DiffResult, DiffSide,
-    DiffSpec, GitEngine, GitError, GitErrorKind, LogRequest, OpOptions, ReadObjectRequest,
-    StatusLetter, COMMIT_FILES_CAP,
+    DiffSpec, GitEngine, GitError, GitErrorKind, GitRepoKind, LogRequest, OpOptions,
+    ReadObjectRequest, StatusBackend, StatusLetter, COMMIT_FILES_CAP,
 };
 
 fn diff_req(path: &str, spec: DiffSpec) -> DiffRequest {
@@ -731,6 +731,106 @@ async fn reads_on_bare_and_plain_directories() {
             .unwrap_err()
             .code(),
         "ENOTAREPO"
+    );
+}
+
+/// The §23 refusal for a read only gix serves, on a CLI-only repository.
+fn assert_cli_only_refusal<T: std::fmt::Debug>(result: mille_git::Result<T>, read: &str) {
+    let err = result.expect_err(read);
+    assert_eq!(err.kind(), GitErrorKind::Unsupported, "{read}: {err}");
+    assert_eq!(err.code(), "EUNSUPPORTED");
+    assert_eq!(
+        err.message(),
+        format!("only the git CLI could open this repository; {read} needs gix")
+    );
+}
+
+// §23: a repository only the git CLI can open (§9.2 step 6). gix is built
+// with `sha1` alone, so a SHA-256 repository — git has made them since 2.29 —
+// fails `gix::open` and opens through `rev-parse`. Every read that needs gix
+// refuses it `EUNSUPPORTED`, saying why; what the CLI serves keeps working.
+#[tokio::test]
+async fn reads_that_need_gix_refuse_a_cli_only_repository() {
+    require_git!();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    let init = common::git_output(
+        &root,
+        &["init", "-q", "--object-format=sha256", "-b", "main"],
+    );
+    if !init.status.success() {
+        eprintln!(
+            "skipping: this git cannot create a SHA-256 repository: {}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        return;
+    }
+    common::configure(&root);
+    std::fs::write(root.join("a.ts"), "x\n").unwrap();
+    common::git(&root, &["add", "-A"]);
+    common::git(&root, &["commit", "-q", "-m", "base"]);
+    let sha = common::git(&root, &["rev-parse", "HEAD"]).trim().to_owned();
+    std::fs::write(root.join("a.ts"), "y\n").unwrap();
+
+    let engine = common::quiet_engine(&[tmp.path()]);
+    let identity = engine.open(&root).await.unwrap();
+    assert_eq!(identity.kind, GitRepoKind::Worktree);
+    assert_eq!(identity.head.as_deref(), Some(sha.as_str()));
+    // The seam's premise. If gix ever opens SHA-256 here, this test needs
+    // another repository gix cannot open.
+    let status = engine.status(&root).await.unwrap();
+    assert_eq!(
+        status.status_backend,
+        StatusBackend::Cli,
+        "gix opened the SHA-256 repository, so it no longer forces a CLI-only open"
+    );
+    assert!(common::has(&status, "a.ts", ".M"));
+
+    assert_cli_only_refusal(
+        engine
+            .diff(&root, diff_req("a.ts", DiffSpec::Worktree))
+            .await,
+        "diff",
+    );
+    let mut commit_diff = diff_req("a.ts", DiffSpec::Commit);
+    commit_diff.commit = Some(sha.clone());
+    assert_cli_only_refusal(engine.diff(&root, commit_diff).await, "diff");
+    assert_cli_only_refusal(
+        engine.commit_files(&root, &sha, OpOptions::default()).await,
+        "commitFiles",
+    );
+    let read = ReadObjectRequest {
+        path: "a.ts".into(),
+        revision: "HEAD".into(),
+        cancel: None,
+    };
+    assert_cli_only_refusal(engine.read_object(&root, read).await, "readObject");
+    assert_cli_only_refusal(
+        engine.log(&root, LogRequest::default()).await,
+        "a log without a path",
+    );
+
+    // The CLI-served reads: a path-filtered log, the working tree.
+    let page = engine
+        .log(
+            &root,
+            LogRequest {
+                path: Some("a.ts".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.commits.len(), 1);
+    assert_eq!(page.commits[0].id, sha);
+    assert_eq!(
+        engine
+            .read_worktree_file(&root, "a.ts", OpOptions::default())
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(&b"y\n"[..])
     );
 }
 

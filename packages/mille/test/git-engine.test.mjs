@@ -23,6 +23,7 @@ import { removeTempDir } from '../../../scripts/test-temp.mjs';
 import {
   git,
   gitStdin,
+  initRepo,
   makeRepo,
   needsGit,
   tempDir,
@@ -199,6 +200,52 @@ test('commitFiles says when its 10 000-file cap cut the list (§14.3)', needsGit
     assert.equal(cut.files.length, 10_000);
     assert.equal(cut.files[0].path, 'f00000.txt');
     assert.equal(cut.files.at(-1).path, 'f09999.txt', 'the first 10 000 by path');
+  } finally {
+    engine.dispose();
+    removeTempDir(repo);
+  }
+});
+
+test('a repository only the git CLI opens refuses gix reads EUNSUPPORTED (§23)', needsGit(), async (t) => {
+  // gix is built with `sha1` alone, so a SHA-256 repository opens only
+  // through the CLI fallback (§9.2 step 6).
+  const repo = tempDir('mille-git-sha256-');
+  const engine = new GitEngine({ allowedRoots: [repo] });
+  try {
+    try {
+      git(repo, 'init', '-q', '--object-format=sha256');
+    } catch (e) {
+      t.skip(`this git cannot create a SHA-256 repository: ${e.message}`);
+      return;
+    }
+    initRepo(repo); // re-init keeps the format; adds the local config
+    write(repo, 'a.ts', 'x\n');
+    git(repo, 'add', '-A');
+    git(repo, 'commit', '-q', '-m', 'base');
+    const head = git(repo, 'rev-parse', 'HEAD').trim();
+    await engine.open(repo);
+    assert.equal(
+      (await engine.status(repo)).statusBackend,
+      'cli',
+      'gix opened the SHA-256 repository, so it no longer forces a CLI-only open',
+    );
+
+    for (const [read, call] of [
+      ['diff', () => engine.diff(repo, { path: 'a.ts', spec: 'worktree' })],
+      ['commitFiles', () => engine.commitFiles(repo, head)],
+      ['readObject', () => engine.readObject(repo, { path: 'a.ts', revision: 'HEAD' })],
+      ['a log without a path', () => engine.log(repo, {})],
+    ]) {
+      await assert.rejects(call(), (e) => {
+        assert.ok(isGitError(e), `${read}: ${e}`);
+        assert.equal(e.code, 'EUNSUPPORTED', read);
+        assert.equal(e.message, `only the git CLI could open this repository; ${read} needs gix`);
+        return true;
+      });
+    }
+    // What the CLI serves still works.
+    const page = await engine.log(repo, { path: 'a.ts' });
+    assert.deepEqual(page.commits.map((c) => c.id), [head]);
   } finally {
     engine.dispose();
     removeTempDir(repo);
