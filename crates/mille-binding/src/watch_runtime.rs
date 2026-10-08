@@ -599,9 +599,6 @@ where
                 total.merge(batch);
                 *target = target.saturating_mul(2).min(publication_ceiling);
                 pending.reserve(*target);
-                // Give the JS host enough scheduling room to drain and publish a
-                // page instead of coalescing a whole wide folder into one frame.
-                std::thread::sleep(Duration::from_millis(1));
                 Ok(())
             };
 
@@ -614,6 +611,13 @@ where
                 pending_walked.extend(walked);
                 if pending_walked.len() >= publication_target {
                     flush_pending(&mut pending_walked, &mut publication_target)?;
+                    // Give the JS host enough scheduling room to drain and
+                    // publish this page before the next one, instead of
+                    // coalescing a whole wide folder into one frame. The last
+                    // page needs no room: EOF publishes completion right behind
+                    // it, and sleeping there cost every listed folder a
+                    // millisecond — ~8 s to prefetch a 44k-entry tree (M8).
+                    std::thread::sleep(Duration::from_millis(1));
                 }
                 Ok(())
             };
