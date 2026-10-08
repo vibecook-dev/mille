@@ -20,7 +20,7 @@
 import { tryLoadNative } from '../native-loader.js';
 import { abortError, GitError, toGitError, wrapGit, wrapGitSync } from './error.js';
 import type {
-  CommitFile,
+  CommitFileList,
   CommitRequest,
   DiffRequest,
   DiffResult,
@@ -287,15 +287,16 @@ export class GitEngine {
     return JSON.parse(json) as LogPage;
   }
 
+  /** The files `sha` changed (§14.3); `truncated` when the 10 000 cap cut the list. */
   async commitFiles(
     worktreePath: string,
     sha: string,
     opts: { signal?: AbortSignal } = {},
-  ): Promise<CommitFile[]> {
+  ): Promise<CommitFileList> {
     const json = await this.#cancellable(opts.signal, (op) =>
       this.#native.commitFiles(worktreePath, sha, op),
     );
-    return JSON.parse(json) as CommitFile[];
+    return JSON.parse(json) as CommitFileList;
   }
 
   async readObject(

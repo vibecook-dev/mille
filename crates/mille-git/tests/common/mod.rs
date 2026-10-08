@@ -53,6 +53,40 @@ pub fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// `git` with `input` on stdin (`mktree`, `hash-object --stdin`), in the
+/// same scrubbed environment as [`git_output`]. Panics on a non-zero exit.
+pub fn git_stdin(dir: &Path, args: &[&str], input: &str) -> String {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn git");
+    // Dropping stdin after the write closes it, so git sees EOF.
+    child
+        .stdin
+        .take()
+        .expect("git stdin")
+        .write_all(input.as_bytes())
+        .expect("write git stdin");
+    let out = child.wait_with_output().expect("wait for git");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed in {}: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
 /// Configure a fresh repository so the user's global config (signing,
 /// hooksPath, autocrlf, fsmonitor) cannot change what a test observes.
 pub fn configure(dir: &Path) {

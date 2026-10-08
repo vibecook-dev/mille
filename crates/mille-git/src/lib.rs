@@ -50,7 +50,8 @@ pub use error::{GitError, GitErrorKind, Result};
 pub use gitdir::{find_dot_git, resolve_git_dir, MAX_DOT_GIT_WALK};
 pub use identity::{GitIdentity, GitRepoKind};
 pub use log::{
-    CommitFile, LogCommit, LogPage, LogRequest, ReadObjectRequest, COMMIT_FILES_CAP, MAX_LOG_PAGE,
+    CommitFile, CommitFileList, LogCommit, LogPage, LogRequest, ReadObjectRequest,
+    COMMIT_FILES_CAP, MAX_LOG_PAGE,
 };
 pub use mutation::{CommitRequest, OpOptions};
 pub use porcelain::parse_porcelain_v2;
@@ -631,13 +632,14 @@ impl GitEngine {
     }
 
     /// The files a commit changed versus its first parent (§14.3), sorted,
-    /// capped at [`COMMIT_FILES_CAP`].
+    /// capped at [`COMMIT_FILES_CAP`], with `truncated` set when the cap cut
+    /// the list.
     pub async fn commit_files(
         &self,
         worktree: &Path,
         sha: &str,
         options: OpOptions,
-    ) -> Result<Vec<CommitFile>> {
+    ) -> Result<CommitFileList> {
         let sha = assert_safe_revision(sha)?.to_owned();
         self.read(
             worktree,

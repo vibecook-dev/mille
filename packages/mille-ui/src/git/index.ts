@@ -48,6 +48,7 @@ export type { WatchDotGitOptions } from './watch-dotgit.js';
 export { GIT_PROTOCOL_VERSION, GitError, isGitError } from './service-types.js';
 export type {
   CommitFile,
+  CommitFileList,
   CommitRequest,
   DiffHunk,
   DiffLine,

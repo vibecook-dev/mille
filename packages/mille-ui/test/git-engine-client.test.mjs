@@ -94,7 +94,7 @@ function fakeService(overrides = {}, { checkout = ROOT } = {}) {
     },
     diff: record('diff', async () => assert.fail('adapters never diff')),
     log: record('log', async () => ({ commits: [], tookMs: 0, exhausted: true })),
-    commitFiles: record('commitFiles', async () => []),
+    commitFiles: record('commitFiles', async () => ({ files: [], truncated: false })),
     readObject: record('readObject', async () => null),
     readWorktreeFile: record('readWorktreeFile', async () => null),
     stage: record('stage', async () => {}),

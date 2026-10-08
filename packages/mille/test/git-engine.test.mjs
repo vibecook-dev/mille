@@ -20,7 +20,16 @@ import {
 } from '../dist/git/index.js';
 import { tryParseGitReason } from '../dist/git/error.js';
 import { removeTempDir } from '../../../scripts/test-temp.mjs';
-import { git, makeRepo, needsGit, tempDir, waitFor, write, xyOf } from './fixtures/git-fixture.mjs';
+import {
+  git,
+  gitStdin,
+  makeRepo,
+  needsGit,
+  tempDir,
+  waitFor,
+  write,
+  xyOf,
+} from './fixtures/git-fixture.mjs';
 
 test('isNativeGitAvailable agrees with the features the loaded binary reports', () => {
   const features = buildIdentity().nativeFeatures;
@@ -150,7 +159,7 @@ test('diff, log, readObject, readWorktreeFile, commitFiles and worktrees', needs
     assert.deepEqual([...bytes], [0xff, 0xfe, 0x00, 0x01]);
 
     const files = await engine.commitFiles(repo, head);
-    assert.deepEqual(files, [{ path: 'a.ts', status: 'M' }]);
+    assert.deepEqual(files, { files: [{ path: 'a.ts', status: 'M' }], truncated: false });
 
     const worktrees = await engine.worktrees(repo);
     assert.equal(worktrees.length, 1);
@@ -158,6 +167,38 @@ test('diff, log, readObject, readWorktreeFile, commitFiles and worktrees', needs
 
     const advice = await engine.advisePerformanceConfig(repo);
     assert.equal(typeof advice, 'object');
+  } finally {
+    engine.dispose();
+    removeTempDir(repo);
+  }
+});
+
+test('commitFiles says when its 10 000-file cap cut the list (§14.3)', needsGit(), async () => {
+  const repo = makeRepo({ 'seed.ts': 'seed\n' });
+  const engine = new GitEngine({ allowedRoots: [repo] });
+  try {
+    // Plumbing, not ten thousand files on disk: one blob named `n` times in a
+    // flat tree, committed with no parent, so every entry is an addition.
+    const blob = gitStdin(repo, ['hash-object', '-w', '--stdin'], 'x\n').trim();
+    const rootCommitOf = (n) => {
+      let listing = '';
+      for (let i = 0; i < n; i += 1) listing += `100644 blob ${blob}\tf${String(i).padStart(5, '0')}.txt\n`;
+      const tree = gitStdin(repo, ['mktree'], listing).trim();
+      return gitStdin(repo, ['commit-tree', tree, '-m', `${n} files`], '').trim();
+    };
+    const atCap = rootCommitOf(10_000);
+    const overCap = rootCommitOf(10_001);
+    await engine.open(repo);
+
+    const whole = await engine.commitFiles(repo, atCap);
+    assert.equal(whole.truncated, false, 'exactly the cap is the whole list');
+    assert.equal(whole.files.length, 10_000);
+
+    const cut = await engine.commitFiles(repo, overCap);
+    assert.equal(cut.truncated, true);
+    assert.equal(cut.files.length, 10_000);
+    assert.equal(cut.files[0].path, 'f00000.txt');
+    assert.equal(cut.files.at(-1).path, 'f09999.txt', 'the first 10 000 by path');
   } finally {
     engine.dispose();
     removeTempDir(repo);

@@ -25,6 +25,7 @@ export type {
 } from './types.js';
 export type {
   CommitFile,
+  CommitFileList,
   CommitRequest,
   DiffHunk,
   DiffLine,

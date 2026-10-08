@@ -26,6 +26,7 @@ export type Checks = [
   Assert<Mutual<engine.LogRequest, contract.LogRequest>>,
   Assert<Mutual<engine.LogPage, contract.LogPage>>,
   Assert<Mutual<engine.CommitFile, contract.CommitFile>>,
+  Assert<Mutual<engine.CommitFileList, contract.CommitFileList>>,
   Assert<Mutual<engine.CommitRequest, contract.CommitRequest>>,
   Assert<Mutual<engine.ReadObjectRequest, contract.ReadObjectRequest>>,
   Assert<Mutual<engine.GitWorktree, contract.GitWorktree>>,

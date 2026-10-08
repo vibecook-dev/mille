@@ -115,7 +115,7 @@ test('AC-012: every GitService verb is one transport call with plain args', asyn
     close: undefined,
     diff: { path: 'a.ts', tooLarge: false, tookMs: 2, hunks: [] },
     log: { commits: [], tookMs: 1, exhausted: true },
-    commitFiles: [{ path: 'a.ts', status: 'M' }],
+    commitFiles: { files: [{ path: 'a.ts', status: 'M' }], truncated: false },
     readObject: 'contents',
     readWorktreeFile: 'worktree',
     stage: undefined,
@@ -135,7 +135,10 @@ test('AC-012: every GitService verb is one transport call with plain args', asyn
   assert.equal((await service.diff(W, { path: 'a.ts', spec: 'worktree', maxLines: 9, signal })).tookMs, 2);
   assert.equal((await service.log(W)).exhausted, true);
   await service.log(W, { path: 'a.ts', limit: 5, signal });
-  assert.deepEqual(await service.commitFiles(W, 'c0ffee'), [{ path: 'a.ts', status: 'M' }]);
+  assert.deepEqual(await service.commitFiles(W, 'c0ffee'), {
+    files: [{ path: 'a.ts', status: 'M' }],
+    truncated: false,
+  });
   assert.equal(await service.readObject(W, { path: 'a.ts', revision: 'HEAD', signal }), 'contents');
   assert.equal(await service.readWorktreeFile(W, 'a.ts', { signal }), 'worktree');
   await service.stage(W, ['a.ts'], { signal });

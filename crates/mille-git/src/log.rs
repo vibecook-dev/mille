@@ -78,6 +78,20 @@ pub struct CommitFile {
     pub status: StatusLetter,
 }
 
+/// `commitFiles`' answer (§14.3): the changed files sorted by path and capped
+/// at [`COMMIT_FILES_CAP`], and whether the cap cut the list short — a
+/// History room must be able to say "and more" rather than show a silently
+/// partial commit.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitFileList {
+    /// At most [`COMMIT_FILES_CAP`] files, sorted by path.
+    pub files: Vec<CommitFile>,
+    /// The commit changed more files than the cap; `files` is the first
+    /// [`COMMIT_FILES_CAP`] of them by path.
+    pub truncated: bool,
+}
+
 /// `readObject` (§14.2).
 #[derive(Clone, Debug, Default)]
 pub struct ReadObjectRequest {
@@ -246,7 +260,7 @@ pub(crate) fn parse_log_lines(stdout: &str) -> Vec<LogCommit> {
 
 /// The files `sha` changed versus its first parent (or the empty tree for a
 /// root commit), with rename detection as configured.
-pub(crate) fn commit_files(repo: &gix::Repository, sha: &str) -> Result<Vec<CommitFile>> {
+pub(crate) fn commit_files(repo: &gix::Repository, sha: &str) -> Result<CommitFileList> {
     use gix::object::tree::diff::ChangeDetached as Change;
     assert_safe_revision(sha)?;
     let commit = repo
@@ -321,8 +335,9 @@ pub(crate) fn commit_files(repo: &gix::Repository, sha: &str) -> Result<Vec<Comm
         })
         .collect();
     files.sort_by(|a, b| a.path.cmp(&b.path));
+    let truncated = files.len() > COMMIT_FILES_CAP;
     files.truncate(COMMIT_FILES_CAP);
-    Ok(files)
+    Ok(CommitFileList { files, truncated })
 }
 
 /// `rev:path` bytes, or `None` when missing or at / above `hard_refuse`.

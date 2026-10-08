@@ -156,6 +156,15 @@ export interface CommitFile {
   readonly status: GitStatusLetter;
 }
 
+/**
+ * `commitFiles`' answer (§14.3): at most 10 000 files, sorted by path, and
+ * whether that cap cut the list short (`files` is then the first 10 000).
+ */
+export interface CommitFileList {
+  readonly files: readonly CommitFile[];
+  readonly truncated: boolean;
+}
+
 export interface CommitRequest {
   readonly summary: string;
   readonly body?: string;
@@ -271,7 +280,7 @@ export interface GitService {
 
   diff(worktreePath: string, req: DiffRequest): Promise<DiffResult>;
   log(worktreePath: string, req?: LogRequest): Promise<LogPage>;
-  commitFiles(worktreePath: string, sha: string): Promise<readonly CommitFile[]>;
+  commitFiles(worktreePath: string, sha: string): Promise<CommitFileList>;
   readObject(worktreePath: string, req: ReadObjectRequest): Promise<string | Uint8Array | null>;
   readWorktreeFile(
     worktreePath: string,

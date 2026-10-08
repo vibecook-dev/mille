@@ -224,9 +224,10 @@ Each item names the section it departs from and why. None reopens a §31/§32 de
 39. **Signatures follow Appendix A where Appendix B differs**: `read_object` takes a
     `ReadObjectRequest { path, revision, cancel }`; `commit_files` and `read_worktree_file` take
     `OpOptions` for the abort token; contents are `ObjectBytes = Vec<u8>` (text vs `Uint8Array` is
-    the TypeScript layer's call, as `getContents` decides today). `commit_files` is sorted by path
-    and capped at 10 000 rows without a separate truncated count, since Appendix A returns a bare
-    `CommitFile[]`.
+    the TypeScript layer's call, as `getContents` decides today). `commit_files` answers a
+    `CommitFileList { files, truncated }` rather than Appendix A's bare `CommitFile[]`: `files`
+    sorted by path and capped at 10 000 (`COMMIT_FILES_CAP`), `truncated` true exactly when the
+    commit changed more files than that, so a History room can say the list is partial.
 
 ### The binding (PR 6a onward)
 

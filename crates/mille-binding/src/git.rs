@@ -475,7 +475,8 @@ impl GitEngineJs {
         })
     }
 
-    /// The files a commit changed (§14.3). JSON `CommitFile[]`.
+    /// The files a commit changed (§14.3). JSON `CommitFileList`
+    /// (`{ files, truncated }`).
     #[napi(js_name = "commitFiles", catch_unwind)]
     pub fn commit_files<'env>(
         &self,

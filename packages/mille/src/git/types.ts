@@ -126,6 +126,15 @@ export interface CommitFile {
   readonly status: GitStatusLetter;
 }
 
+/**
+ * `commitFiles`' answer (§14.3): at most 10 000 files, sorted by path, and
+ * whether that cap cut the list short (`files` is then the first 10 000).
+ */
+export interface CommitFileList {
+  readonly files: readonly CommitFile[];
+  readonly truncated: boolean;
+}
+
 export interface CommitRequest {
   readonly summary: string;
   readonly body?: string;
@@ -211,7 +220,7 @@ export interface GitService {
   onStatus(worktreePath: string, cb: (s: StatusSnapshot) => void): () => void;
   diff(worktreePath: string, req: DiffRequest): Promise<DiffResult>;
   log(worktreePath: string, req?: LogRequest): Promise<LogPage>;
-  commitFiles(worktreePath: string, sha: string): Promise<readonly CommitFile[]>;
+  commitFiles(worktreePath: string, sha: string): Promise<CommitFileList>;
   readObject(worktreePath: string, req: ReadObjectRequest): Promise<string | Uint8Array | null>;
   readWorktreeFile(
     worktreePath: string,
@@ -254,7 +263,7 @@ export interface GitCallTable {
   status: { args: { worktree: string }; result: StatusSnapshot };
   diff: { args: { worktree: string; request: Omit<DiffRequest, 'signal'> }; result: DiffResult };
   log: { args: { worktree: string; request: Omit<LogRequest, 'signal'> }; result: LogPage };
-  commitFiles: { args: { worktree: string; sha: string }; result: CommitFile[] };
+  commitFiles: { args: { worktree: string; sha: string }; result: CommitFileList };
   readObject: {
     args: { worktree: string; request: Omit<ReadObjectRequest, 'signal'> };
     result: string | Uint8Array | null;

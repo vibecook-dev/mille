@@ -8,7 +8,7 @@ use common::Repo;
 use mille_git::{
     diff_sides, CancellationToken, DiffCaps, DiffLineKind, DiffRequest, DiffResult, DiffSide,
     DiffSpec, GitEngine, GitError, GitErrorKind, LogRequest, OpOptions, ReadObjectRequest,
-    StatusLetter,
+    StatusLetter, COMMIT_FILES_CAP,
 };
 
 fn diff_req(path: &str, spec: DiffSpec) -> DiffRequest {
@@ -549,11 +549,13 @@ async fn commit_files_lists_what_a_commit_changed() {
     let sha = repo.commit_all("changes");
     let engine = opened(&repo).await;
 
-    let files = engine
+    let changed = engine
         .commit_files(&repo.root, &sha, OpOptions::default())
         .await
         .unwrap();
-    let summary: Vec<(String, Option<String>, StatusLetter)> = files
+    assert!(!changed.truncated);
+    let summary: Vec<(String, Option<String>, StatusLetter)> = changed
+        .files
         .iter()
         .map(|f| (f.path.clone(), f.orig_path.clone(), f.status))
         .collect();
@@ -574,12 +576,68 @@ async fn commit_files_lists_what_a_commit_changed() {
         .commit_files(&repo.root, &root, OpOptions::default())
         .await
         .unwrap();
-    assert!(first.iter().all(|f| f.status == StatusLetter::Added));
-    assert_eq!(first.len(), 3, "directories are not listed");
+    assert!(first.files.iter().all(|f| f.status == StatusLetter::Added));
+    assert_eq!(first.files.len(), 3, "directories are not listed");
+    assert!(!first.truncated);
     let bad = engine
         .commit_files(&repo.root, "-o", OpOptions::default())
         .await;
     assert_eq!(bad.unwrap_err().code(), "EINVAL");
+}
+
+// §14.3: `truncated` says when the cap cut the list — exactly the cap is
+// the whole list, one more is not.
+#[tokio::test]
+async fn commit_files_says_when_the_cap_cut_the_list() {
+    require_git!();
+    let repo = Repo::init();
+    repo.write("seed.ts", "seed\n");
+    repo.commit_all("seed");
+    // Plumbing, not ten thousand files on disk: one blob, a flat tree naming
+    // it `n` times, and a parentless commit of that tree (every entry an
+    // addition against the empty tree).
+    let blob = common::git_stdin(&repo.root, &["hash-object", "-w", "--stdin"], "x\n");
+    let blob = blob.trim();
+    let root_commit_of = |n: usize| -> String {
+        let listing: String = (0..n)
+            .map(|i| format!("100644 blob {blob}\tf{i:05}.txt\n"))
+            .collect();
+        let tree = common::git_stdin(&repo.root, &["mktree"], &listing);
+        let message = format!("{n} files");
+        common::git_stdin(
+            &repo.root,
+            &["commit-tree", tree.trim(), "-m", &message],
+            "",
+        )
+        .trim()
+        .to_owned()
+    };
+    let at_cap = root_commit_of(COMMIT_FILES_CAP);
+    let over_cap = root_commit_of(COMMIT_FILES_CAP + 1);
+    let engine = opened(&repo).await;
+
+    let whole = engine
+        .commit_files(&repo.root, &at_cap, OpOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(whole.files.len(), COMMIT_FILES_CAP);
+    assert!(!whole.truncated, "exactly the cap is the whole list");
+
+    let cut = engine
+        .commit_files(&repo.root, &over_cap, OpOptions::default())
+        .await
+        .unwrap();
+    assert!(cut.truncated, "one file over the cap must say so");
+    assert_eq!(cut.files.len(), COMMIT_FILES_CAP);
+    // The first COMMIT_FILES_CAP by path; the last name is the one left out.
+    assert_eq!(cut.files[0].path, "f00000.txt");
+    assert_eq!(
+        cut.files[COMMIT_FILES_CAP - 1].path,
+        format!("f{:05}.txt", COMMIT_FILES_CAP - 1)
+    );
+    let json = serde_json::to_value(&cut).unwrap();
+    assert_eq!(json["truncated"], serde_json::Value::Bool(true));
+    assert_eq!(json["files"].as_array().unwrap().len(), COMMIT_FILES_CAP);
 }
 
 #[tokio::test]

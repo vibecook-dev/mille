@@ -59,6 +59,15 @@ export function git(cwd, ...args) {
   return result.stdout;
 }
 
+/** `git` with `input` on stdin (`mktree`, `hash-object --stdin`). */
+export function gitStdin(cwd, args, input) {
+  const result = spawnSync('git', args, { cwd, encoding: 'utf8', env: GIT_ENV, input });
+  if (result.status !== 0) {
+    throw new Error(`git ${args.join(' ')} failed in ${cwd}: ${result.stderr}`);
+  }
+  return result.stdout;
+}
+
 /** A realpath'd temp directory (macOS `/var` → `/private/var`). */
 export function tempDir(prefix = 'mille-git-') {
   return realpathSync(mkdtempSync(join(tmpdir(), prefix)));
