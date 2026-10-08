@@ -11,7 +11,7 @@
 
 import { test } from 'node:test';
 import { strict as assert } from 'node:assert';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -153,6 +153,41 @@ test(
         await fx.prefetch(rootId, { depth: 3 });
         return fx.getSnapshot().directoryChildrenLoaded(top.slow);
       });
+    } finally {
+      probe.__readProbeReset();
+      await fx.dispose();
+      removeTempDir(root);
+    }
+  },
+);
+
+test(
+  'a recursive resync keeps the known children of a folder whose read stalls',
+  { skip },
+  async () => {
+    probe.__readProbeReset();
+    const root = fixture();
+    const fx = new FileExplorer({ roots: [root], readTimeoutMs: 300 });
+    try {
+      const { rootId, ids } = await open(fx, root);
+      await fx.list(ids.slow);
+      const known = () => {
+        const snapshot = fx.getSnapshot();
+        return snapshot
+          .childrenOf(ids.slow)
+          .map((id) => snapshot.getById(id).name)
+          .sort();
+      };
+      assert.deepEqual(known(), ['inside.txt', 'sub']);
+
+      // The authoritative pass cannot read `slow`. Unknown is not empty: its
+      // children stay, while a real deletion elsewhere is still applied.
+      probe.__readProbePark(join(root, 'slow'), 'list');
+      rmSync(join(root, 'fast', 'a.txt'));
+      await fx.resync(rootId, { recursive: true });
+      assert.deepEqual(known(), ['inside.txt', 'sub']);
+      const snapshot = fx.getSnapshot();
+      assert.deepEqual(snapshot.childrenOf(ids.fast), []);
     } finally {
       probe.__readProbeReset();
       await fx.dispose();
