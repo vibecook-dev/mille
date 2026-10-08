@@ -17,6 +17,10 @@ pub use entry::{Capability, Entry, EntryId, EntryKind};
 pub mod fs;
 pub use fs::{DirEntry, Fs, FsMetadata, InMemoryFs, RealFs};
 
+// M8 — persistent id-keyed maps behind the snapshot's O(1) clone.
+pub mod id_map;
+pub use id_map::{IdMap, IdSet};
+
 // TODO: Phase 1–2 — EntryStore (sum-tree, id allocator, path index)
 pub mod store;
 pub use store::EntryStore;

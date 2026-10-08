@@ -383,8 +383,8 @@ where
 }
 
 /// Convert a walked entry set into `Entry` records and push them into
-/// `EntryStore`, resolving each entry's `parent_id` from a path-indexed map
-/// built during the insertion pass.
+/// `EntryStore`, resolving each entry's `parent_id` from the store's path
+/// index, one published batch per depth level.
 ///
 /// Internally topo-sorts by (depth asc, path asc) before insertion so that
 /// parents are always processed before their children, regardless of walker
@@ -392,9 +392,11 @@ where
 /// `Parallelism::RayonNewPool(n)` does not — without this sort, children
 /// whose parent had not yet been seen would silently become spurious roots.
 ///
-/// Returns the list of allocated EntryIds in insertion order. Phase 2.4
-/// coalescer: later phases may extend this to stream via a channel rather
-/// than materialize the full Vec first.
+/// Returns the id of every walked entry, level by level: a path the store
+/// already indexed keeps its id (insertion is idempotent by path) and is
+/// listed first within its level, followed by the ids allocated for the
+/// level in insertion order. Phase 2.4 coalescer: later phases may extend
+/// this to stream via a channel rather than materialize the full Vec first.
 pub fn populate_store(
     store: &crate::store::EntryStore,
     root: &Path,
@@ -415,64 +417,77 @@ pub fn populate_store_with_provenance(
     excludes: Option<&crate::ignore::IgnoreMatcher>,
 ) -> Result<Vec<crate::entry::EntryId>, FxError> {
     use crate::entry::{Entry, EntryId, EntryKind};
-    use std::collections::HashMap;
 
-    let mut path_to_id: HashMap<PathBuf, EntryId> = HashMap::with_capacity(walked.len());
     let mut ids = Vec::with_capacity(walked.len());
 
     // Topo-sort by (depth asc, path asc). Walker output under
     // Parallelism::RayonNewPool(n) does not guarantee parent-before-child
     // order; without this sort, children whose parent hadn't been inserted
-    // would look up None in `path_to_id` and attach as spurious roots.
+    // would look up None in the path index and attach as spurious roots.
     let mut ordered: Vec<&WalkedEntry> = walked.iter().collect();
     ordered.sort_by(|a, b| a.depth.cmp(&b.depth).then_with(|| a.path.cmp(&b.path)));
 
-    for w in ordered {
-        // Look in the current-walk map first, then fall back to the
-        // store's path index. The fallback matters for subsequent
-        // `populate_from_path` calls (lazy `prefetch` in v0.2 B2):
-        // the new walk's `path_to_id` starts empty, so children whose
-        // parent was inserted by a prior walk would otherwise get
-        // `parent_id = None` and appear as spurious roots.
-        let parent_id = match &w.parent_path {
-            None => None,
-            Some(pp) => path_to_id
-                .get(pp)
-                .copied()
-                .or_else(|| store.get_by_path(pp).map(|e| e.id)),
-        };
+    // Suppress unused-variable warning on non-ignore paths.
+    let _ = root;
 
-        // Suppress unused-variable warning on non-ignore paths.
-        let _ = root;
+    // Publish one batch per depth level rather than one snapshot per entry
+    // (M8). Every parent of a level sits in an earlier level or was already
+    // in the store, so by the time a level is built its parents are
+    // published and the store's path index resolves them — including parents
+    // inserted by a prior walk (lazy `prefetch` in v0.2 B2), which would
+    // otherwise get `parent_id = None` and appear as spurious roots. A tree
+    // costs one publication per level, and each sibling list is merged once
+    // per level instead of re-inserted per child.
+    for level in ordered.chunk_by(|a, b| a.depth == b.depth) {
+        let batch: Vec<(PathBuf, Entry)> = level
+            .iter()
+            .filter(|w| match store.get_by_path(&w.path) {
+                Some(existing) => {
+                    ids.push(existing.id);
+                    false
+                }
+                None => true,
+            })
+            .map(|w| {
+                let parent_id = w
+                    .parent_path
+                    .as_ref()
+                    .and_then(|pp| store.get_by_path(pp))
+                    .map(|parent| parent.id);
 
-        let is_dir_like = w.kind == EntryKind::Directory || w.symlink_target_is_dir == Some(true);
-        let is_ignored = match repository_ignore {
-            Some(m) => m.is_ignored(&w.path, is_dir_like),
-            None => false,
-        };
-        let is_excluded = match excludes {
-            Some(m) => m.is_ignored(&w.path, is_dir_like),
-            None => false,
-        };
+                let is_dir_like =
+                    w.kind == EntryKind::Directory || w.symlink_target_is_dir == Some(true);
+                let is_ignored = match repository_ignore {
+                    Some(m) => m.is_ignored(&w.path, is_dir_like),
+                    None => false,
+                };
+                let is_excluded = match excludes {
+                    Some(m) => m.is_ignored(&w.path, is_dir_like),
+                    None => false,
+                };
 
-        let entry = Entry {
-            id: EntryId(0),
-            parent_id,
-            name: w.name.clone(),
-            kind: w.kind,
-            size: w.size,
-            mtime_ms: w.mtime_ms,
-            ctime_ms: w.ctime_ms,
-            symlink_target_is_dir: w.symlink_target_is_dir,
-            path_segments: None,
-            is_ignored,
-            is_excluded,
-            is_readonly: w.is_readonly,
-            is_hidden: w.is_hidden,
-        };
-        let id = store.insert(w.path.clone(), entry)?;
-        path_to_id.insert(w.path.clone(), id);
-        ids.push(id);
+                let entry = Entry {
+                    id: EntryId(0),
+                    parent_id,
+                    name: w.name.clone(),
+                    kind: w.kind,
+                    size: w.size,
+                    mtime_ms: w.mtime_ms,
+                    ctime_ms: w.ctime_ms,
+                    symlink_target_is_dir: w.symlink_target_is_dir,
+                    path_segments: None,
+                    is_ignored,
+                    is_excluded,
+                    is_readonly: w.is_readonly,
+                    is_hidden: w.is_hidden,
+                };
+                (w.path.clone(), entry)
+            })
+            .collect();
+        // A path indexed between the filter above and this publication (URI
+        // resolution does not take the caller's policy gate) is skipped by
+        // `insert_batch`: it keeps the id it was given there, unlisted here.
+        ids.extend(store.insert_batch(batch)?);
     }
 
     Ok(ids)

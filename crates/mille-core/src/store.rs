@@ -15,6 +15,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
+use smallvec::SmallVec;
 
 use crate::changes::ChangeSet;
 use crate::entry::{Entry, EntryId, EntryKind};
@@ -439,12 +440,41 @@ impl EntryStore {
     /// Snapshot the path index below `root`. The returned paths include
     /// `root` itself when it is known. Watch reconciliation uses this to
     /// compare a bounded disk walk with the authoritative in-memory view.
+    ///
+    /// Costs O(known subtree), not O(store): it follows the snapshot's child
+    /// lists down from `root`'s entry instead of scanning the whole path
+    /// index. Reconciliation runs once per listed folder, so the scan made
+    /// hydrating a tree folder by folder quadratic (M8). The two agree because
+    /// every indexed path below a known directory belongs to one of its
+    /// descendants: insertion resolves a parent from the path, a rename moves
+    /// the whole indexed prefix with its entry, and directories leave through
+    /// `remove_subtree`. The one exception is a single-entry `remove` of a
+    /// directory whose children are known: it strands them in the path index
+    /// with no parent in the tree, where only the scan could still see them.
+    /// A root that is not indexed has no child lists to follow, so the scan
+    /// still answers for it.
     pub fn paths_under(&self, root: &Path) -> Vec<(PathBuf, EntryId)> {
-        self.path_to_id
-            .iter()
-            .filter(|kv| kv.key().as_ref() == root || kv.key().starts_with(root))
-            .map(|kv| (kv.key().to_path_buf(), *kv.value()))
-            .collect()
+        // Bind the id first: the shard guard must be gone before the
+        // fallback scan takes read locks on every shard.
+        let root_id = self.path_to_id.get(root).map(|id| *id.value());
+        let Some(root_id) = root_id else {
+            return self
+                .path_to_id
+                .iter()
+                .filter(|kv| kv.key().starts_with(root))
+                .map(|kv| (kv.key().to_path_buf(), *kv.value()))
+                .collect();
+        };
+        let snapshot = self.inner.load();
+        let mut out = Vec::new();
+        let mut stack = vec![root_id];
+        while let Some(id) = stack.pop() {
+            if let Some(path) = self.id_to_path.get(&id) {
+                out.push((path.value().to_path_buf(), id));
+            }
+            stack.extend_from_slice(snapshot.children_of(id));
+        }
+        out
     }
 
     /// Replace one entry record while preserving its id and tree position.
@@ -518,7 +548,11 @@ impl EntryStore {
                 && existing.mtime_ms != next.entries[&id].mtime_ms)
         {
             if let Some(parent_id) = existing.parent_id {
-                let mut siblings = next.children.remove(&parent_id).unwrap_or_default();
+                let mut siblings = next
+                    .children
+                    .remove(&parent_id)
+                    .map(Arc::unwrap_or_clone)
+                    .unwrap_or_default();
                 siblings.sort_by(|a, b| {
                     let ae = next.entries.get(a);
                     let be = next.entries.get(b);
@@ -527,7 +561,7 @@ impl EntryStore {
                         _ => a.cmp(b),
                     }
                 });
-                next.children.insert(parent_id, siblings);
+                next.children.insert(parent_id, Arc::new(siblings));
             }
         }
 
@@ -566,7 +600,7 @@ impl EntryStore {
         match parent {
             None => next.roots.push(id),
             Some(parent_id) => {
-                let siblings = next.children.entry(parent_id).or_default();
+                let siblings = Arc::make_mut(next.children.entry(parent_id).or_default());
                 // IDE-style order: directories first, then files, each group
                 // A→Z by name (JetBrains / VS Code Project view).
                 let pos = siblings
@@ -644,9 +678,10 @@ impl EntryStore {
     }
 
     /// Insert a bounded batch while cloning and publishing the immutable
-    /// snapshot only once. This is the progressive-listing hot path: calling
-    /// `insert` for every child of a 100k-entry folder would repeatedly clone
-    /// an ever-growing map and become quadratic.
+    /// snapshot only once. This is the progressive-listing hot path, and
+    /// `populate_store` publishes each depth level of a walk through it:
+    /// calling `insert` for every child of a 100k-entry folder publishes 100k
+    /// snapshots and re-inserts into one sibling list 100k times.
     ///
     /// Entries whose paths are already indexed are skipped. Parents must
     /// already exist in the published snapshot; directory-page batches only
@@ -767,7 +802,8 @@ impl EntryStore {
             }
             merged.extend_from_slice(&siblings[old_index..]);
             merged.extend_from_slice(&incoming[new_index..]);
-            next.children.insert(*parent_id, merged.into());
+            next.children
+                .insert(*parent_id, Arc::new(SmallVec::from_vec(merged)));
         }
 
         let prev_tree_version = next.tree_version;
@@ -826,7 +862,7 @@ impl EntryStore {
             Some(parent_id) => {
                 if let Some(siblings) = next.children.get_mut(&parent_id) {
                     if let Some(pos) = siblings.iter().position(|&c| c == id) {
-                        siblings.remove(pos);
+                        Arc::make_mut(siblings).remove(pos);
                     }
                 }
                 if let Some(count) = next.direct_child_counts.get_mut(&parent_id) {
@@ -941,7 +977,7 @@ impl EntryStore {
         }
         if let Some(parent_id) = parent_for_walk {
             if let Some(siblings) = next.children.get_mut(&parent_id) {
-                siblings.retain(|child| *child != id);
+                Arc::make_mut(siblings).retain(|child| *child != id);
             }
             if let Some(count) = next.direct_child_counts.get_mut(&parent_id) {
                 *count = count.saturating_sub(1);
@@ -1119,13 +1155,17 @@ impl EntryStore {
             let new_parent_id = new_parent_id.expect("reparent destination has a parent id");
             if let Some(old_parent_id) = old_parent_id {
                 if let Some(siblings) = next.children.get_mut(&old_parent_id) {
-                    siblings.retain(|child| *child != id);
+                    Arc::make_mut(siblings).retain(|child| *child != id);
                 }
                 if let Some(count) = next.direct_child_counts.get_mut(&old_parent_id) {
                     *count = count.saturating_sub(1);
                 }
             }
-            let mut siblings = next.children.remove(&new_parent_id).unwrap_or_default();
+            let mut siblings = next
+                .children
+                .remove(&new_parent_id)
+                .map(Arc::unwrap_or_clone)
+                .unwrap_or_default();
             let insert_pos = siblings
                 .binary_search_by(|&sibling| {
                     let sibling_entry = next.entries.get(&sibling);
@@ -1138,7 +1178,7 @@ impl EntryStore {
                 })
                 .unwrap_or_else(|position| position);
             siblings.insert(insert_pos, id);
-            next.children.insert(new_parent_id, siblings);
+            next.children.insert(new_parent_id, Arc::new(siblings));
             *next.direct_child_counts.entry(new_parent_id).or_insert(0) += 1;
 
             let visible = current
@@ -1180,6 +1220,7 @@ impl EntryStore {
         } else if let Some(parent_id) = old_parent_id {
             // Same-parent rename: re-sort in place.
             if let Some(siblings) = next.children.get_mut(&parent_id) {
+                let siblings = Arc::make_mut(siblings);
                 if let Some(pos) = siblings.iter().position(|&c| c == id) {
                     siblings.remove(pos);
                 }
@@ -1347,24 +1388,24 @@ impl EntryStore {
         next.file_nesting = file_nesting;
 
         let entries = &next.entries;
-        for siblings in next.children.values_mut() {
-            siblings.sort_by(
-                |left, right| match (entries.get(left), entries.get(right)) {
+        next.children.for_each_value_mut(|siblings| {
+            Arc::make_mut(siblings).sort_by(|left, right| {
+                match (entries.get(left), entries.get(right)) {
                     (Some(left), Some(right)) => sibling_order.compare(left, right),
                     _ => left.cmp(right),
-                },
-            );
-        }
+                }
+            });
+        });
 
         next.descendant_visible_counts.clear();
         for (id, entry) in &next.entries {
             next.descendant_visible_counts
-                .insert(*id, visibility.includes(entry) as u32);
+                .insert(id, visibility.includes(entry) as u32);
         }
         let visible_ids: Vec<EntryId> = next
             .entries
             .iter()
-            .filter_map(|(id, entry)| visibility.includes(entry).then_some(*id))
+            .filter_map(|(id, entry)| visibility.includes(entry).then_some(id))
             .collect();
         for id in visible_ids {
             let mut cursor = next.entries.get(&id).and_then(|entry| entry.parent_id);
@@ -1385,7 +1426,7 @@ impl EntryStore {
         let prev_tree_version = next.tree_version;
         next.tree_version += 1;
         let new_tree_version = next.tree_version;
-        let changed_parents: Vec<EntryId> = next.children.keys().copied().collect();
+        let changed_parents: Vec<EntryId> = next.children.keys().collect();
         let changed_roots: Vec<EntryId> = next.roots.iter().copied().collect();
         *self.sibling_order.write() = sibling_order;
         *self.visibility.write() = visibility;
@@ -2463,5 +2504,134 @@ mod tests {
         assert!(cs.changed_ids.contains(&dir_id));
         assert!(cs.changed_ids.contains(&leaf_id));
         assert!(cs.child_set_changed.contains(&root));
+    }
+
+    /// What `paths_under` answered before M8: a scan of the whole path index.
+    fn paths_under_by_scan(s: &EntryStore, root: &Path) -> Vec<(PathBuf, EntryId)> {
+        let mut paths: Vec<_> = s
+            .path_to_id
+            .iter()
+            .filter(|kv| kv.key().starts_with(root))
+            .map(|kv| (kv.key().to_path_buf(), *kv.value()))
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn paths_under_walks_the_known_subtree_and_agrees_with_an_index_scan() {
+        let s = EntryStore::new();
+        let r = s.insert(abs("r"), dir("r", None)).unwrap();
+        let a = s.insert(abs("r/a"), dir("a", Some(r))).unwrap();
+        let b = s.insert(abs("r/a/b"), dir("b", Some(a))).unwrap();
+        s.insert(abs("r/a/x.txt"), leaf("x.txt", Some(a))).unwrap();
+        s.insert(abs("r/a/b/y.txt"), leaf("y.txt", Some(b)))
+            .unwrap();
+        // A sibling whose name extends `a`: under `r`, never under `r/a`.
+        let ab = s.insert(abs("r/ab"), dir("ab", Some(r))).unwrap();
+        s.insert(abs("r/ab/z.txt"), leaf("z.txt", Some(ab)))
+            .unwrap();
+        let gone = s.insert(abs("r/gone"), dir("gone", Some(r))).unwrap();
+        s.insert(abs("r/gone/w.txt"), leaf("w.txt", Some(gone)))
+            .unwrap();
+        let other = s.insert(abs("q"), dir("q", None)).unwrap();
+        s.insert(abs("q/v.txt"), leaf("v.txt", Some(other)))
+            .unwrap();
+
+        // Every mutation that moves or drops indexed prefixes.
+        s.rename(b, abs("r/ab/b")).unwrap();
+        s.rename(a, abs("r/a2")).unwrap();
+        s.remove_subtree(gone);
+
+        let known = [
+            "r",
+            "r/a2",
+            "r/ab",
+            "r/ab/b",
+            "r/a2/x.txt",
+            "q",
+            "r/a",
+            "r/gone",
+            "missing",
+        ];
+        for relative in known {
+            let root = abs(relative);
+            let mut walked = s.paths_under(&root);
+            walked.sort();
+            assert_eq!(walked, paths_under_by_scan(&s, &root), "{relative}");
+        }
+        let mut under_ab: Vec<PathBuf> = s
+            .paths_under(&abs("r/ab"))
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        under_ab.sort();
+        assert_eq!(
+            under_ab,
+            vec![
+                abs("r/ab"),
+                abs("r/ab/b"),
+                abs("r/ab/b/y.txt"),
+                abs("r/ab/z.txt")
+            ]
+        );
+    }
+
+    #[test]
+    fn retained_snapshots_survive_every_kind_of_publication_unchanged() {
+        let s = EntryStore::new();
+        let root = s.insert(abs("r"), dir("r", None)).unwrap();
+        let folder = s.insert(abs("r/f"), dir("f", Some(root))).unwrap();
+        let batch: Vec<(PathBuf, Entry)> = (0..200)
+            .map(|index| {
+                let name = format!("file-{index:03}.txt");
+                (
+                    abs(&format!("r/f/{name}")),
+                    file_with_size(&name, Some(folder), 1),
+                )
+            })
+            .collect();
+        s.insert_batch(batch).unwrap();
+        s.mark_directory_children_loaded(folder).unwrap();
+        let before = s.snapshot();
+        let rows_of = |snapshot: &StoreSnapshot| -> Vec<(EntryId, String, usize, u64, u32, bool)> {
+            snapshot
+                .entries_iter()
+                .map(|(id, entry)| {
+                    (
+                        id,
+                        entry.name.clone(),
+                        snapshot.children_of(id).len(),
+                        snapshot.subtree_total_size(id),
+                        snapshot.subtree_visible_count(id),
+                        snapshot.directory_children_loaded(id),
+                    )
+                })
+                .collect()
+        };
+        let expected = rows_of(&before);
+        let expected_children = before.children_of(folder).to_vec();
+
+        let renamed = before.children_of(folder)[7];
+        s.rename(renamed, abs("r/f/aaa.txt")).unwrap();
+        let moved = s.insert(abs("r/m"), dir("m", Some(root))).unwrap();
+        s.rename(before.children_of(folder)[9], abs("r/m/moved.txt"))
+            .unwrap();
+        s.remove(before.children_of(folder)[11]);
+        s.remove_subtree(moved);
+        let mut grown = (*s.get_by_id(before.children_of(folder)[13]).unwrap()).clone();
+        grown.size = 99;
+        s.update(grown.id, grown).unwrap();
+        s.reconfigure_projection(
+            SiblingOrder::default(),
+            VisibilityPolicy::project_view(),
+            true,
+            FileNestingPolicy::default(),
+        );
+        s.mark_root_unavailable(root).unwrap();
+
+        assert_eq!(rows_of(&before), expected);
+        assert_eq!(before.children_of(folder), expected_children.as_slice());
+        assert_ne!(rows_of(&s.snapshot()), expected);
     }
 }
