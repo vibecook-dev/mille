@@ -28,7 +28,9 @@ use std::cell::Cell;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use mille_core::{populate_store, Entry, EntryId, EntryKind, EntryStore, WalkedEntry};
+use mille_core::{
+    populate_store, Entry, EntryId, EntryKind, EntryStore, IgnoreMatcher, WalkedEntry,
+};
 
 /// Counts the bytes each thread allocates, so tests running in parallel do
 /// not see each other's allocations.
@@ -224,6 +226,22 @@ fn hydrate_by_populate(walk: &[WalkedEntry]) -> usize {
     store.snapshot().entry_count()
 }
 
+/// `populate_store` under a repository-ignore matcher holding one rule file
+/// per top-level folder — a home folder of projects, each with its own
+/// `.gitignore`, so the number of ignore files grows with the tree.
+fn hydrate_by_populate_with_ignores(walk: &[WalkedEntry]) -> usize {
+    let mut ignore = IgnoreMatcher::new();
+    ignore
+        .add_from_string(&walk[0].path, "*.log\nbuild/\n")
+        .unwrap();
+    for project in walk.iter().filter(|item| item.depth == 1) {
+        ignore.add_from_string(&project.path, "*.tmp\n").unwrap();
+    }
+    let store = EntryStore::new();
+    populate_store(&store, &walk[0].path, walk, Some(&ignore)).unwrap();
+    store.snapshot().entry_count()
+}
+
 fn hydrate_by_entry(walk: &[WalkedEntry]) -> usize {
     let store = EntryStore::new();
     for item in walk {
@@ -305,6 +323,12 @@ fn per_folder_hydration_is_linear() {
 fn populate_hydration_is_linear() {
     assert_linear_bytes("populate", hydrate_by_populate);
     assert_linear_time("populate", hydrate_by_populate);
+}
+
+#[test]
+fn populate_hydration_under_per_project_ignores_is_linear() {
+    assert_linear_bytes("populate+ignores", hydrate_by_populate_with_ignores);
+    assert_linear_time("populate+ignores", hydrate_by_populate_with_ignores);
 }
 
 #[test]
