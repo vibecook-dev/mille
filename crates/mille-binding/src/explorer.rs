@@ -51,6 +51,8 @@ fn entry_from_walked(walked: &mille_core::WalkedEntry, parent_id: Option<EntryId
 /// entries only—their children were not read—and ignored/excluded descendants
 /// may have had traversal pruned. The walk root is the exception: expanding an
 /// ignored folder explicitly is allowed and does read its direct children.
+/// A directory whose read did not answer (M10: timed out, stuck, dataless)
+/// is never complete, whatever its depth.
 fn mark_walked_directory_listings(
     store: &EntryStore,
     walked: &[mille_core::WalkedEntry],
@@ -58,9 +60,11 @@ fn mark_walked_directory_listings(
     max_depth: Option<usize>,
     repository_ignore: Option<&mille_core::IgnoreMatcher>,
     excludes: Option<&mille_core::IgnoreMatcher>,
+    unread: &[mille_core::UnreadDirectory],
 ) -> std::result::Result<Vec<EntryId>, FxError> {
     let ids: Vec<EntryId> = walked
         .iter()
+        .filter(|entry| !unread.iter().any(|dir| dir.path == entry.path))
         .filter(|entry| {
             let directory_like =
                 entry.kind == EntryKind::Directory || entry.symlink_target_is_dir == Some(true);
@@ -151,6 +155,13 @@ pub struct ExplorerOptionsJs {
     pub show_hidden_files: Option<bool>,
     pub show_ignored_files: Option<bool>,
     pub file_nesting_rules: Option<Vec<FileNestingRuleJs>>,
+    /// Stall deadline for one native read, in ms (M10). Default 2000.
+    pub read_timeout_ms: Option<u32>,
+    /// Reads allowed past their deadline before new reads are refused.
+    /// Default 16.
+    pub max_stuck_reads: Option<u32>,
+    /// Let listings download cloud-evicted (dataless) folders. Default false.
+    pub materialize_dataless: Option<bool>,
 }
 
 /// Resolved form of ExplorerOptionsJs with defaults applied.
@@ -210,6 +221,11 @@ pub struct FileExplorer {
     pub(crate) operations: Arc<parking_lot::Mutex<HashMap<String, CancellationToken>>>,
     /// Undo stack for create / rename / move / soft-delete.
     pub(crate) journal: Arc<parking_lot::Mutex<OperationJournal>>,
+    /// Every directory listing and `stat` that list / expand / walk /
+    /// prefetch / reveal make goes through this pool (M10): a read stuck in
+    /// the kernel answers ETIMEDOUT for its directory after the stall
+    /// deadline instead of holding `policy_gate` and the engine with it.
+    pub(crate) reads: mille_core::ReadBoundary,
 }
 
 #[napi]
@@ -277,6 +293,19 @@ impl FileExplorer {
             show_hidden_files: options.show_hidden_files.unwrap_or(true),
             show_ignored_files: options.show_ignored_files.unwrap_or(true),
         };
+        let reads = mille_core::ReadBoundary::new(mille_core::ReadBoundaryOptions {
+            timeout: options
+                .read_timeout_ms
+                .map(|ms| std::time::Duration::from_millis(u64::from(ms)))
+                .unwrap_or(mille_core::read_boundary::DEFAULT_READ_TIMEOUT),
+            max_stuck: options
+                .max_stuck_reads
+                .map(|n| n as usize)
+                .unwrap_or(mille_core::read_boundary::DEFAULT_MAX_STUCK_READS),
+            concurrency: resolved.walker_concurrency.max(1),
+            materialize_dataless: options.materialize_dataless.unwrap_or(false),
+            hook: crate::read_probe::hook(),
+        });
 
         Ok(Self {
             store: Arc::new(EntryStore::with_projection_settings(
@@ -295,6 +324,7 @@ impl FileExplorer {
             events: Arc::new(EventBus::new()),
             operations: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             journal: Arc::new(parking_lot::Mutex::new(OperationJournal::new())),
+            reads,
         })
     }
 
@@ -421,10 +451,14 @@ impl FileExplorer {
                 return Ok(Some(entry.id.raw() as i64));
             }
 
-            match tokio::fs::symlink_metadata(&candidate).await {
+            match self.reads.stat(&candidate, false) {
                 Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(fx_error_to_napi(io_to_fx(error, candidate))),
+                Err(mille_core::ReadFailure::Io(error))
+                    if error.to_io_error().kind() == std::io::ErrorKind::NotFound =>
+                {
+                    continue
+                }
+                Err(failure) => return Err(fx_error_to_napi(failure.into_fx(&candidate))),
             }
 
             let mut current = root.clone();
@@ -444,8 +478,7 @@ impl FileExplorer {
             let root_id = match self.store.get_by_path(&root) {
                 Some(entry) => entry.id,
                 None => {
-                    let entry = stat_to_entry(&root, None, root_name)
-                        .await
+                    let entry = crate::mutations::stat_entry(&self.reads, &root, None, root_name)
                         .map_err(fx_error_to_napi)?;
                     self.store
                         .insert(root.clone(), entry)
@@ -465,10 +498,13 @@ impl FileExplorer {
                 let id = match self.store.get_by_path(&current) {
                     Some(entry) => entry.id,
                     None => {
-                        let entry =
-                            stat_to_entry(&current, parent_id, name.to_string_lossy().into_owned())
-                                .await
-                                .map_err(fx_error_to_napi)?;
+                        let entry = crate::mutations::stat_entry(
+                            &self.reads,
+                            &current,
+                            parent_id,
+                            name.to_string_lossy().into_owned(),
+                        )
+                        .map_err(fx_error_to_napi)?;
                         self.store
                             .insert(current.clone(), entry)
                             .map_err(fx_error_to_napi)
@@ -529,7 +565,7 @@ impl FileExplorer {
     #[napi(js_name = "populateFromRoots", catch_unwind)]
     pub async fn populate_from_roots(&self) -> Result<u32> {
         use mille_core::{
-            populate_store_with_provenance, walk, walk_with_ignore, IgnoreMatcher, WalkOptions,
+            populate_store_with_provenance, walk_bounded, IgnoreMatcher, WalkOptions,
         };
 
         self.ensure_watcher()?;
@@ -559,45 +595,40 @@ impl FileExplorer {
                     let mut repository_ignore = IgnoreMatcher::new();
                     let mut excludes = IgnoreMatcher::new();
                     if self.options.respect_ignore {
-                        for name in mille_core::IGNORE_FILE_NAMES {
-                            let candidate = root.join(name);
-                            if candidate.is_file() {
-                                let _ = traversal.add_from_file(&candidate);
-                                let _ = repository_ignore.add_from_file(&candidate);
-                            }
-                        }
+                        crate::bounded::seed_ignore_files(
+                            &self.reads,
+                            root,
+                            &mut [&mut traversal, &mut repository_ignore],
+                        )?;
                     }
                     add_exclude_globs(&mut traversal, root, &exclude_globs)?;
                     add_exclude_globs(&mut excludes, root, &exclude_globs)?;
-                    let w = walk_with_ignore(root, options, &traversal)?;
+                    let report = walk_bounded(root, options, Some(&traversal), &self.reads)?;
                     if self.options.respect_ignore {
-                        for entry in &w {
-                            if entry.path.file_name().is_some_and(|name| {
-                                mille_core::IGNORE_FILE_NAMES
-                                    .contains(&name.to_string_lossy().as_ref())
-                            }) {
-                                let _ = repository_ignore.add_from_file(&entry.path);
-                            }
+                        // The walk already read every ignore file it emitted.
+                        for (path, contents) in &report.ignore_files {
+                            let _ = repository_ignore.add_from_contents(path, contents);
                         }
                     }
                     Ok((
-                        w,
+                        report,
                         self.options.respect_ignore.then_some(repository_ignore),
                         (!exclude_globs.is_empty()).then_some(excludes),
                     ))
                 } else {
-                    Ok((walk(root, options)?, None, None))
+                    Ok((walk_bounded(root, options, None, &self.reads)?, None, None))
                 }
             })();
-            let (walked, repository_ignore, excludes) = match walk_result {
+            let (report, repository_ignore, excludes) = match walk_result {
                 Ok(result) => result,
                 Err(error) if matches!(&error, FxError::Io { .. }) => {
-                    self.mark_configured_root_unavailable(root)
+                    self.root_read_failed(root, &error)
                         .map_err(fx_error_to_napi)?;
                     continue;
                 }
                 Err(error) => return Err(fx_error_to_napi(error)),
             };
+            let walked = report.entries;
             if let Some(walked_root) = walked.iter().find(|entry| entry.path == *root) {
                 if let Some(existing) = self.store.get_by_path(root) {
                     if existing.kind == EntryKind::Unavailable {
@@ -634,6 +665,7 @@ impl FileExplorer {
                 None,
                 repository_ignore.as_ref(),
                 excludes.as_ref(),
+                &report.unread,
             )
             .map_err(fx_error_to_napi)?;
             total = total.saturating_add(ids.len() as u32);
@@ -739,14 +771,14 @@ impl FileExplorer {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| root.to_string_lossy().into_owned());
-            let observation = match stat_to_entry(root, None, name).await {
+            let observation = match crate::mutations::stat_entry(&self.reads, root, None, name) {
                 Ok(entry)
                     if entry.kind == EntryKind::Directory
                         || entry.symlink_target_is_dir == Some(true) =>
                 {
-                    match tokio::fs::read_dir(root).await {
-                        Ok(_) => Ok(entry),
-                        Err(error) => Err(io_to_fx(error, root.clone())),
+                    match self.reads.open_dir(root) {
+                        Ok(()) => Ok(entry),
+                        Err(failure) => Err(failure.into_fx(root)),
                     }
                 }
                 other => other,
@@ -763,6 +795,16 @@ impl FileExplorer {
         let mut became_available = Vec::new();
         for (root, observation) in roots.iter().zip(observed) {
             let existing = self.store.get_by_path(root);
+            // A stat that did not answer says nothing about availability: keep
+            // what the store knows. Only a root it has never seen gets a
+            // placeholder row, below.
+            if existing.is_some()
+                && observation
+                    .as_ref()
+                    .is_err_and(crate::bounded::is_unanswered)
+            {
+                continue;
+            }
             let available = observation.as_ref().is_ok_and(|entry| {
                 entry.kind == EntryKind::Directory || entry.symlink_target_is_dir == Some(true)
             });
@@ -1024,7 +1066,7 @@ impl FileExplorer {
         include_root: Option<bool>,
     ) -> Result<u32> {
         use mille_core::{
-            populate_store_with_provenance, walk, walk_with_ignore, IgnoreMatcher, WalkOptions,
+            populate_store_with_provenance, walk_bounded, IgnoreMatcher, WalkOptions,
         };
 
         self.ensure_watcher()?;
@@ -1080,46 +1122,44 @@ impl FileExplorer {
                     .flat_map(|r| r.iter())
                 {
                     if self.options.respect_ignore {
-                        for name in mille_core::IGNORE_FILE_NAMES {
-                            let candidate = anchor.join(name);
-                            if candidate.is_file() {
-                                let _ = traversal.add_from_file(&candidate);
-                                let _ = repository_ignore.add_from_file(&candidate);
-                            }
-                        }
+                        crate::bounded::seed_ignore_files(
+                            &self.reads,
+                            &anchor,
+                            &mut [&mut traversal, &mut repository_ignore],
+                        )?;
                     }
                     anchor = anchor.join(seg);
                 }
                 if self.options.respect_ignore {
-                    for name in mille_core::IGNORE_FILE_NAMES {
-                        let candidate = p.join(name);
-                        if candidate.is_file() {
-                            let _ = traversal.add_from_file(&candidate);
-                            let _ = repository_ignore.add_from_file(&candidate);
-                        }
-                    }
+                    crate::bounded::seed_ignore_files(
+                        &self.reads,
+                        &p,
+                        &mut [&mut traversal, &mut repository_ignore],
+                    )?;
                 }
-                let w = walk_with_ignore(&p, options, &traversal)?;
+                let report = walk_bounded(&p, options, Some(&traversal), &self.reads)?;
                 if self.options.respect_ignore {
-                    for entry in &w {
-                        if entry.path.file_name().is_some_and(|name| {
-                            mille_core::IGNORE_FILE_NAMES.contains(&name.to_string_lossy().as_ref())
-                        }) {
-                            let _ = repository_ignore.add_from_file(&entry.path);
-                        }
+                    for (path, contents) in &report.ignore_files {
+                        let _ = repository_ignore.add_from_contents(path, contents);
                     }
                 }
                 Ok((
-                    w,
+                    report,
                     self.options.respect_ignore.then_some(repository_ignore),
                     (!exclude_globs.is_empty()).then_some(excludes),
                 ))
             } else {
-                Ok((walk(&p, options)?, None, None))
+                Ok((walk_bounded(&p, options, None, &self.reads)?, None, None))
             }
         })();
-        let (walked, repository_ignore, excludes) = match walk_result {
+        let (report, repository_ignore, excludes) = match walk_result {
             Ok(result) => result,
+            // A read that did not answer is the typed result for THIS
+            // directory (ETIMEDOUT / EDATALESS); the store is left as it was
+            // so a retry can succeed once the folder answers.
+            Err(error) if crate::bounded::is_unanswered(&error) => {
+                return Err(fx_error_to_napi(error));
+            }
             Err(error) if p == root && matches!(&error, FxError::Io { .. }) => {
                 self.mark_configured_root_unavailable(&root)
                     .map_err(fx_error_to_napi)?;
@@ -1127,6 +1167,7 @@ impl FileExplorer {
             }
             Err(error) => return Err(fx_error_to_napi(error)),
         };
+        let walked = report.entries;
         if p == root {
             if let Some(walked_root) = walked.iter().find(|entry| entry.path == root) {
                 if let Some(existing) = self.store.get_by_path(&root) {
@@ -1169,6 +1210,7 @@ impl FileExplorer {
             max_depth.map(|depth| depth as usize),
             repository_ignore.as_ref(),
             excludes.as_ref(),
+            &report.unread,
         )
         .map_err(fx_error_to_napi)?;
         Ok(ids.len() as u32)
@@ -3342,6 +3384,10 @@ impl FileExplorer {
         if self.disposed.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
+        // First, so a watcher batch or expansion waiting on a stuck read
+        // returns ECANCELED now; dropping the watcher below joins its thread.
+        // Helpers still in the kernel exit on their own when it returns.
+        self.reads.close();
         let watcher = match self.watcher.lock() {
             Ok(mut guard) => guard.take(),
             Err(poisoned) => poisoned.into_inner().take(),
@@ -3353,6 +3399,27 @@ impl FileExplorer {
 }
 
 impl FileExplorer {
+    /// Caller holds `policy_gate`. A root whose walk failed becomes
+    /// Unavailable — unless its read only did not answer (M10) and the store
+    /// already holds it: a timeout is not evidence the root is gone, so its
+    /// known tree stays and the failure is reported as a warning instead.
+    fn root_read_failed(
+        &self,
+        root: &std::path::Path,
+        error: &FxError,
+    ) -> std::result::Result<(), FxError> {
+        if crate::bounded::is_unanswered(error) {
+            self.events.emit_warning(WarningPayloadJs {
+                code: error.code().as_str().into(),
+                detail: Some(error.to_string()),
+            });
+            if self.store.get_by_path(root).is_some() {
+                return Ok(());
+            }
+        }
+        self.mark_configured_root_unavailable(root).map(|_| ())
+    }
+
     /// Caller holds `policy_gate`.
     fn mark_configured_root_unavailable(
         &self,
@@ -3453,6 +3520,7 @@ impl FileExplorer {
             follow_symlinks: self.options.follow_symlinks,
             walker_concurrency: self.options.walker_concurrency,
             debounce_ms: self.options.watch_debounce_ms,
+            reads: self.reads.clone(),
         }
     }
 

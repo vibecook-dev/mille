@@ -214,6 +214,12 @@ export interface ExplorerOptions {
   readonly maxCachedEntries?: number;
   /** Initial progressive page size. Later pages grow to amortize large stores. Default: 256. */
   readonly directoryBatchSize?: number;
+  /** Stall deadline for one native read (ms); past it the folder answers ETIMEDOUT. Default: 2000. */
+  readonly readTimeoutMs?: number;
+  /** Reads allowed past their deadline before new reads are refused. Default: 16. */
+  readonly maxStuckReads?: number;
+  /** Let listings download cloud-evicted folders (macOS). Default: false — they answer EDATALESS. */
+  readonly materializeDataless?: boolean;
   /**
    * Phase B2 — initial walk policy. Currently advisory on the
    * `FileExplorer` itself (it never walks at construction time; callers
@@ -556,6 +562,10 @@ export class FileExplorer {
     if (options.snapshotPath !== undefined) nativeOpts.snapshotPath = options.snapshotPath;
     if (options.maxCachedEntries !== undefined)
       nativeOpts.maxCachedEntries = options.maxCachedEntries;
+    if (options.readTimeoutMs !== undefined) nativeOpts.readTimeoutMs = options.readTimeoutMs;
+    if (options.maxStuckReads !== undefined) nativeOpts.maxStuckReads = options.maxStuckReads;
+    if (options.materializeDataless !== undefined)
+      nativeOpts.materializeDataless = options.materializeDataless;
     if (options.settings !== undefined) {
       nativeOpts.sortBy = options.settings.sortBy;
       nativeOpts.caseSensitive = options.settings.caseSensitive;
@@ -724,7 +734,7 @@ export class FileExplorer {
     if (uri.scheme !== 'file') return null;
     const nativeResolve = this.nativeFx.resolvePath;
     if (typeof nativeResolve === 'function') {
-      const id = await nativeResolve.call(this.nativeFx, uri.path);
+      const id = await wrap(nativeResolve.call(this.nativeFx, uri.path));
       if (id === null || id === undefined) return null;
       return (this.nativeFx.getSnapshot().getById(id) as Entry | null) ?? null;
     }
@@ -791,7 +801,9 @@ export class FileExplorer {
   async resolvePath(path: string): Promise<EntryId | null> {
     const nativeResolve = this.nativeFx.resolvePath;
     if (typeof nativeResolve === 'function') {
-      return (await nativeResolve.call(this.nativeFx, path)) ?? null;
+      // Wrapped like every other native call, so a stat that did not answer
+      // (ETIMEDOUT) or failed reaches the caller as a typed FileSystemError.
+      return (await wrap(nativeResolve.call(this.nativeFx, path))) ?? null;
     }
 
     // Compatibility with pre-resolvePath native artifacts.

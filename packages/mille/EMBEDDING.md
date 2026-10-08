@@ -585,6 +585,8 @@ try {
 | `ENOSPC`       | Write failed — disk full.                                                     |
 | `EROFS`        | Write attempted on a read-only filesystem or mount.                           |
 | `EBUSY`        | Resource locked (Windows: file in use by another process).                    |
+| `ETIMEDOUT`    | A native read stalled past `readTimeoutMs`, or one into that folder is stuck. |
+| `EDATALESS`    | Cloud-evicted (dataless) folder, and `materializeDataless` is off.            |
 | `EINVAL`       | Bad arguments (invalid name, wrong kind for op, malformed frame on the wire). |
 | `ECANCELED`    | Operation cancelled — disposed explorer, cancelled stream, closed session.    |
 | `EUNSUPPORTED` | Capability not advertised (e.g. stream read on a provider without `Stream`).  |
@@ -700,6 +702,25 @@ profiling.
   still work; they just take an extra walk. Drop to ~50k for a background
   indexer that only needs shallow metadata.
 - `walkerConcurrency` — defaults to `num_cpus`. Pin lower on shared CI.
+- `readTimeoutMs` — default **2000**. Every listing and stat runs on a small
+  native helper pool, and a read that makes no progress for this long answers
+  `ETIMEDOUT` for its folder (an iCloud folder downloading, a hung network
+  mount). The rest of the tree keeps loading, a repeat request into a stuck
+  folder answers at once rather than queueing behind it, and a retry succeeds
+  once the kernel call returns. The deadline measures _no progress_, so a huge
+  folder on a slow share is never cut off. A blocked kernel call cannot be
+  cancelled; it keeps its helper thread until it returns, and `dispose()` does
+  not wait for it.
+- `maxStuckReads` — default **16**. Reads allowed past their deadline at once.
+  Beyond it, new reads answer `ETIMEDOUT` immediately instead of parking more
+  threads.
+- `materializeDataless` — default **false** (macOS). A cloud-evicted folder is
+  not downloaded to list it: the helper threads run with
+  `IOPOL_MATERIALIZE_DATALESS_FILES_OFF`, so the kernel refuses instead of
+  fetching, and the folder answers `EDATALESS`. Listing is metadata, and
+  materializing a dataless folder can fetch a whole package. Set `true` for
+  Finder-like behaviour; the read deadline still applies, and a retry after
+  the download lands succeeds.
 - `compactFolders` — default **true**. Collapses `a/b/c` single-child chains
   into one row; the row's `pathSegments` field carries the original segments.
   Disable only if you need per-level UI.

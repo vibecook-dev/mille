@@ -102,6 +102,61 @@ pub(crate) async fn stat_to_entry(
     })
 }
 
+/// `stat_to_entry` through the bounded read pool (M10): the same record, but
+/// a stat that blocks in the kernel answers ETIMEDOUT after the deadline
+/// instead of parking the caller. Used by the reveal and root-refresh paths.
+pub(crate) fn stat_entry(
+    reads: &mille_core::ReadBoundary,
+    path: &Path,
+    parent_id: Option<EntryId>,
+    name: String,
+) -> Result<Entry, FxError> {
+    let output = reads
+        .stat(path, false)
+        .map_err(|failure| failure.into_fx(path))?;
+    let stat = output
+        .as_stat()
+        .ok_or_else(|| FxError::InternalBug("bounded stat returned no metadata".into()))?;
+    let meta = &stat.metadata;
+
+    let kind = if meta.is_dir() {
+        EntryKind::Directory
+    } else if meta.file_type().is_symlink() {
+        EntryKind::Symlink
+    } else if meta.is_file() {
+        EntryKind::File
+    } else {
+        EntryKind::Unknown
+    };
+    let size = if kind == EntryKind::File {
+        meta.len()
+    } else {
+        0
+    };
+    let symlink_target_is_dir = if kind == EntryKind::Symlink {
+        stat.target.as_ref().map(|target| target.is_dir())
+    } else {
+        None
+    };
+    let is_hidden = name.starts_with('.');
+
+    Ok(Entry {
+        id: EntryId(0),
+        parent_id,
+        name,
+        kind,
+        size,
+        mtime_ms: mtime_ms_from_meta(meta),
+        ctime_ms: ctime_ms_from_meta(meta),
+        symlink_target_is_dir,
+        path_segments: None,
+        is_ignored: false,
+        is_excluded: false,
+        is_readonly: meta.permissions().readonly(),
+        is_hidden,
+    })
+}
+
 fn mtime_ms_from_meta(meta: &std::fs::Metadata) -> i64 {
     meta.modified()
         .ok()
