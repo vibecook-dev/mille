@@ -21,6 +21,33 @@ MILLE_PROGRESSIVE_DIRECTORY_COMPLETE_BUDGET_MS=30000 \
 pnpm bench:progressive-directory
 ```
 
+## Store hydration scaling
+
+```sh
+pnpm bench:hydration
+pnpm bench:hydration -- --report hydration-report.json
+```
+
+Times the three ways a store fills — `prefetch(id)` for every folder breadth
+first, one native depth walk (`prefetch(root, { depth })`), and
+`populateFromRoots()` — over synthetic trees of 5,500 / 11,000 / 22,000 /
+44,000 entries in two shapes: `wide` (folders of 500 files) and `deep` (many
+small folders nested 24 levels). Each (shape, size, path) runs in its own
+child process, so the reported peak RSS is that run's alone; the host is
+configured as VibeField's files worker configures it (`roots-only`, no
+symlink following, `respectIgnore`), and the fixture gives the root and
+every top-level folder a `.gitignore`, the way a home folder of projects has
+one per project.
+
+Every run must hydrate exactly the fixture's entry count. Each (shape, path)
+series' fitted scaling exponent — the slope of log(time) over log(entries) —
+must stay under `MILLE_HYDRATION_MAX_EXPONENT` (default 1.35; mille 0.3.4's
+cloning store measured ~1.7–2), and peak RSS growth per entry at the largest
+size under `MILLE_HYDRATION_MAX_BYTES_PER_ENTRY` (default 4096). Times are
+reporters; the 1-minute load average is printed beside each row. Resize with
+`MILLE_HYDRATION_SIZES`, `MILLE_HYDRATION_SHAPES`, `MILLE_HYDRATION_PATHS` and
+`MILLE_HYDRATION_RUNS` (median of N child runs).
+
 ## Transport: MessagePort vs WebSocket
 
 ```sh

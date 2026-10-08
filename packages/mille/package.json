@@ -75,6 +75,7 @@
     "bench:viewport": "node bench/viewport-retention.mjs",
     "bench:wide-folder": "node bench/wide-folder-order.mjs",
     "bench:progressive-directory": "node bench/progressive-directory.mjs",
+    "bench:hydration": "node bench/hydration-scaling.mjs",
     "bench:natural-sort": "node bench/natural-sort.mjs",
     "bench:settings": "node bench/explorer-settings.mjs",
     "bench:visibility": "node bench/visibility-projection.mjs",

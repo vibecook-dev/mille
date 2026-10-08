@@ -18,6 +18,7 @@
     "bench:navigation": "node packages/mille-ui/bench/navigation-state.mjs && node apps/playground/scripts/navigation-state-store-bench.mjs",
     "bench:viewport": "node packages/mille/bench/viewport-retention.mjs",
     "bench:wide-folder": "node packages/mille/bench/wide-folder-order.mjs",
+    "bench:hydration": "node packages/mille/bench/hydration-scaling.mjs",
     "bench:natural-sort": "node packages/mille/bench/natural-sort.mjs",
     "bench:settings": "node packages/mille/bench/explorer-settings.mjs",
     "bench:visibility": "node packages/mille/bench/visibility-projection.mjs",
