@@ -37,6 +37,34 @@ function tempRoot() {
 }
 
 /**
+ * Entries in a folder whose progressive read a test must catch in flight —
+ * observe a partial page, then cancel, abort, collapse or dispose before EOF.
+ * The read has to outlast that round trip by a wide margin, and how long it
+ * lasts is the engine's speed: at 1–2k entries a store that publishes pages
+ * cheaply finished whole reads (~15–30 ms) between polls, so these tests
+ * failed on the race rather than on the behaviour (M8). The mid-read polls
+ * run every millisecond for the same reason.
+ */
+const IN_FLIGHT_ENTRIES = 8192;
+
+/**
+ * Capture the host's watcher registration, which starts when the first port
+ * attaches. Once registered, the host resyncs every folder expanded before
+ * that point, and that resync completes a listing on its own — behind a test
+ * that cancelled or is still watching the progressive read. Await the
+ * returned function after attaching and before expanding.
+ */
+function captureWatchRegistration(host) {
+  const startWatching = host.local.startWatching.bind(host.local);
+  let registration;
+  host.local.startWatching = () => (registration = startWatching());
+  return async () => {
+    await registration;
+    host.local.startWatching = startWatching;
+  };
+}
+
+/**
  * Poll `predicate` every 10ms up to `timeoutMs`. Ready when the predicate
  * returns a non-nullish value — `0` counts as ready (EntryIds start at 0,
  * so truthy checks would spin forever waiting for the first-allocated id).
@@ -319,27 +347,34 @@ test('wide directories publish usable partial rows before authoritative completi
 
 test('collapsing cancels an obsolete wide-directory read and re-expand retries cleanly', async () => {
   const dir = tempRoot();
+  let host;
+  let client;
   try {
-    const total = 2048;
+    const total = IN_FLIGHT_ENTRIES;
     for (let i = 0; i < total; i++) {
       writeFileSync(join(dir, `cancel-${String(i).padStart(5, '0')}.txt`), 'x');
     }
-    const host = await createFileExplorerHost({
+    host = await createFileExplorerHost({
       roots: [dir],
       initialWalk: 'roots-only',
       compactFolders: false,
       directoryBatchSize: 16,
     });
+    const watchRegistered = captureWatchRegistration(host);
     const { port1, port2 } = new MessageChannel();
     host.attachPort(port1);
-    const client = await connectFileExplorer(port2);
+    client = await connectFileExplorer(port2);
+    await watchRegistered();
     const rootId = client.getSnapshot().roots()[0].id;
 
     client.setExpanded({ add: [rootId] });
-    await waitFor(() => {
-      const snapshot = host.local.getSnapshot();
-      return snapshot.childrenOf(rootId).length > 0 && !snapshot.directoryChildrenLoaded(rootId);
-    });
+    await waitFor(
+      () => {
+        const snapshot = host.local.getSnapshot();
+        return snapshot.childrenOf(rootId).length > 0 && !snapshot.directoryChildrenLoaded(rootId);
+      },
+      { stepMs: 1 },
+    );
     client.setExpanded({ remove: [rootId] });
     await new Promise((resolve) => setTimeout(resolve, 40));
     assert.equal(
@@ -353,46 +388,56 @@ test('collapsing cancels an obsolete wide-directory read and re-expand retries c
       timeoutMs: 8000,
     });
     await waitFor(() => client.getSnapshot().directoryLoadState(rootId).state === 'complete');
-
-    await client.dispose();
-    await host.dispose();
   } finally {
+    // Dispose even when an assertion fails: a live host keeps its tick
+    // running, and the test process would never exit.
+    await client?.dispose();
+    await host?.dispose();
     removeTempDir(dir);
   }
 });
 
 test('one collapsed window does not cancel a progressive load still used by another', async () => {
   const dir = tempRoot();
+  let host;
+  let clientA;
+  let clientB;
   try {
-    const total = 1024;
+    const total = IN_FLIGHT_ENTRIES;
     for (let i = 0; i < total; i++) {
       writeFileSync(join(dir, `shared-${String(i).padStart(5, '0')}.txt`), 'x');
     }
-    const host = await createFileExplorerHost({
+    host = await createFileExplorerHost({
       roots: [dir],
       initialWalk: 'roots-only',
       compactFolders: false,
       directoryBatchSize: 16,
     });
+    const watchRegistered = captureWatchRegistration(host);
     const a = new MessageChannel();
     const b = new MessageChannel();
     host.attachPort(a.port1);
     host.attachPort(b.port1);
-    const clientA = await connectFileExplorer(a.port2);
-    const clientB = await connectFileExplorer(b.port2);
+    clientA = await connectFileExplorer(a.port2);
+    clientB = await connectFileExplorer(b.port2);
+    await watchRegistered();
     const rootId = clientA.getSnapshot().roots()[0].id;
     assert.equal(clientB.getSnapshot().roots()[0].id, rootId);
 
     clientA.setExpanded({ add: [rootId] });
     clientB.setExpanded({ add: [rootId] });
-    await waitFor(() => {
-      const snapshot = host.local.getSnapshot();
-      return snapshot.childrenOf(rootId).length > 0 && !snapshot.directoryChildrenLoaded(rootId);
-    });
+    await waitFor(
+      () => {
+        const snapshot = host.local.getSnapshot();
+        return snapshot.childrenOf(rootId).length > 0 && !snapshot.directoryChildrenLoaded(rootId);
+      },
+      { stepMs: 1 },
+    );
     await waitFor(
       () =>
         clientA.getSnapshot().directoryLoadState(rootId).state === 'loading' &&
         clientB.getSnapshot().directoryLoadState(rootId).state === 'loading',
+      { stepMs: 1 },
     );
 
     clientA.setExpanded({ remove: [rootId] });
@@ -408,11 +453,12 @@ test('one collapsed window does not cancel a progressive load still used by anot
     clientA.setExpanded({ add: [rootId] });
     await waitFor(() => clientA.getSnapshot().directChildCount(rootId) === total);
     await waitFor(() => clientA.getSnapshot().directoryLoadState(rootId).state === 'complete');
-
-    await clientA.dispose();
-    await clientB.dispose();
-    await host.dispose();
   } finally {
+    // Dispose even when an assertion fails: a live host keeps its tick
+    // running, and the test process would never exit.
+    await clientA?.dispose();
+    await clientB?.dispose();
+    await host?.dispose();
     removeTempDir(dir);
   }
 });
@@ -421,7 +467,7 @@ test('local progressive resync honors AbortSignal without marking a partial page
   const dir = tempRoot();
   const fx = new FileExplorer({ roots: [dir] });
   try {
-    const total = 1024;
+    const total = IN_FLIGHT_ENTRIES;
     for (let i = 0; i < total; i++) {
       writeFileSync(join(dir, `abort-${String(i).padStart(5, '0')}.txt`), 'x');
     }
@@ -433,10 +479,13 @@ test('local progressive resync honors AbortSignal without marking a partial page
       batchSize: 16,
       signal: controller.signal,
     });
-    await waitFor(() => {
-      const snapshot = fx.getSnapshot();
-      return snapshot.childrenOf(rootId).length > 0 && !snapshot.directoryChildrenLoaded(rootId);
-    });
+    await waitFor(
+      () => {
+        const snapshot = fx.getSnapshot();
+        return snapshot.childrenOf(rootId).length > 0 && !snapshot.directoryChildrenLoaded(rootId);
+      },
+      { stepMs: 1 },
+    );
     controller.abort();
     await assert.rejects(pending, (error) => error?.code === 'ECANCELED');
     assert.equal(
@@ -620,7 +669,7 @@ test('host disposal cancels and joins an in-flight progressive directory read', 
   let host;
   let client;
   try {
-    for (let i = 0; i < 1024; i++) {
+    for (let i = 0; i < IN_FLIGHT_ENTRIES; i++) {
       writeFileSync(join(dir, `dispose-${String(i).padStart(5, '0')}.txt`), 'x');
     }
     host = await createFileExplorerHost({
@@ -629,15 +678,20 @@ test('host disposal cancels and joins an in-flight progressive directory read', 
       compactFolders: false,
       directoryBatchSize: 16,
     });
+    const watchRegistered = captureWatchRegistration(host);
     const { port1, port2 } = new MessageChannel();
     host.attachPort(port1);
     client = await connectFileExplorer(port2);
+    await watchRegistered();
     const rootId = client.getSnapshot().roots()[0].id;
     client.setExpanded({ add: [rootId] });
-    await waitFor(() => {
-      const snapshot = host.local.getSnapshot();
-      return snapshot.childrenOf(rootId).length > 0 && !snapshot.directoryChildrenLoaded(rootId);
-    });
+    await waitFor(
+      () => {
+        const snapshot = host.local.getSnapshot();
+        return snapshot.childrenOf(rootId).length > 0 && !snapshot.directoryChildrenLoaded(rootId);
+      },
+      { stepMs: 1 },
+    );
 
     await host.dispose();
     host = undefined;
@@ -740,16 +794,18 @@ test('initialWalk=none leaves store empty until explicit populateFromRoots', asy
   // The escape hatch: consumers who want full manual control set
   // initialWalk: 'none' and drive hydration themselves.
   const dir = tempRoot();
+  let host;
+  let client;
   try {
     writeFileSync(join(dir, 'a.txt'), 'a');
-    const host = await createFileExplorerHost({
+    host = await createFileExplorerHost({
       roots: [dir],
       initialWalk: 'none',
     });
 
     const { port1, port2 } = new MessageChannel();
     host.attachPort(port1);
-    const client = await connectFileExplorer(port2);
+    client = await connectFileExplorer(port2);
 
     // No roots seed — give the host a few ticks to prove it really
     // doesn't walk on its own.
@@ -765,10 +821,11 @@ test('initialWalk=none leaves store empty until explicit populateFromRoots', asy
     await waitFor(() => client.getSnapshot().roots().length === 1);
 
     assert.equal(client.getSnapshot().roots().length, 1, 'manual walk seeded one root');
-
-    await client.dispose();
-    await host.dispose();
   } finally {
+    // Dispose even when an assertion fails: a live host keeps its tick
+    // running, and the test process would never exit.
+    await client?.dispose();
+    await host?.dispose();
     removeTempDir(dir);
   }
 });
