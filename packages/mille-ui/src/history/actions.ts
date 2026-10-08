@@ -43,6 +43,22 @@ function throwIfAborted(signal: AbortSignal | undefined, action: string): void {
 }
 
 /**
+ * SPEC mille-git §12.5: a client call that ended in an abort — the shell and
+ * engine adapters' `ABORT_ERR`, or any failure once `signal` has fired — is
+ * a cancel, reported as `ScmActionError('ECANCELED')` and the `cancelled`
+ * phase rather than a failure. Anything else passes through.
+ */
+function asCancel(error: unknown, signal: AbortSignal | undefined, action: string): unknown {
+  if (error instanceof ScmActionError) return error;
+  const code =
+    typeof error === 'object' && error !== null ? (error as { code?: unknown }).code : undefined;
+  if (signal?.aborted || code === 'ABORT_ERR') {
+    return new ScmActionError('ECANCELED', action, `${action} cancelled`);
+  }
+  return error;
+}
+
+/**
  * Discard working-tree changes for `paths` after optional confirmation.
  */
 export async function runScmRevert(
@@ -115,7 +131,8 @@ export async function runScmRevert(
       paths,
       fraction: 1,
     });
-  } catch (error) {
+  } catch (thrown) {
+    const error = asCancel(thrown, options.signal, action);
     if (error instanceof ScmActionError) {
       emit(hooks, {
         operationId,
@@ -195,7 +212,8 @@ export async function runScmCompare(
       fraction: 1,
     });
     return result;
-  } catch (error) {
+  } catch (thrown) {
+    const error = asCancel(thrown, options.signal, action);
     if (error instanceof ScmActionError) {
       emit(hooks, {
         operationId,

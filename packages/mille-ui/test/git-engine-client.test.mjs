@@ -22,7 +22,7 @@ import {
   isGitError,
 } from '../dist/git.js';
 import { createShellGitClient } from '../dist/git-node.js';
-import { runScmRevert, ScmActionError } from '../dist/history.js';
+import { runScmCompare, runScmRevert, ScmActionError } from '../dist/history.js';
 import { removeTempDir } from '../../../scripts/test-temp.mjs';
 import {
   git,
@@ -362,7 +362,100 @@ test('scm: compare reads the working tree and a revision, with the shell labels'
       { path: 'tracked.ts', left: { kind: 'working' }, right: { kind: 'working' } },
       { signal: ac.signal },
     ),
-    (e) => isGitError(e) && e.code === 'ECANCELED' && /abort/i.test(e.message),
+    isAbortErr,
+  );
+});
+
+/** §12.5: the shell clients' abort — a plain `Error` with `code: 'ABORT_ERR'`. */
+function isAbortErr(e) {
+  return (
+    e instanceof Error &&
+    !isGitError(e) &&
+    e.code === 'ABORT_ERR' &&
+    e.message === 'git operation aborted'
+  );
+}
+
+/** A fake engine call that waits for `opts.signal` and rejects as the engine does. */
+function pendingUntilAbort(signalOf) {
+  return (...args) =>
+    new Promise((_resolve, reject) => {
+      const signal = signalOf(...args);
+      const cancel = () => reject(new GitError('ECANCELED', 'git operation aborted'));
+      if (signal.aborted) cancel();
+      else signal.addEventListener('abort', cancel, { once: true });
+    });
+}
+
+test('G1 / §12.5: an aborted adapter call rejects ABORT_ERR, as the shell clients do', async () => {
+  const mutation = pendingUntilAbort((_w, _paths, opts) => opts.signal);
+  const service = fakeService({
+    restore: mutation,
+    stage: mutation,
+    unstage: mutation,
+    readWorktreeFile: pendingUntilAbort((_w, _path, opts) => opts.signal),
+    readObject: pendingUntilAbort((_w, req) => req.signal),
+  });
+  const scm = createGitServiceScmClient(service, ROOT);
+  const calls = {
+    revert: (signal) => scm.revert(['a.ts'], { signal }),
+    stage: (signal) => scm.stage(['a.ts'], { signal }),
+    unstage: (signal) => scm.unstage(['a.ts'], { signal }),
+    'compare (working)': (signal) =>
+      scm.compare({ path: 'a.ts', left: { kind: 'working' }, right: { kind: 'working' } }, { signal }),
+    'compare (revision)': (signal) =>
+      scm.compare(
+        { path: 'a.ts', left: { kind: 'revision', revision: 'HEAD' }, right: { kind: 'working' } },
+        { signal },
+      ),
+  };
+  for (const [name, call] of Object.entries(calls)) {
+    const ac = new AbortController();
+    const pending = call(ac.signal);
+    await new Promise((resolve) => setImmediate(resolve));
+    ac.abort();
+    await assert.rejects(pending, (e) => {
+      assert.ok(isAbortErr(e), `${name}: ${e}`);
+      // The engine's own rejection rides along as the cause.
+      assert.ok(isGitError(e.cause) && e.cause.code === 'ECANCELED', `${name}: cause ${e.cause}`);
+      return true;
+    });
+  }
+
+  // Once the signal has fired, a quiet failure (ENOENT) is the abort, not a
+  // missing side: compare must not answer `null` for a cancelled read.
+  const racing = fakeService({
+    readWorktreeFile: async (_w, _p, opts) => {
+      if (!opts.signal.aborted) {
+        await new Promise((resolve) => opts.signal.addEventListener('abort', resolve, { once: true }));
+      }
+      throw new GitError('ENOENT', 'gone');
+    },
+  });
+  const ac = new AbortController();
+  const pending = createGitServiceScmClient(racing, ROOT).compare(
+    { path: 'a.ts', left: { kind: 'working' }, right: { kind: 'working' } },
+    { signal: ac.signal },
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  ac.abort();
+  await assert.rejects(pending, isAbortErr);
+});
+
+test('G1: an ECANCELED the caller did not ask for passes through unchanged', async () => {
+  // The engine also rejects ECANCELED when the worktree closes or the engine
+  // is disposed under a call. No signal fired, so it is not the caller's
+  // abort and the adapter must not dress it up as one.
+  const closed = new GitError('ECANCELED', 'git operation aborted');
+  const service = fakeService({
+    restore: async () => {
+      throw closed;
+    },
+  });
+  const ac = new AbortController();
+  await assert.rejects(
+    createGitServiceScmClient(service, ROOT).revert(['a.ts'], { signal: ac.signal }),
+    (e) => e === closed,
   );
 });
 
@@ -377,6 +470,76 @@ test('scm: runScmRevert drives the adapter like any ScmClient', async () => {
     runScmRevert(['a.ts'], { client, signal: ac.signal, hooks: { confirm: async () => true } }),
     (err) => err instanceof ScmActionError && err.code === 'ECANCELED',
   );
+});
+
+test('G1 / §12.5: runScm* reports a mid-flight adapter abort as a cancel, not a failure', async () => {
+  const service = fakeService({
+    restore: pendingUntilAbort((_w, _paths, opts) => opts.signal),
+    readObject: pendingUntilAbort((_w, req) => req.signal),
+  });
+  const client = createGitServiceScmClient(service, ROOT);
+
+  for (const [action, run] of [
+    ['scm.revert', (opts) => runScmRevert(['a.ts'], { client, ...opts })],
+    [
+      'scm.compare',
+      (opts) =>
+        runScmCompare(
+          { path: 'a.ts', left: { kind: 'revision', revision: 'HEAD' }, right: { kind: 'working' } },
+          { client, ...opts },
+        ),
+    ],
+  ]) {
+    const ac = new AbortController();
+    const phases = [];
+    const errors = [];
+    const hooks = {
+      confirm: async () => true,
+      onProgress: (e) => phases.push(e.phase),
+      onError: (e) => errors.push(e),
+    };
+    const pending = run({ signal: ac.signal, hooks });
+    // Past the pre-flight checks: the engine call is in flight.
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(phases.at(-1), 'running', action);
+    ac.abort();
+    await assert.rejects(
+      pending,
+      (err) => err instanceof ScmActionError && err.code === 'ECANCELED' && err.action === action,
+    );
+    assert.equal(phases.at(-1), 'cancelled', action);
+    assert.deepEqual(errors, [], `${action}: a cancel is not an error`);
+  }
+});
+
+test('G1: runScmRevert keeps ECANCELED for a cancel and passes real failures through', async () => {
+  // A client's own ABORT_ERR (no signal of ours fired) is still a cancel.
+  const abortErr = Object.assign(new Error('git operation aborted'), { code: 'ABORT_ERR' });
+  await assert.rejects(
+    runScmRevert(['a.ts'], {
+      client: {
+        revert: async () => {
+          throw abortErr;
+        },
+      },
+    }),
+    (err) => err instanceof ScmActionError && err.code === 'ECANCELED',
+  );
+  // Anything else is a failure, rethrown as the client threw it.
+  const hook = new GitError('EHOOK', 'pre-commit said no');
+  const phases = [];
+  await assert.rejects(
+    runScmRevert(['a.ts'], {
+      client: {
+        revert: async () => {
+          throw hook;
+        },
+      },
+      hooks: { onProgress: (e) => phases.push(e.phase) },
+    }),
+    (err) => err === hook,
+  );
+  assert.equal(phases.at(-1), 'failed');
 });
 
 // ─── The native engine behind the adapters (AC-007) ───────────────────
@@ -463,6 +626,18 @@ test('AC-007 / AC-017: engine scm — compare, and revert restores index bytes',
       /escapes/,
     );
     assert.equal(readFileSync(outside, 'utf8'), 'SECRET\n');
+
+    // §12.5 against the real engine: its ECANCELED reaches the caller as
+    // the shell clients' ABORT_ERR, and nothing was restored.
+    writeFileSync(join(dir, 'tracked.ts'), 'kept\n');
+    const ac = new AbortController();
+    ac.abort();
+    await assert.rejects(scm.revert(['tracked.ts'], { signal: ac.signal }), (e) => {
+      assert.ok(isAbortErr(e), String(e));
+      assert.ok(isGitError(e.cause) && e.cause.code === 'ECANCELED', String(e.cause));
+      return true;
+    });
+    assert.equal(readFileSync(join(dir, 'tracked.ts'), 'utf8'), 'kept\n');
   } finally {
     await service.dispose();
     removeTempDir(dir);

@@ -28,6 +28,11 @@
 //   `getContents` and `compare` want whole files; `revert` is the engine's
 //   index → worktree `restore` (never `--source=HEAD`, AC-017), which is what
 //   the shell client's `git restore --worktree` did.
+// - **An abort rejects `ABORT_ERR`, as the shell clients do** (§12.5): a
+//   plain `Error` with `code: 'ABORT_ERR'`, not the service's
+//   `GitError('ECANCELED')`, so swapping the shell client for the engine
+//   changes no caller's cancel check. `runScm*` maps it to
+//   `ScmActionError('ECANCELED')` for both.
 //
 // Spelling: the adapter compares paths lexically (it cannot realpath in a
 // renderer). Open the worktree and construct the adapter with the same
@@ -89,8 +94,37 @@ function assertRelative(path: string): string {
   return path;
 }
 
-function abortError(): GitError {
-  return new GitError('ECANCELED', 'git operation aborted');
+/**
+ * What an aborted adapter call rejects with: a plain `Error` whose `code` is
+ * `'ABORT_ERR'` — exactly what the shell clients throw (`shell-history.ts`
+ * `runGit`), so a caller written against them recognises an engine abort
+ * unchanged (§12.5). `GitService` itself keeps `GitError('ECANCELED')`;
+ * `runScm*` turns either into `ScmActionError('ECANCELED')`.
+ */
+function abortError(cause?: unknown): Error {
+  const err =
+    cause === undefined
+      ? new Error('git operation aborted')
+      : new Error('git operation aborted', { cause });
+  (err as Error & { code?: string }).code = 'ABORT_ERR';
+  return err;
+}
+
+/**
+ * Await an engine call made with `signal`. Once the caller's signal has
+ * fired, whatever the call rejected with — the engine's `ECANCELED`, or a
+ * failure that raced the abort — surfaces as `ABORT_ERR`, as it does from
+ * the shell clients. An `ECANCELED` with no abort behind it (the worktree
+ * closed or the engine was disposed under the call) is not the caller's
+ * cancel and passes through as the engine said it.
+ */
+async function abortable<T>(signal: AbortSignal | undefined, call: () => Promise<T>): Promise<T> {
+  try {
+    return await call();
+  } catch (error) {
+    if (signal?.aborted) throw abortError(error);
+    throw error;
+  }
 }
 
 // ─── GitClient ────────────────────────────────────────────────────────
@@ -323,17 +357,20 @@ export function createGitServiceScmClient(service: GitService, worktreePath: str
     async revert(paths, opts) {
       if (paths.length === 0) return;
       const targets = await translate(paths, opts?.rootPath);
-      await service.restore(worktreePath, targets, signalOpts(opts?.signal));
+      const signal = opts?.signal;
+      await abortable(signal, () => service.restore(worktreePath, targets, signalOpts(signal)));
     },
     async stage(paths, opts) {
       if (paths.length === 0) return;
       const targets = await translate(paths, opts?.rootPath);
-      await service.stage(worktreePath, targets, signalOpts(opts?.signal));
+      const signal = opts?.signal;
+      await abortable(signal, () => service.stage(worktreePath, targets, signalOpts(signal)));
     },
     async unstage(paths, opts) {
       if (paths.length === 0) return;
       const targets = await translate(paths, opts?.rootPath);
-      await service.unstage(worktreePath, targets, signalOpts(opts?.signal));
+      const signal = opts?.signal;
+      await abortable(signal, () => service.unstage(worktreePath, targets, signalOpts(signal)));
     },
     async compare(request, opts): Promise<ScmCompareResult> {
       const [path] = await translate([request.path], request.rootPath);
@@ -344,14 +381,15 @@ export function createGitServiceScmClient(service: GitService, worktreePath: str
       async function load(side: ScmCompareRequest['left']): Promise<string | Uint8Array | null> {
         if (signal?.aborted) throw abortError();
         try {
-          if (side.kind === 'working') {
-            return await service.readWorktreeFile(worktreePath, target, signalOpts(signal));
-          }
-          return await service.readObject(worktreePath, {
-            path: target,
-            revision: side.revision,
-            ...signalOpts(signal),
-          });
+          return await abortable(signal, () =>
+            side.kind === 'working'
+              ? service.readWorktreeFile(worktreePath, target, signalOpts(signal))
+              : service.readObject(worktreePath, {
+                  path: target,
+                  revision: side.revision,
+                  ...signalOpts(signal),
+                }),
+          );
         } catch (error) {
           if (isQuiet(error)) return null; // a missing side is not an error
           throw error;

@@ -344,7 +344,10 @@ Each item names the section it departs from and why. None reopens a §31/§32 de
     is fetched once); a `rootPath` override must lie inside the checkout. Paths are validated
     lexically before any call, with the shell clients' `path escapes workspace root` message.
     `ENOTAREPO`, `ENOGIT`, `ENOENT`, `EACCES`, `EUNKNOWN` and `EUNSUPPORTED` become `[]` / `null`, as
-    the shell clients' non-zero exits do; `EINVAL`, `ECANCELED` and the rest throw.
+    the shell clients' non-zero exits do; `EINVAL` and the rest throw. A call whose `AbortSignal`
+    fired rejects the shell clients' `Error` with `code: 'ABORT_ERR'` (§12.5), the engine's
+    `GitError('ECANCELED')` as its `cause`; an `ECANCELED` no caller signal asked for (the worktree
+    closed under the call) passes through as the engine said it.
 66. **Spellings compare lexically** (renderer-safe code cannot realpath; drive-letter paths
     case-insensitively). Construct an adapter with the spelling `open` was given: the identity keeps
     the first opener's spelling (deviation 8).
