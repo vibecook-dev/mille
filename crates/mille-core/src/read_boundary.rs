@@ -56,7 +56,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use parking_lot::{Condvar, Mutex};
+use parking_lot::{Condvar, Mutex, MutexGuard};
 
 use crate::error::{ErrorCode, FxError};
 use crate::ignore::IGNORE_FILE_NAMES;
@@ -84,7 +84,8 @@ const DEFAULT_CONCURRENCY: usize = 8;
 /// Idle helpers exit after this long, so a quiet explorer holds no threads.
 const IDLE_KEEPALIVE: Duration = Duration::from_secs(10);
 
-/// How long a waiter spins on a running read before parking.
+/// How long a waiter spins on a running read before parking, and how long an
+/// idle helper spins for the next read before parking.
 const SPIN_BEFORE_PARK: Duration = Duration::from_micros(50);
 
 /// Upper bound on one condvar wait, so a waiter notices cancellation and a
@@ -561,6 +562,9 @@ struct Shared {
     hook: Option<Arc<dyn ReadHook>>,
     epoch: Instant,
     closed: AtomicBool,
+    /// Mirrors `state.queue.len()`, so an idle helper can watch for work
+    /// without taking the lock.
+    queued: AtomicUsize,
     state: Mutex<State>,
     work: Condvar,
 }
@@ -610,6 +614,7 @@ impl ReadBoundary {
             hook: options.hook,
             epoch: Instant::now(),
             closed: AtomicBool::new(false),
+            queued: AtomicUsize::new(0),
             state: Mutex::new(State {
                 queue: VecDeque::new(),
                 flights: HashMap::new(),
@@ -787,6 +792,7 @@ impl ReadBoundary {
         });
         state.flights.insert(key, Arc::clone(&flight));
         state.queue.push_back(Arc::clone(&flight));
+        shared.queued.fetch_add(1, Ordering::Release);
         if state.queue.len() > state.idle && state.threads < shared.max_threads {
             state.threads += 1;
             let worker = Arc::clone(shared);
@@ -822,6 +828,7 @@ impl Shared {
         }
         state.closed = true;
         let queued: Vec<_> = state.queue.drain(..).collect();
+        self.queued.store(0, Ordering::Release);
         for flight in &queued {
             state.flights.remove(&flight.key);
             flight.finish(Err(ReadFailure::Cancelled));
@@ -992,49 +999,76 @@ impl Drop for Ticket {
 
 fn worker_main(shared: Arc<Shared>) {
     set_thread_materialization(shared.materialize_dataless);
-    loop {
-        let flight = {
-            let mut state = shared.state.lock();
-            loop {
-                if state.closed {
-                    state.threads -= 1;
-                    return;
-                }
-                if let Some(flight) = state.queue.pop_front() {
-                    if flight.interest.load(Ordering::Acquire) == 0 {
-                        // Every requester gave up before a thread was free.
-                        remove_flight(&mut state, &flight);
-                        flight.finish(Err(ReadFailure::Cancelled));
-                        continue;
-                    }
-                    flight.started.store(true, Ordering::Release);
-                    flight.progress.start();
-                    break flight;
-                }
-                state.idle += 1;
-                let timed_out = shared.work.wait_for(&mut state, IDLE_KEEPALIVE).timed_out();
-                state.idle -= 1;
-                if timed_out && state.queue.is_empty() {
-                    state.threads -= 1;
-                    return;
-                }
-            }
-        };
-
-        // A panic here (a hook, or a bug) must still finish the flight, or its
-        // path would read as stuck forever and the thread count would drift.
-        let outcome =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&shared, &flight)))
-                .unwrap_or_else(|_| {
-                    Err(ReadFailure::Io(IoFailure {
-                        raw: None,
-                        kind: io::ErrorKind::Other,
-                        message: "native read helper panicked".into(),
-                    }))
-                });
-        flight.finish(outcome);
-        let mut state = shared.state.lock();
+    let mut state = shared.state.lock();
+    while let Some(flight) = next_flight(&shared, &mut state) {
+        MutexGuard::unlocked(&mut state, || {
+            // A panic here (a hook, or a bug) must still finish the flight,
+            // or its path would read as stuck forever and the thread count
+            // would drift.
+            let outcome =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&shared, &flight)))
+                    .unwrap_or_else(|_| {
+                        Err(ReadFailure::Io(IoFailure {
+                            raw: None,
+                            kind: io::ErrorKind::Other,
+                            message: "native read helper panicked".into(),
+                        }))
+                    });
+            flight.finish(outcome);
+        });
         remove_flight(&mut state, &flight);
+    }
+}
+
+/// The next read for this helper, or `None` when it should exit (closed, or
+/// idle past `IDLE_KEEPALIVE`; the thread count is already decremented).
+///
+/// An idle helper spins for `SPIN_BEFORE_PARK` before parking — the mirror
+/// of the waiter's spin in `Ticket::wait_with`. A walk submits its next read
+/// microseconds after this one finishes; parking and being woken for it cost
+/// more than the read itself on a cached tree (measured: ~25 µs per directory
+/// on a serial `walk_scan` of 8.5k directories, load ~20). The spinning
+/// helper counts as idle, so `submit` hands it the read instead of spawning.
+fn next_flight(shared: &Shared, state: &mut MutexGuard<'_, State>) -> Option<Arc<Flight>> {
+    let mut spun = false;
+    loop {
+        if state.closed {
+            state.threads -= 1;
+            return None;
+        }
+        if let Some(flight) = state.queue.pop_front() {
+            shared.queued.fetch_sub(1, Ordering::AcqRel);
+            if flight.interest.load(Ordering::Acquire) == 0 {
+                // Every requester gave up before a thread was free.
+                remove_flight(state, &flight);
+                flight.finish(Err(ReadFailure::Cancelled));
+                continue;
+            }
+            flight.started.store(true, Ordering::Release);
+            flight.progress.start();
+            return Some(flight);
+        }
+        state.idle += 1;
+        if !spun {
+            spun = true;
+            MutexGuard::unlocked(state, || {
+                let until = Instant::now() + SPIN_BEFORE_PARK;
+                while shared.queued.load(Ordering::Acquire) == 0
+                    && !shared.closed.load(Ordering::Acquire)
+                    && Instant::now() < until
+                {
+                    std::hint::spin_loop();
+                }
+            });
+            state.idle -= 1;
+            continue;
+        }
+        let timed_out = shared.work.wait_for(state, IDLE_KEEPALIVE).timed_out();
+        state.idle -= 1;
+        if timed_out && state.queue.is_empty() {
+            state.threads -= 1;
+            return None;
+        }
     }
 }
 
