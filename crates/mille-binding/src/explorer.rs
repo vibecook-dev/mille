@@ -298,6 +298,9 @@ impl FileExplorer {
                 .read_timeout_ms
                 .map(|ms| std::time::Duration::from_millis(u64::from(ms)))
                 .unwrap_or(mille_core::read_boundary::DEFAULT_READ_TIMEOUT),
+            // The explorer keeps one deadline for the first answer and for
+            // every stall, as it always has.
+            first_response: None,
             max_stuck: options
                 .max_stuck_reads
                 .map(|n| n as usize)

@@ -15,6 +15,15 @@
 //!   is a *stall* deadline — every entry read and every `lstat` ticks
 //!   progress — so a huge-but-moving directory on a slow share is never cut
 //!   off, and a call that is stuck in the kernel is.
+//! - **The first response gets its own deadline.** A spun-down hard disk or a
+//!   sleeping NAS blocks the *first* call into it for as long as the platters
+//!   take to spin up, with no progress to tick, and then answers normally.
+//!   `first_response` bounds a read until it shows its first sign of life;
+//!   `timeout` (the stall deadline) bounds every gap after that. The default
+//!   keeps them equal, which is the behaviour the IDE explorer was built on;
+//!   [`ReadBoundaryOptions::media`] gives a media library 30 s to wake a disk
+//!   and still 2 s per stall, so "the drive is asleep" is never reported as
+//!   "the drive is empty".
 //! - **Stuck reads are capped.** The pool has `concurrency + max_stuck`
 //!   threads at most. Once `max_stuck` reads are past their deadline, new
 //!   reads are refused at once (`Saturated`) instead of queueing behind them.
@@ -58,6 +67,12 @@ use crate::ignore::IGNORE_FILE_NAMES;
 /// share keeps reading as long as entries keep arriving.
 pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_millis(2_000);
 
+/// First-response deadline of [`ReadBoundaryOptions::media`]. How long a
+/// disk takes to spin up from standby is hardware-specific (SMART attribute
+/// 3, `Spin_Up_Time`), and a NAS may wake several disks in turn, so this errs
+/// long. It only delays the verdict on a dead mount, never a healthy read.
+pub const MEDIA_FIRST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Default number of reads allowed to sit past their deadline at once. Each
 /// holds one parked helper thread until the kernel returns.
 pub const DEFAULT_MAX_STUCK_READS: usize = 16;
@@ -99,8 +114,15 @@ pub enum ReadKind {
 
 #[derive(Clone)]
 pub struct ReadBoundaryOptions {
-    /// Stall deadline: a read with no progress for this long times out.
+    /// Stall deadline: a read that has answered at least once and then makes
+    /// no progress for this long times out.
     pub timeout: Duration,
+    /// Deadline for a read's *first* sign of life, measured from when it was
+    /// queued. `None` uses `timeout`. Set it longer than `timeout` for
+    /// storage that sleeps (see the module comment): a read still waiting for
+    /// a disk to spin up is not stuck, and is not counted against
+    /// `max_stuck`, until this passes.
+    pub first_response: Option<Duration>,
     /// Reads allowed past their deadline before new reads are refused.
     pub max_stuck: usize,
     /// Healthy concurrent reads (helper threads beyond the stuck budget).
@@ -116,6 +138,7 @@ impl Default for ReadBoundaryOptions {
     fn default() -> Self {
         Self {
             timeout: DEFAULT_READ_TIMEOUT,
+            first_response: None,
             max_stuck: DEFAULT_MAX_STUCK_READS,
             concurrency: DEFAULT_CONCURRENCY,
             materialize_dataless: false,
@@ -124,10 +147,23 @@ impl Default for ReadBoundaryOptions {
     }
 }
 
+impl ReadBoundaryOptions {
+    /// A profile for media libraries on disks that sleep: 30 s for the first
+    /// response ([`MEDIA_FIRST_RESPONSE_TIMEOUT`]), the default 2 s stall
+    /// deadline after that, and no dataless materialization.
+    pub fn media() -> Self {
+        Self {
+            first_response: Some(MEDIA_FIRST_RESPONSE_TIMEOUT),
+            ..Self::default()
+        }
+    }
+}
+
 impl std::fmt::Debug for ReadBoundaryOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReadBoundaryOptions")
             .field("timeout", &self.timeout)
+            .field("first_response", &self.first_response)
             .field("max_stuck", &self.max_stuck)
             .field("concurrency", &self.concurrency)
             .field("materialize_dataless", &self.materialize_dataless)
@@ -256,6 +292,9 @@ impl IoFailure {
 pub struct ReadProgress {
     epoch: Instant,
     last: AtomicU64,
+    /// The read has answered at least once (any `tick`), so the stall
+    /// deadline applies from here on instead of the first-response one.
+    responded: AtomicBool,
 }
 
 impl ReadProgress {
@@ -263,12 +302,33 @@ impl ReadProgress {
         Self {
             epoch,
             last: AtomicU64::new(0),
+            responded: AtomicBool::new(false),
         }
     }
 
+    /// Record that the read accomplished something: an entry, a batch, a
+    /// returned syscall. The first tick also ends the first-response wait.
     pub fn tick(&self) {
+        self.mark();
+        if !self.responded.load(Ordering::Relaxed) {
+            self.responded.store(true, Ordering::Release);
+        }
+    }
+
+    /// A helper picked the read up. That is activity — the queue wait is
+    /// over — but not a response from the filesystem, which is what a
+    /// sleeping disk withholds.
+    fn start(&self) {
+        self.mark();
+    }
+
+    fn mark(&self) {
         let nanos = self.epoch.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         self.last.store(nanos.max(1), Ordering::Release);
+    }
+
+    fn responded(&self) -> bool {
+        self.responded.load(Ordering::Acquire)
     }
 
     fn last(&self) -> Option<Instant> {
@@ -441,10 +501,10 @@ impl Flight {
     }
 
     /// In the kernel and past the deadline.
-    fn is_stuck(&self, now: Instant, timeout: Duration) -> bool {
+    fn is_stuck(&self, now: Instant, shared: &Shared) -> bool {
         self.started.load(Ordering::Acquire)
             && !self.is_finished()
-            && now.saturating_duration_since(self.last_activity()) >= timeout
+            && now.saturating_duration_since(self.last_activity()) >= shared.deadline(self)
     }
 
     fn finish(&self, outcome: ReadOutcome) {
@@ -477,7 +537,10 @@ struct State {
 }
 
 struct Shared {
+    /// Stall deadline, once a read has answered.
     timeout: Duration,
+    /// Deadline until a read first answers.
+    first_response: Duration,
     max_stuck: usize,
     max_threads: usize,
     materialize_dataless: bool,
@@ -510,6 +573,7 @@ impl std::fmt::Debug for ReadBoundary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReadBoundary")
             .field("timeout", &self.shared.timeout)
+            .field("first_response", &self.shared.first_response)
             .field("max_stuck", &self.shared.max_stuck)
             .field("max_threads", &self.shared.max_threads)
             .field("materialize_dataless", &self.shared.materialize_dataless)
@@ -520,8 +584,12 @@ impl std::fmt::Debug for ReadBoundary {
 impl ReadBoundary {
     pub fn new(options: ReadBoundaryOptions) -> Self {
         let max_stuck = options.max_stuck.max(1);
+        let timeout = options.timeout.max(Duration::from_millis(1));
         let shared = Arc::new(Shared {
-            timeout: options.timeout.max(Duration::from_millis(1)),
+            timeout,
+            first_response: options
+                .first_response
+                .map_or(timeout, |first| first.max(Duration::from_millis(1))),
             max_stuck,
             max_threads: options.concurrency.max(1) + max_stuck,
             materialize_dataless: options.materialize_dataless,
@@ -550,8 +618,16 @@ impl ReadBoundary {
         DEFAULT.get_or_init(|| ReadBoundary::new(ReadBoundaryOptions::default()))
     }
 
+    /// The stall deadline: how long a read that has answered may go without
+    /// progress.
     pub fn timeout(&self) -> Duration {
         self.shared.timeout
+    }
+
+    /// The first-response deadline: how long a read may wait for its first
+    /// answer (equal to [`timeout`](Self::timeout) unless configured).
+    pub fn first_response(&self) -> Duration {
+        self.shared.first_response
     }
 
     pub fn materializes_dataless(&self) -> bool {
@@ -612,7 +688,7 @@ impl ReadBoundary {
         state
             .flights
             .values()
-            .filter(|flight| flight.is_stuck(now, self.shared.timeout))
+            .filter(|flight| flight.is_stuck(now, &self.shared))
             .count()
     }
 
@@ -635,14 +711,14 @@ impl ReadBoundary {
             return Ticket::ready(shared, Err(ReadFailure::Cancelled));
         }
         if let Some(flight) = state.flights.get(&key) {
-            if !flight.is_stuck(now, shared.timeout) {
+            if !flight.is_stuck(now, shared) {
                 flight.interest.fetch_add(1, Ordering::AcqRel);
                 return Ticket::joined(shared, Arc::clone(flight));
             }
         }
         let mut stuck = 0;
         for flight in state.flights.values() {
-            if flight.is_stuck(now, shared.timeout) {
+            if flight.is_stuck(now, shared) {
                 if path.starts_with(flight.path()) {
                     return Ticket::ready(
                         shared,
@@ -688,6 +764,16 @@ impl ReadBoundary {
 }
 
 impl Shared {
+    /// The deadline that applies to `flight` now: the first-response one
+    /// until it has answered, the stall one after.
+    fn deadline(&self, flight: &Flight) -> Duration {
+        if flight.progress.responded() {
+            self.timeout
+        } else {
+            self.first_response
+        }
+    }
+
     fn close(&self) {
         self.closed.store(true, Ordering::Release);
         let mut state = self.state.lock();
@@ -750,7 +836,8 @@ impl Ticket {
             return Some(Err(ReadFailure::Cancelled));
         }
         let stalled_for = Instant::now().saturating_duration_since(flight.last_activity());
-        (stalled_for >= self.shared.timeout).then_some(Err(ReadFailure::TimedOut { stalled_for }))
+        (stalled_for >= self.shared.deadline(flight))
+            .then_some(Err(ReadFailure::TimedOut { stalled_for }))
     }
 
     /// Time left before this read counts as stalled, at its current progress.
@@ -758,7 +845,7 @@ impl Ticket {
         match &self.flight {
             Some(flight) if self.ready.is_none() => self
                 .shared
-                .timeout
+                .deadline(flight)
                 .saturating_sub(Instant::now().saturating_duration_since(flight.last_activity())),
             _ => Duration::ZERO,
         }
@@ -778,7 +865,6 @@ impl Ticket {
         let Some(flight) = self.flight.clone() else {
             return Err(ReadFailure::Cancelled);
         };
-        let timeout = self.shared.timeout;
         // A cached listing takes the helper tens of microseconds — less than
         // parking and waking this thread. Spin that long before sleeping, or a
         // hot walk pays a scheduler round trip per directory.
@@ -797,10 +883,13 @@ impl Ticket {
             let activity = flight.last_activity();
             let now = Instant::now();
             let stalled_for = now.saturating_duration_since(activity);
-            if stalled_for >= timeout {
+            // Re-read every slice: the first answer switches the read from
+            // the first-response deadline to the stall deadline.
+            let deadline = self.shared.deadline(&flight);
+            if stalled_for >= deadline {
                 return Err(ReadFailure::TimedOut { stalled_for });
             }
-            let remaining = timeout - stalled_for;
+            let remaining = deadline - stalled_for;
             flight.done.wait_for(&mut slot, remaining.min(WAIT_SLICE));
         }
     }
@@ -879,7 +968,7 @@ fn worker_main(shared: Arc<Shared>) {
                         continue;
                     }
                     flight.started.store(true, Ordering::Release);
-                    flight.progress.tick();
+                    flight.progress.start();
                     break flight;
                 }
                 state.idle += 1;
@@ -1641,5 +1730,115 @@ pub(crate) mod tests {
             Err(ReadFailure::TimedOut { .. })
         ));
         gate.release_all();
+    }
+
+    /// A disk spinning up: the first answer is withheld for `wake`, then the
+    /// read answers and (optionally) stalls again for `then_stall`.
+    struct SpinUp {
+        wake: Duration,
+        then_stall: Option<Duration>,
+    }
+
+    impl ReadHook for SpinUp {
+        fn before_read(&self, _kind: ReadKind, _path: &Path, progress: &ReadProgress) {
+            std::thread::sleep(self.wake);
+            if let Some(stall) = self.then_stall {
+                progress.tick();
+                std::thread::sleep(stall);
+            }
+        }
+    }
+
+    fn spin_up_boundary(
+        stall_ms: u64,
+        first_ms: Option<u64>,
+        wake_ms: u64,
+        then_stall_ms: Option<u64>,
+    ) -> ReadBoundary {
+        ReadBoundary::new(ReadBoundaryOptions {
+            timeout: Duration::from_millis(stall_ms),
+            first_response: first_ms.map(Duration::from_millis),
+            hook: Some(Arc::new(SpinUp {
+                wake: Duration::from_millis(wake_ms),
+                then_stall: then_stall_ms.map(Duration::from_millis),
+            })),
+            ..ReadBoundaryOptions::default()
+        })
+    }
+
+    #[test]
+    fn a_read_waking_a_disk_gets_the_first_response_deadline() {
+        let td = tree();
+        let fast = td.path().join("fast");
+        // 400 ms without a sign of life: fine under a 3 s first-response
+        // deadline even though the stall deadline is 100 ms.
+        let patient = spin_up_boundary(100, Some(3_000), 400, None);
+        let start = Instant::now();
+        assert_eq!(names(&list(&patient, &fast).wait()), ["a.txt"]);
+        assert!(start.elapsed() >= Duration::from_millis(400));
+
+        // The same disk under the stall deadline alone is reported stalled.
+        let impatient = spin_up_boundary(100, None, 400, None);
+        assert_eq!(impatient.first_response(), impatient.timeout());
+        assert!(matches!(
+            list(&impatient, &fast).wait(),
+            Err(ReadFailure::TimedOut { .. })
+        ));
+    }
+
+    #[test]
+    fn after_the_first_answer_the_stall_deadline_applies() {
+        let td = tree();
+        let fast = td.path().join("fast");
+        // Answers at once, then stalls for 1.5 s: the generous first-response
+        // deadline must not cover a stall after the read has answered.
+        let reads = spin_up_boundary(100, Some(10_000), 0, Some(1_500));
+        let start = Instant::now();
+        let outcome = list(&reads, &fast).wait();
+        assert!(
+            matches!(outcome, Err(ReadFailure::TimedOut { .. })),
+            "{outcome:?}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(1_200),
+            "waited {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_read_awaiting_its_first_answer_is_not_stuck_before_its_deadline() {
+        let gate = Arc::new(Gate::default());
+        let td = tree();
+        let slow = td.path().join("slow");
+        gate.park(ReadKind::ListDir, &slow);
+        let reads = ReadBoundary::new(ReadBoundaryOptions {
+            timeout: Duration::from_millis(50),
+            first_response: Some(Duration::from_secs(5)),
+            hook: Some(Arc::clone(&gate) as Arc<dyn ReadHook>),
+            ..ReadBoundaryOptions::default()
+        });
+        let first = list(&reads, &slow);
+        eventually(Duration::from_secs(2), || gate.entered(&slow) == 1);
+        std::thread::sleep(Duration::from_millis(200));
+        // Well past the stall deadline, but still inside the first-response
+        // one: not stuck, so a second request joins instead of being refused.
+        assert_eq!(reads.stuck_reads(), 0);
+        let second = list(&reads, &slow);
+        gate.release_all();
+        assert_eq!(names(&first.wait()), ["inside.txt", "sub"]);
+        assert_eq!(names(&second.wait()), ["inside.txt", "sub"]);
+        assert_eq!(gate.entered(&slow), 1);
+    }
+
+    #[test]
+    fn the_media_profile_waits_30_s_for_a_disk_and_2_s_per_stall() {
+        let options = ReadBoundaryOptions::media();
+        assert_eq!(options.first_response, Some(Duration::from_secs(30)));
+        assert_eq!(options.timeout, DEFAULT_READ_TIMEOUT);
+        assert!(!options.materialize_dataless);
+        let reads = ReadBoundary::new(options);
+        assert_eq!(reads.first_response(), MEDIA_FIRST_RESPONSE_TIMEOUT);
+        assert_eq!(reads.timeout(), Duration::from_secs(2));
     }
 }
