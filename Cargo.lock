@@ -2020,6 +2020,7 @@ dependencies = [
  "icu_collator",
  "icu_locale_core",
  "ignore",
+ "libc",
  "memmap2",
  "notify",
  "notify-debouncer-full",

@@ -879,7 +879,7 @@ mod tests {
             assert_eq!((hard.dev, hard.ino, hard.nlink), (orig.dev, orig.ino, 2));
             let link = &map[&td.path().join("Movies/heat-link")];
             assert_eq!((link.kind, link.is_symlink), (EntryKind::Symlink, true));
-            if lister == ScanLister::Auto && cfg!(target_os = "linux") {
+            if lister == ScanLister::Auto && cfg!(any(target_os = "macos", target_os = "linux")) {
                 assert_eq!(report.listers.portable, 0, "{:?}", report.listers);
             } else {
                 assert_eq!(report.listers.portable, report.dirs_listed);

@@ -8,8 +8,15 @@
 //! cap, joined reads and dataless policy exactly as `list_dir` does; the
 //! progress ticks below are what keep a large-but-moving listing alive.
 //!
-//! Backends, chosen per directory:
+//! Three backends, chosen per directory:
 //!
+//! - **macOS: `getattrlistbulk(2)`.** One syscall returns up to 128 KiB of
+//!   packed records — name, type, `(dev, ino)`, birth and modification time,
+//!   `st_flags`, link count and size for every child — instead of a
+//!   `readdir` plus a full-path `lstat` per child. Research 07 §5 measured
+//!   parallel `getattrlistbulk` at 2.6–4.6× the old walker with ~25× less
+//!   user CPU. `ENOTSUP`/`EINVAL` on the first call (a filesystem without
+//!   the VNOP, or an attribute it refuses) falls back to the portable lister.
 //! - **Linux: `getdents64` + `statx(dirfd, name, AT_SYMLINK_NOFOLLOW,
 //!   BASIC_STATS | BTIME)`** through rustix: dirfd-relative (no path joins,
 //!   no full-path lookups) and with birth time. A kernel without `statx`
@@ -112,8 +119,8 @@ pub(crate) fn is_default_ignored(name: &[u8]) -> bool {
 /// Which lister produced a listing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ListerKind {
-    /// macOS `getattrlistbulk` (the lister lands separately).
-    #[allow(dead_code)]
+    /// macOS `getattrlistbulk`.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Bulk,
     /// Linux `getdents64` + `statx`.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -342,7 +349,7 @@ impl Names {
         self.push_bytes(name.as_bytes())
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
     fn push_bytes(&mut self, name: &[u8]) -> NameRef {
         let start = self.bytes.len();
         self.bytes.extend_from_slice(name);
@@ -425,7 +432,7 @@ impl ScanListing {
         self.entries.push((name, record));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn push_bytes(&mut self, name: &[u8], record: Record) {
         let name = self.names.push_bytes(name);
         self.entries.push((name, record));
@@ -480,6 +487,10 @@ pub(crate) fn scan_dir(
     progress: &ReadProgress,
 ) -> io::Result<ScanListing> {
     if options.lister == ScanLister::Auto {
+        #[cfg(target_os = "macos")]
+        if let Some(listing) = bulk::list(dir, options, progress)? {
+            return Ok(listing);
+        }
         #[cfg(target_os = "linux")]
         if let Some(listing) = linux::list(dir, options, progress)? {
             return Ok(listing);
@@ -536,6 +547,380 @@ fn list_portable(
         out.push(&name, record);
     }
     Ok(out)
+}
+
+/// macOS `getattrlistbulk(2)` lister.
+#[cfg(target_os = "macos")]
+mod bulk {
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+    use std::ffi::{c_void, CStr, CString, OsStr};
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    use std::io;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    use super::{timespec_ns, ListerKind, Record, ScanListOptions, ScanListing};
+    use crate::entry::EntryKind;
+    use crate::read_boundary::ReadProgress;
+
+    /// `<sys/attr.h>`; libc does not bind it. Per-entry errno, placed right
+    /// after `ATTR_CMN_RETURNED_ATTRS` (man 2 getattrlistbulk).
+    const ATTR_CMN_ERROR: u32 = 0x2000_0000;
+    /// `<sys/vnode.h>` `enum vtype`.
+    const VREG: u32 = 1;
+    const VDIR: u32 = 2;
+    const VLNK: u32 = 5;
+    /// Apple DTS recommends at least 32 KiB per call (forum thread 766035);
+    /// 128 KiB holds ~1,000 media-folder entries, so most directories take
+    /// one call plus the terminating zero.
+    const BUF_LEN: usize = 128 * 1024;
+
+    thread_local! {
+        /// Helper threads are long-lived, so each reuses one buffer rather
+        /// than allocating (and page-faulting) 128 KiB per directory.
+        static BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// `Ok(None)` when this directory must be listed another way: the
+    /// filesystem rejects the call, or the loop guard tripped.
+    pub(super) fn list(
+        dir: &Path,
+        options: &ScanListOptions,
+        progress: &ReadProgress,
+    ) -> io::Result<Option<ScanListing>> {
+        let path = CString::new(dir.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+        // SAFETY: `path` is NUL-terminated and outlives the call; the flags
+        // are constants. With materialization off, a dataless directory
+        // answers EDEADLK here, which the boundary maps to `Dataless`.
+        let raw = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `open` just returned this descriptor; nothing else owns it.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        BUF.with(|cell| match cell.try_borrow_mut() {
+            Ok(mut buf) => read_all(&fd, &mut buf, dir, options, progress),
+            // Not reachable (one listing per helper at a time), but never
+            // worth a panic: use a private buffer.
+            Err(_) => read_all(&fd, &mut Vec::new(), dir, options, progress),
+        })
+    }
+
+    /// Network volumes need a loop guard: Apple DTS documents
+    /// `getattrlistbulk` returning the same entries forever on SMB
+    /// (FB15497909, macOS 15). A local volume is trusted, so it pays nothing.
+    fn is_local(fd: &OwnedFd) -> bool {
+        // SAFETY: `statfs` is plain old data, so all-zero is a valid value.
+        let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `fd` is open and `stat` is a valid out-pointer.
+        let rc = unsafe { libc::fstatfs(fd.as_raw_fd(), &mut stat) };
+        rc == 0 && stat.f_flags & (libc::MNT_LOCAL as u32) != 0
+    }
+
+    fn read_all(
+        fd: &OwnedFd,
+        buf: &mut Vec<u8>,
+        dir: &Path,
+        options: &ScanListOptions,
+        progress: &ReadProgress,
+    ) -> io::Result<Option<ScanListing>> {
+        if buf.len() < BUF_LEN {
+            buf.resize(BUF_LEN, 0);
+        }
+        // SAFETY: `attrlist` is plain old data, so all-zero is valid.
+        let mut attrs: libc::attrlist = unsafe { std::mem::zeroed() };
+        attrs.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
+        // Returned in bit order (man 2 getattrlist), ERROR right after
+        // RETURNED_ATTRS: name, devid, objtype, crtime, modtime, flags,
+        // fileid; then the file group: linkcount, datalength. Directories
+        // get no file group; nothing is asked of the directory group.
+        attrs.commonattr = libc::ATTR_CMN_RETURNED_ATTRS
+            | libc::ATTR_CMN_NAME
+            | ATTR_CMN_ERROR
+            | libc::ATTR_CMN_DEVID
+            | libc::ATTR_CMN_OBJTYPE
+            | libc::ATTR_CMN_CRTIME
+            | libc::ATTR_CMN_MODTIME
+            | libc::ATTR_CMN_FLAGS
+            | libc::ATTR_CMN_FILEID;
+        attrs.fileattr = libc::ATTR_FILE_LINKCOUNT | libc::ATTR_FILE_DATALENGTH;
+
+        let mut out = ScanListing::new(ListerKind::Bulk);
+        let mut seen: Option<HashSet<u64>> = (!is_local(fd)).then(HashSet::new);
+        let mut first = true;
+        loop {
+            // SAFETY: `fd` is an open directory; `attrs` and `buf` are valid
+            // for the duration and `buf.len()` is its true length.
+            let count = unsafe {
+                libc::getattrlistbulk(
+                    fd.as_raw_fd(),
+                    (&mut attrs as *mut libc::attrlist).cast::<c_void>(),
+                    buf.as_mut_ptr().cast::<c_void>(),
+                    buf.len(),
+                    0,
+                )
+            };
+            if count < 0 {
+                let err = io::Error::last_os_error();
+                match err.raw_os_error() {
+                    Some(libc::EINTR) => continue,
+                    // The filesystem has no bulk VNOP for these attributes.
+                    // Nothing was consumed from `fd`, and the fallback opens
+                    // its own, so `readdir` and this call never share one.
+                    Some(libc::ENOTSUP | libc::EINVAL) if first => return Ok(None),
+                    _ => return Err(err),
+                }
+            }
+            first = false;
+            if count == 0 {
+                break;
+            }
+            progress.tick();
+            let mut offset = 0usize;
+            for _ in 0..count {
+                let entry = parse(buf, offset)?;
+                offset = offset
+                    .checked_add(entry.len)
+                    .filter(|end| *end <= buf.len())
+                    .ok_or_else(malformed)?;
+                if let Some(seen) = seen.as_mut() {
+                    let mut hasher = DefaultHasher::new();
+                    entry.name.hash(&mut hasher);
+                    if !seen.insert(hasher.finish()) {
+                        // The same name twice: the iteration is looping (or
+                        // two names collide in 64 bits). Either way, start
+                        // over with `readdir`.
+                        return Ok(None);
+                    }
+                }
+                accept(&mut out, fd, dir, options, &entry);
+            }
+        }
+        Ok(Some(out))
+    }
+
+    /// One packed entry, borrowed from the buffer.
+    struct Packed<'a> {
+        len: usize,
+        /// Without the trailing NUL.
+        name: &'a [u8],
+        /// With it, for `fstatat`.
+        name_c: Option<&'a CStr>,
+        error: u32,
+        record: Record,
+    }
+
+    fn malformed() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "getattrlistbulk returned a malformed attribute buffer",
+        )
+    }
+
+    /// Bounds-checked reads from one entry's bytes.
+    struct Reader<'a> {
+        bytes: &'a [u8],
+        pos: usize,
+    }
+
+    impl<'a> Reader<'a> {
+        fn take<const N: usize>(&mut self) -> io::Result<[u8; N]> {
+            let end = self.pos.checked_add(N).ok_or_else(malformed)?;
+            let slice = self.bytes.get(self.pos..end).ok_or_else(malformed)?;
+            self.pos = end;
+            // The slice is exactly N bytes long.
+            slice.try_into().map_err(|_| malformed())
+        }
+        fn u32(&mut self) -> io::Result<u32> {
+            self.take::<4>().map(u32::from_ne_bytes)
+        }
+        fn i32(&mut self) -> io::Result<i32> {
+            self.take::<4>().map(i32::from_ne_bytes)
+        }
+        fn u64(&mut self) -> io::Result<u64> {
+            self.take::<8>().map(u64::from_ne_bytes)
+        }
+        fn i64(&mut self) -> io::Result<i64> {
+            self.take::<8>().map(i64::from_ne_bytes)
+        }
+        /// `struct timespec` on 64-bit Darwin: `time_t` + `long`.
+        fn timespec_ns(&mut self) -> io::Result<i64> {
+            let sec = self.i64()?;
+            let nsec = self.i64()?;
+            Ok(timespec_ns(sec, nsec))
+        }
+    }
+
+    /// Parse the entry at `offset`. Attributes are packed in bit order, each
+    /// 4-byte aligned; every one requested here is a multiple of 4 bytes, so
+    /// no padding falls between them.
+    fn parse(buf: &[u8], offset: usize) -> io::Result<Packed<'_>> {
+        let head = buf.get(offset..).ok_or_else(malformed)?;
+        let len = Reader {
+            bytes: head,
+            pos: 0,
+        }
+        .u32()? as usize;
+        let bytes = head.get(..len).ok_or_else(malformed)?;
+        let mut r = Reader { bytes, pos: 4 };
+        // attribute_set_t: common, vol, dir, file, fork.
+        let common = r.u32()?;
+        let _vol = r.u32()?;
+        let _dir = r.u32()?;
+        let file = r.u32()?;
+        let _fork = r.u32()?;
+
+        let error = if common & ATTR_CMN_ERROR != 0 {
+            r.u32()?
+        } else {
+            0
+        };
+        let (name, name_c) = if common & libc::ATTR_CMN_NAME != 0 {
+            // attrreference_t: offset from the reference itself, length with NUL.
+            let at = r.pos;
+            let rel = r.i32()?;
+            let with_nul = r.u32()? as usize;
+            let start = (at as isize)
+                .checked_add(rel as isize)
+                .and_then(|s| usize::try_from(s).ok())
+                .ok_or_else(malformed)?;
+            let end = start.checked_add(with_nul).ok_or_else(malformed)?;
+            let raw = bytes.get(start..end).ok_or_else(malformed)?;
+            let name_c = CStr::from_bytes_with_nul(raw).ok();
+            let name = name_c.map_or(raw, CStr::to_bytes);
+            (name, name_c)
+        } else {
+            return Err(malformed());
+        };
+        let mut record = Record {
+            kind: EntryKind::Unknown,
+            is_symlink: false,
+            size: 0,
+            mtime_ns: 0,
+            btime_ns: None,
+            dev: 0,
+            ino: 0,
+            flags: 0,
+            nlink: 1,
+        };
+        if common & libc::ATTR_CMN_DEVID != 0 {
+            // dev_t is i32 on Darwin; widen the way std's `MetadataExt::dev`
+            // does (`st_dev as u64`), so the two agree bit for bit.
+            record.dev = r.i32()? as u64;
+        }
+        if common & libc::ATTR_CMN_OBJTYPE != 0 {
+            record.kind = match r.u32()? {
+                VREG => EntryKind::File,
+                VDIR => EntryKind::Directory,
+                VLNK => EntryKind::Symlink,
+                _ => EntryKind::Unknown,
+            };
+            record.is_symlink = record.kind == EntryKind::Symlink;
+        }
+        if common & libc::ATTR_CMN_CRTIME != 0 {
+            record.btime_ns = Some(r.timespec_ns()?);
+        }
+        if common & libc::ATTR_CMN_MODTIME != 0 {
+            record.mtime_ns = r.timespec_ns()?;
+        }
+        if common & libc::ATTR_CMN_FLAGS != 0 {
+            record.flags = r.u32()?;
+        }
+        if common & libc::ATTR_CMN_FILEID != 0 {
+            record.ino = r.u64()?;
+        }
+        if file & libc::ATTR_FILE_LINKCOUNT != 0 {
+            record.nlink = u64::from(r.u32()?);
+        }
+        if file & libc::ATTR_FILE_DATALENGTH != 0 {
+            record.size = u64::try_from(r.i64()?).unwrap_or(0);
+        }
+        Ok(Packed {
+            len,
+            name,
+            name_c,
+            error,
+            record: record.normalised(),
+        })
+    }
+
+    fn accept(
+        out: &mut ScanListing,
+        fd: &OwnedFd,
+        dir: &Path,
+        options: &ScanListOptions,
+        entry: &Packed<'_>,
+    ) {
+        let name = OsStr::from_bytes(entry.name);
+        if entry.error != 0 {
+            out.vanished += 1;
+            return;
+        }
+        let hint = Some(entry.record.kind);
+        if options.drops_before_stat(name, hint) {
+            out.skipped += 1;
+            return;
+        }
+        let mut record = entry.record;
+        if record.kind == EntryKind::Symlink && options.follow_symlinks {
+            if let Some(target) = entry.name_c.and_then(|name| stat_at(fd, name)) {
+                record = Record {
+                    is_symlink: true,
+                    ..target
+                };
+            }
+        }
+        if options.drops_after_stat(name, hint, record.kind) {
+            out.skipped += 1;
+            return;
+        }
+        if record.kind == EntryKind::File && options.is_ignore_file(name) {
+            if let Ok(text) = std::fs::read_to_string(dir.join(name)) {
+                out.ignore_files.push((name.to_os_string(), text));
+            }
+        }
+        out.push_bytes(entry.name, record);
+    }
+
+    /// `fstatat(fd, name, 0)`: follow a link from its directory.
+    fn stat_at(fd: &OwnedFd, name: &CStr) -> Option<Record> {
+        // SAFETY: `stat` is plain old data, so all-zero is valid.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `fd` is open, `name` is NUL-terminated, `st` is a valid
+        // out-pointer; flags 0 follows the link.
+        let rc = unsafe { libc::fstatat(fd.as_raw_fd(), name.as_ptr(), &mut st, 0) };
+        if rc != 0 {
+            return None;
+        }
+        let kind = match st.st_mode & libc::S_IFMT {
+            libc::S_IFREG => EntryKind::File,
+            libc::S_IFDIR => EntryKind::Directory,
+            libc::S_IFLNK => EntryKind::Symlink,
+            _ => EntryKind::Unknown,
+        };
+        Some(
+            Record {
+                kind,
+                is_symlink: false,
+                size: u64::try_from(st.st_size).unwrap_or(0),
+                mtime_ns: timespec_ns(st.st_mtime, st.st_mtime_nsec),
+                btime_ns: Some(timespec_ns(st.st_birthtime, st.st_birthtime_nsec)),
+                dev: st.st_dev as u64,
+                ino: st.st_ino,
+                flags: st.st_flags,
+                nlink: u64::from(st.st_nlink),
+            }
+            .normalised(),
+        )
+    }
 }
 
 /// Linux `getdents64` + `statx` lister.
