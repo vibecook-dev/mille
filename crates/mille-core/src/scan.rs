@@ -402,6 +402,32 @@ impl ScanReport {
 ///
 /// For a library on a disk that sleeps, give `reads` a long first-response
 /// deadline ([`ReadBoundaryOptions::media`](crate::ReadBoundaryOptions::media)).
+///
+/// The walk is synchronous; from async code run it on a blocking thread.
+///
+/// ```no_run
+/// use std::path::Path;
+/// use mille_core::{walk_scan, FileFilter, ReadBoundary, ReadBoundaryOptions, ScanOptions, Visit};
+///
+/// let reads = ReadBoundary::new(ReadBoundaryOptions::media());
+/// let options = ScanOptions {
+///     file_filter: Some(FileFilter::extensions(["mkv", "mp4", "srt"])),
+///     ..ScanOptions::media()
+/// };
+/// let mut files = Vec::new();
+/// let report = walk_scan(Path::new("/Volumes/Media/Movies"), &options, &reads, |dir, e| {
+///     if e.is_file() {
+///         // The only per-entry allocation is the one the caller makes.
+///         files.push((dir.join(e.name), e.identity(), e.size, e.mtime_ns));
+///     }
+///     Visit::Continue
+/// })?;
+/// for unread in &report.unread {
+///     // Unknown, not empty: keep whatever was known below `unread.path`.
+///     eprintln!("not read: {:?} ({:?})", unread.path, unread.failure.code());
+/// }
+/// # Ok::<(), mille_core::FxError>(())
+/// ```
 pub fn walk_scan<F>(
     root: &Path,
     options: &ScanOptions,
