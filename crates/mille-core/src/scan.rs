@@ -573,15 +573,7 @@ impl Scan<'_> {
             if self.options.is_cancelled() {
                 return Err(FxError::Cancelled);
             }
-            while self.inflight.len() < parallelism {
-                let Some(job) = self.pending.pop() else {
-                    break;
-                };
-                let ticket =
-                    self.reads
-                        .scan_dir(&job.path, self.list.clone(), job.dataless, &self.signal);
-                self.inflight.push((job, ticket));
-            }
+            self.fill(parallelism);
             if self.inflight.is_empty() {
                 return Ok(());
             }
@@ -596,6 +588,10 @@ impl Scan<'_> {
                         let (job, _ticket) = self.inflight.swap_remove(index);
                         self.resolve(job, outcome, &mut visit)?;
                         resolved = true;
+                        // Refill at once, so idle helpers get this listing's
+                        // subdirectories without waiting for the rest of the
+                        // pass.
+                        self.fill(parallelism);
                     }
                     None => index += 1,
                 }
@@ -610,6 +606,19 @@ impl Scan<'_> {
                     .min(WAIT_SLICE);
                 self.signal.wait_past(seen, wait);
             }
+        }
+    }
+
+    /// Submit queued directories until `parallelism` reads are in flight.
+    fn fill(&mut self, parallelism: usize) {
+        while self.inflight.len() < parallelism {
+            let Some(job) = self.pending.pop() else {
+                break;
+            };
+            let ticket =
+                self.reads
+                    .scan_dir(&job.path, self.list.clone(), job.dataless, &self.signal);
+            self.inflight.push((job, ticket));
         }
     }
 
