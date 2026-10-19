@@ -55,6 +55,11 @@ smallvec.workspace = true
 # Bitflags (Capability mask)
 bitflags.workspace = true
 
+# The Linux lister behind `walk_scan` (src/scan_list.rs): `getdents64` +
+# `statx`. Already in the lock graph via tempfile.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1", features = ["fs"] }
+
 [dev-dependencies]
 proptest.workspace = true
 tempfile.workspace = true

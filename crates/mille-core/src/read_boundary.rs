@@ -60,6 +60,7 @@ use parking_lot::{Condvar, Mutex};
 
 use crate::error::{ErrorCode, FxError};
 use crate::ignore::IGNORE_FILE_NAMES;
+use crate::scan_list::{ScanListOptions, ScanListing};
 
 /// Default stall deadline. VibeField bounds its own reads outside mille at
 /// 2 s; a healthy local `getdirentries`/`lstat` never comes near it, and
@@ -426,6 +427,9 @@ pub enum ReadOutput {
     Listing(DirListing),
     IgnoreFiles(Vec<IgnoreFile>),
     Opened,
+    /// A scan listing (`walk_scan`): identity and times for every child,
+    /// names in one arena.
+    Scan(ScanListing),
 }
 
 impl ReadOutput {
@@ -442,6 +446,13 @@ impl ReadOutput {
             _ => None,
         }
     }
+
+    pub fn as_scan(&self) -> Option<&ScanListing> {
+        match self {
+            ReadOutput::Scan(listing) => Some(listing),
+            _ => None,
+        }
+    }
 }
 
 pub type ReadOutcome = Result<Arc<ReadOutput>, ReadFailure>;
@@ -450,6 +461,7 @@ pub type ReadOutcome = Result<Arc<ReadOutput>, ReadFailure>;
 enum Op {
     Stat { canonical: bool },
     List(ListOptions),
+    Scan(ScanListOptions),
     IgnoreFiles,
     OpenDir,
 }
@@ -458,7 +470,9 @@ impl Op {
     fn kind(&self) -> ReadKind {
         match self {
             Op::Stat { .. } => ReadKind::Stat,
-            Op::List(_) => ReadKind::ListDir,
+            // A scan listing blocks exactly where a plain listing does, so
+            // the test seam treats them alike; the join key tells them apart.
+            Op::List(_) | Op::Scan(_) => ReadKind::ListDir,
             Op::IgnoreFiles => ReadKind::IgnoreFiles,
             Op::OpenDir => ReadKind::OpenDir,
         }
@@ -652,10 +666,32 @@ impl ReadBoundary {
         known_dataless: bool,
         signal: Option<&Arc<ReadSignal>>,
     ) -> Ticket {
+        self.submit_listing(dir, Op::List(options), known_dataless, signal)
+    }
+
+    /// Start a scan listing of `dir` (see `scan_list`): every child's
+    /// identity and times in one read, through the platform's bulk lister.
+    pub(crate) fn scan_dir(
+        &self,
+        dir: &Path,
+        options: ScanListOptions,
+        known_dataless: bool,
+        signal: &Arc<ReadSignal>,
+    ) -> Ticket {
+        self.submit_listing(dir, Op::Scan(options), known_dataless, Some(signal))
+    }
+
+    fn submit_listing(
+        &self,
+        dir: &Path,
+        op: Op,
+        known_dataless: bool,
+        signal: Option<&Arc<ReadSignal>>,
+    ) -> Ticket {
         if known_dataless && !self.shared.materialize_dataless {
             return Ticket::ready(&self.shared, Err(ReadFailure::Dataless));
         }
-        let ticket = self.submit(dir, Op::List(options));
+        let ticket = self.submit(dir, op);
         if let (Some(flight), Some(signal)) = (&ticket.flight, signal) {
             flight.listeners.lock().push(Arc::clone(signal));
             // It may have finished before the listener was in place.
@@ -1018,6 +1054,9 @@ fn run(shared: &Shared, flight: &Flight) -> ReadOutcome {
     let result = match op {
         Op::Stat { canonical } => stat_path(path, *canonical).map(ReadOutput::Stat),
         Op::List(options) => list_dir(path, *options, progress).map(ReadOutput::Listing),
+        Op::Scan(options) => {
+            crate::scan_list::scan_dir(path, options, progress).map(ReadOutput::Scan)
+        }
         Op::IgnoreFiles => read_ignore_files(path, progress).map(ReadOutput::IgnoreFiles),
         Op::OpenDir => std::fs::read_dir(path).map(|_| ReadOutput::Opened),
     };

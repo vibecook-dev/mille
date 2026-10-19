@@ -51,6 +51,16 @@ pub use walker::{
     SymlinkPolicy, UnreadDirectory, WalkOptions, WalkReport, WalkedEntry,
 };
 
+// flux dogfood — streaming media-grade scan: `(dev, ino)`, birth time, ns
+// mtime per entry; getattrlistbulk on macOS, statx on Linux.
+pub mod scan;
+pub mod scan_list;
+pub use scan::{
+    walk_scan, CancelFlag, DirCtx, FileFilter, ListerCounts, ScanEntry, ScanLister, ScanOptions,
+    ScanReport, Visit,
+};
+pub use scan_list::{ScanListing, DEFAULT_IGNORE_PATTERNS};
+
 // M10 — time-bounded native reads: helper pool, stall deadline, stuck cap,
 // dataless policy.
 pub mod read_boundary;
