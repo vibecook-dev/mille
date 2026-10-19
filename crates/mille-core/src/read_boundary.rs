@@ -747,7 +747,11 @@ impl ReadBoundary {
             return Ticket::ready(shared, Err(ReadFailure::Cancelled));
         }
         if let Some(flight) = state.flights.get(&key) {
-            if !flight.is_stuck(now, shared) {
+            // Join a read that is still running. A finished one lingers in
+            // the map until its helper re-takes the lock to remove it; its
+            // answer predates this request, so it gets a read of its own
+            // (`remove_flight` only removes its own `Arc`).
+            if !flight.is_finished() && !flight.is_stuck(now, shared) {
                 flight.interest.fetch_add(1, Ordering::AcqRel);
                 return Ticket::joined(shared, Arc::clone(flight));
             }
