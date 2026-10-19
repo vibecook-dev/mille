@@ -548,6 +548,9 @@ struct State {
     flights: HashMap<FlightKey, Arc<Flight>>,
     threads: usize,
     idle: usize,
+    /// Idle helpers spinning for the next read (at most one; see
+    /// `next_flight`).
+    spinning: usize,
     closed: bool,
 }
 
@@ -620,6 +623,7 @@ impl ReadBoundary {
                 flights: HashMap::new(),
                 threads: 0,
                 idle: 0,
+                spinning: 0,
                 closed: false,
             }),
             work: Condvar::new(),
@@ -1029,6 +1033,8 @@ fn worker_main(shared: Arc<Shared>) {
 /// more than the read itself on a cached tree (measured: ~25 µs per directory
 /// on a serial `walk_scan` of 8.5k directories, load ~20). The spinning
 /// helper counts as idle, so `submit` hands it the read instead of spawning.
+/// Only one helper spins at a time: one is enough to take the next read
+/// without a wake-up, and the rest would only burn CPU.
 fn next_flight(shared: &Shared, state: &mut MutexGuard<'_, State>) -> Option<Arc<Flight>> {
     let mut spun = false;
     loop {
@@ -1049,8 +1055,9 @@ fn next_flight(shared: &Shared, state: &mut MutexGuard<'_, State>) -> Option<Arc
             return Some(flight);
         }
         state.idle += 1;
-        if !spun {
+        if !spun && state.spinning == 0 {
             spun = true;
+            state.spinning += 1;
             MutexGuard::unlocked(state, || {
                 let until = Instant::now() + SPIN_BEFORE_PARK;
                 while shared.queued.load(Ordering::Acquire) == 0
@@ -1060,9 +1067,11 @@ fn next_flight(shared: &Shared, state: &mut MutexGuard<'_, State>) -> Option<Arc
                     std::hint::spin_loop();
                 }
             });
+            state.spinning -= 1;
             state.idle -= 1;
             continue;
         }
+        spun = true;
         let timed_out = shared.work.wait_for(state, IDLE_KEEPALIVE).timed_out();
         state.idle -= 1;
         if timed_out && state.queue.is_empty() {
