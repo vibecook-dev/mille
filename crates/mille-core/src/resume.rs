@@ -294,8 +294,23 @@ fn entry_path(snap: &ResumeSnapshot, id: EntryId) -> Option<PathBuf> {
 /// state. Returns the set of events a just-resumed watcher would need to
 /// emit to bring subscribers up to date. Output is sorted by (variant,
 /// path) so replay into the event pipeline is deterministic.
+///
+/// A directory below a root that does not answer (stalled, dataless, an OS
+/// error) fails the call with [`FxError::Incomplete`]: its children are
+/// unknown, and diffing them as absent would report every one of them
+/// `Disappeared` — "the drive is asleep" replayed as "everything was
+/// deleted".
 pub fn events_since(snap: &ResumeSnapshot) -> Result<Vec<ResumeEvent>, FxError> {
-    use crate::walker::{walk, WalkOptions};
+    events_since_bounded(snap, crate::read_boundary::ReadBoundary::shared_default())
+}
+
+/// [`events_since`] through a caller-owned boundary (deadline, dataless
+/// policy; the test seam).
+pub(crate) fn events_since_bounded(
+    snap: &ResumeSnapshot,
+    reads: &crate::read_boundary::ReadBoundary,
+) -> Result<Vec<ResumeEvent>, FxError> {
+    use crate::walker::{walk_bounded, WalkOptions};
 
     let mut out: Vec<ResumeEvent> = Vec::new();
 
@@ -320,14 +335,18 @@ pub fn events_since(snap: &ResumeSnapshot) -> Result<Vec<ResumeEvent>, FxError> 
             continue;
         }
 
-        let walked = match walk(
+        let walked = match walk_bounded(
             root,
             WalkOptions {
                 include_hidden: true,
                 include_root: true,
                 ..WalkOptions::default()
             },
-        ) {
+            None,
+            reads,
+        )
+        .and_then(crate::walker::WalkReport::into_complete)
+        {
             Ok(w) => w,
             Err(FxError::Io {
                 code: ErrorCode::ENOENT,
@@ -819,5 +838,45 @@ mod tests {
             in_b.is_empty(),
             "root B should have no events, got {in_b:?}"
         );
+    }
+
+    /// A stalled subdirectory used to vanish from the walk, and every file
+    /// the snapshot knew below it came back `Disappeared`.
+    #[test]
+    fn events_since_fails_incomplete_instead_of_reporting_a_stalled_subtree_deleted() {
+        use crate::read_boundary::tests::{boundary, Gate};
+        use crate::read_boundary::{ReadFailure, ReadKind};
+        use std::sync::Arc;
+
+        let td = TempDir::new().unwrap();
+        let season = td.path().join("Show/Season 01");
+        fs::create_dir_all(&season).unwrap();
+        for ep in 1..=3 {
+            fs::write(season.join(format!("S01E0{ep}.mkv")), b"x").unwrap();
+        }
+        let snap = snapshot_of_real_dir(td.path());
+
+        let gate = Arc::new(Gate::default());
+        gate.park(ReadKind::ListDir, &season);
+        let reads = boundary(&gate, 150);
+        let err = events_since_bounded(&snap, &reads).unwrap_err();
+        match &err {
+            FxError::Incomplete { unread } => {
+                assert_eq!(unread.len(), 1);
+                assert_eq!(unread[0].path, season);
+                assert!(matches!(unread[0].failure, ReadFailure::TimedOut { .. }));
+            }
+            other => panic!("expected Incomplete, got {other:?}"),
+        }
+        assert_eq!(err.code(), ErrorCode::ETIMEDOUT);
+        gate.release_all();
+
+        // Once the directory answers, nothing changed and nothing is reported.
+        let start = std::time::Instant::now();
+        while reads.stuck_reads() > 0 {
+            assert!(start.elapsed() < std::time::Duration::from_secs(2));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(events_since_bounded(&snap, &reads).unwrap().is_empty());
     }
 }

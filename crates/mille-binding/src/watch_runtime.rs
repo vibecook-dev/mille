@@ -634,8 +634,9 @@ where
 
             // Depth one reads only `directory`: if that read does not answer,
             // the walk fails with its typed error before EOF, so nothing below
-            // is removed and the listing is never marked complete.
-            walk_bounded_batched(
+            // is removed and the listing is never marked complete. No
+            // subdirectory is read, so the report's `unread` is always empty.
+            let _depth_one = walk_bounded_batched(
                 directory,
                 walk_options,
                 traversal.as_ref(),

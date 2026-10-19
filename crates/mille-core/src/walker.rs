@@ -108,6 +108,7 @@ pub struct UnreadDirectory {
 }
 
 /// The result of a bounded walk.
+#[must_use = "`unread` directories are unknown, not empty; check it or call `into_complete`"]
 #[derive(Debug, Default)]
 pub struct WalkReport {
     /// Walked entries in walk order. Empty for the batched form, whose
@@ -122,8 +123,31 @@ pub struct WalkReport {
     pub ignore_files: Vec<(PathBuf, String)>,
 }
 
+impl WalkReport {
+    /// The entries, if every directory answered; otherwise
+    /// [`FxError::Incomplete`] carrying `unread`. For callers that need the
+    /// whole tree or nothing.
+    pub fn into_complete(self) -> Result<Vec<WalkedEntry>, FxError> {
+        if self.unread.is_empty() {
+            Ok(self.entries)
+        } else {
+            Err(FxError::Incomplete {
+                unread: self.unread,
+            })
+        }
+    }
+}
+
+/// Walk `root` through the process-wide default [`ReadBoundary`].
+///
+/// All or nothing: if any directory below the root does not answer (stall,
+/// dataless placeholder, OS error), this fails with [`FxError::Incomplete`]
+/// rather than returning a tree with that subtree silently missing — a caller
+/// diffing the result against an earlier walk would otherwise read "drive
+/// asleep" as "everything below it deleted". Use [`walk_bounded`] to keep the
+/// partial result and act on `unread` directly.
 pub fn walk(root: &Path, options: WalkOptions) -> Result<Vec<WalkedEntry>, FxError> {
-    Ok(walk_bounded(root, options, None, ReadBoundary::shared_default())?.entries)
+    walk_bounded(root, options, None, ReadBoundary::shared_default())?.into_complete()
 }
 
 /// Walk with gitignore rules applied BEFORE symlink resolution.
@@ -138,17 +162,25 @@ pub fn walk(root: &Path, options: WalkOptions) -> Result<Vec<WalkedEntry>, FxErr
 /// `.rgignore` is listed, its rules apply to its siblings and everything
 /// below them, so nested ignore files work the same as the root one. The
 /// caller's matcher is consulted first and is never modified.
+///
+/// Fails with [`FxError::Incomplete`] when a directory does not answer, as
+/// [`walk`] does.
 pub fn walk_with_ignore(
     root: &Path,
     options: WalkOptions,
     ignore: &IgnoreMatcher,
 ) -> Result<Vec<WalkedEntry>, FxError> {
-    Ok(walk_bounded(root, options, Some(ignore), ReadBoundary::shared_default())?.entries)
+    walk_bounded(root, options, Some(ignore), ReadBoundary::shared_default())?.into_complete()
 }
 
 /// Stream a walk in bounded batches. The walker keeps its deterministic
 /// per-directory ordering, but callers can publish each completed batch
 /// instead of waiting for the entire subtree to materialize.
+///
+/// Every batch is delivered; then, if a directory did not answer, the walk
+/// fails with [`FxError::Incomplete`], so the caller knows the batches it
+/// published are not the whole tree. [`walk_bounded_batched`] reports the
+/// same directories without failing.
 pub fn walk_batched<C, F>(
     root: &Path,
     options: WalkOptions,
@@ -168,11 +200,13 @@ where
         batch_size,
         cancelled,
         on_batch,
-    )
+    )?
+    .into_complete()
     .map(|_| ())
 }
 
-/// Ignore-aware companion to [`walk_batched`].
+/// Ignore-aware companion to [`walk_batched`]; fails with
+/// [`FxError::Incomplete`] the same way.
 pub fn walk_with_ignore_batched<C, F>(
     root: &Path,
     options: WalkOptions,
@@ -193,7 +227,8 @@ where
         batch_size,
         cancelled,
         on_batch,
-    )
+    )?
+    .into_complete()
     .map(|_| ())
 }
 
@@ -1705,6 +1740,36 @@ mod bounded_reads {
         let healed = walk_bounded(td.path(), WalkOptions::default(), None, &reads).unwrap();
         assert!(healed.unread.is_empty());
         assert!(healed.entries.iter().any(|e| e.name == "deep.txt"));
+    }
+
+    /// The all-or-nothing forms (`walk`, `walk_with_ignore`, the batched
+    /// pair) go through `into_complete`: a stalled subtree is an error, not
+    /// a smaller tree.
+    #[test]
+    fn into_complete_turns_unread_directories_into_an_incomplete_error() {
+        let gate = Arc::new(Gate::default());
+        let td = tree();
+        let slow = td.path().join("slow");
+        gate.park(ReadKind::ListDir, &slow);
+        let reads = boundary(&gate, 150);
+        let report = walk_bounded(td.path(), WalkOptions::default(), None, &reads).unwrap();
+        let err = report.into_complete().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ETIMEDOUT);
+        match err {
+            crate::error::FxError::Incomplete { unread } => {
+                assert_eq!(unread.len(), 1);
+                assert_eq!(unread[0].path, slow);
+            }
+            other => panic!("expected Incomplete, got {other:?}"),
+        }
+        gate.release_all();
+
+        let healthy = tree();
+        let entries = walk_bounded(healthy.path(), WalkOptions::default(), None, &reads)
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        assert!(entries.iter().any(|e| e.name == "deep.txt"));
     }
 
     #[test]

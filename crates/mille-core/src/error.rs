@@ -93,6 +93,29 @@ pub enum FxError {
 
     #[error("EntryId space exhausted (2^53 cap)")]
     EntryIdExhausted,
+
+    /// A walk finished, but some directories below its root never answered
+    /// (stalled, refused while stuck, dataless) or answered with an OS error.
+    /// Their children are unknown — not absent — so a caller that wanted the
+    /// whole tree must not treat the entries it did get as complete. Returned
+    /// by the walk forms that have no report to put `unread` in.
+    #[error("{}", incomplete_message(unread))]
+    Incomplete {
+        unread: Vec<crate::walker::UnreadDirectory>,
+    },
+}
+
+fn incomplete_message(unread: &[crate::walker::UnreadDirectory]) -> String {
+    match unread.first() {
+        Some(first) => format!(
+            "walk incomplete: {} director{} could not be read (first: {:?}, {:?})",
+            unread.len(),
+            if unread.len() == 1 { "y" } else { "ies" },
+            first.path,
+            first.failure.code(),
+        ),
+        None => "walk incomplete".to_string(),
+    }
 }
 
 impl FxError {
@@ -105,6 +128,11 @@ impl FxError {
             FxError::InvalidInput(_) => ErrorCode::EINVAL,
             FxError::InternalBug(_) => ErrorCode::EUNKNOWN,
             FxError::EntryIdExhausted => ErrorCode::EUNKNOWN,
+            // The first directory's own reason: ETIMEDOUT for a stall,
+            // EDATALESS for a placeholder, EACCES for a permission error.
+            FxError::Incomplete { unread } => unread
+                .first()
+                .map_or(ErrorCode::ETIMEDOUT, |first| first.failure.code()),
         }
     }
 }
@@ -259,6 +287,18 @@ mod tests {
         assert_eq!(FxError::InvalidInput("x".into()).code(), ErrorCode::EINVAL);
         assert_eq!(FxError::InternalBug("x".into()).code(), ErrorCode::EUNKNOWN);
         assert_eq!(FxError::EntryIdExhausted.code(), ErrorCode::EUNKNOWN);
+
+        let incomplete = FxError::Incomplete {
+            unread: vec![crate::walker::UnreadDirectory {
+                path: PathBuf::from("/media/tv"),
+                failure: crate::read_boundary::ReadFailure::Dataless,
+            }],
+        };
+        assert_eq!(incomplete.code(), ErrorCode::EDATALESS);
+        assert!(
+            incomplete.to_string().contains("1 directory"),
+            "{incomplete}"
+        );
     }
 
     #[cfg(unix)]
