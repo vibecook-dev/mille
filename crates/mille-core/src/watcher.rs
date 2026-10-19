@@ -556,87 +556,73 @@ enum PathState {
 /// Algorithm: group by path, run a small state machine per group, then
 /// emit one event per path in first-seen order. `Overflow` and `Error`
 /// are not grouped per path and pass through inline.
+///
+/// One pass, O(n) in the batch: each output slot records which path owns
+/// it, so the final event is a direct lookup. (The previous final pass
+/// searched every first-seen path for each slot's owner — O(n²): 10k
+/// events took 7.4 s and 40k took 86 s, on the forwarder thread, under the
+/// binding's `policy_gate`. An `npm install` or a season-pack copy is easily
+/// that many events.) Keys borrow from `raw`, so a path is cloned once, into
+/// its output event.
 pub fn coalesce_events(raw: &[RawEvent]) -> Vec<FsChangeEvent> {
     use std::collections::HashMap;
 
-    // Per-path running state, plus the index of first appearance so we
-    // can emit in deterministic first-seen order.
-    let mut state: HashMap<PathBuf, PathState> = HashMap::new();
-    let mut first_seen: Vec<PathBuf> = Vec::new();
+    /// One output position: a path's coalesced event (index into
+    /// `paths`), or a Coarse/Error that passes through where it appeared.
+    enum Slot<'a> {
+        Path(usize),
+        Pass(&'a RawEvent),
+    }
 
-    // Output buffer. Overflow/Error events are appended inline at the
-    // position they appeared, preserving relative order with first-seen
-    // path events.
-    let mut out: Vec<FsChangeEvent> = Vec::new();
-    // Marker indices in `out` for each first-seen path so we can patch
-    // the final coalesced event in place once the batch is fully scanned.
-    let mut path_slot: HashMap<PathBuf, usize> = HashMap::new();
+    let mut slots: Vec<Slot<'_>> = Vec::with_capacity(raw.len());
+    // Per-path running state, in first-seen order.
+    let mut paths: Vec<(&PathBuf, PathState)> = Vec::new();
+    let mut index: HashMap<&Path, usize> = HashMap::new();
 
     for ev in raw {
         match ev {
-            RawEvent::Overflow { root } => {
-                out.push(FsChangeEvent::Coarse { root: root.clone() });
-            }
-            RawEvent::Error(msg) => {
-                out.push(FsChangeEvent::Error {
-                    message: msg.clone(),
-                });
-            }
+            RawEvent::Overflow { .. } | RawEvent::Error(_) => slots.push(Slot::Pass(ev)),
             RawEvent::Created(p)
             | RawEvent::Modified(p)
             | RawEvent::Deleted(p)
-            | RawEvent::Any(p) => {
-                // Reserve a slot for this path on first appearance so its
-                // position in the output matches first-seen order.
-                if !path_slot.contains_key(p) {
-                    path_slot.insert(p.clone(), out.len());
-                    first_seen.push(p.clone());
-                    // Placeholder; overwritten below before return.
-                    out.push(FsChangeEvent::Unknown { path: p.clone() });
+            | RawEvent::Any(p) => match index.get(p.as_path()) {
+                Some(&at) => paths[at].1 = transition(Some(paths[at].1), ev),
+                None => {
+                    // Reserve the slot on first appearance, so the path's
+                    // position in the output is its first-seen position.
+                    index.insert(p.as_path(), paths.len());
+                    slots.push(Slot::Path(paths.len()));
+                    paths.push((p, transition(None, ev)));
                 }
-                let next = transition(state.get(p).copied(), ev);
-                state.insert(p.clone(), next);
-            }
+            },
         }
     }
 
-    // Patch each path slot with its final coalesced event, dropping
-    // cancelled paths by collecting into a fresh vector that skips them.
-    let mut final_out: Vec<FsChangeEvent> = Vec::with_capacity(out.len());
-    let mut emitted_path: HashMap<usize, ()> = HashMap::new();
-    for (idx, slot) in out.into_iter().enumerate() {
-        // Find the path that owns this slot, if any.
-        let owner = first_seen.iter().find(|p| path_slot[*p] == idx);
-        match owner {
-            Some(p) => {
-                if emitted_path.contains_key(&idx) {
-                    continue;
-                }
-                emitted_path.insert(idx, ());
-                match state[p] {
-                    PathState::Cancelled => { /* drop transient file */ }
-                    PathState::Created => {
-                        final_out.push(FsChangeEvent::Created { path: p.clone() });
-                    }
-                    PathState::Modified => {
-                        final_out.push(FsChangeEvent::Modified { path: p.clone() });
-                    }
-                    PathState::Deleted => {
-                        final_out.push(FsChangeEvent::Deleted { path: p.clone() });
-                    }
-                    PathState::Unknown => {
-                        final_out.push(FsChangeEvent::Unknown { path: p.clone() });
-                    }
+    slots
+        .into_iter()
+        .filter_map(|slot| match slot {
+            Slot::Pass(RawEvent::Overflow { root }) => {
+                Some(FsChangeEvent::Coarse { root: root.clone() })
+            }
+            Slot::Pass(RawEvent::Error(message)) => Some(FsChangeEvent::Error {
+                message: message.clone(),
+            }),
+            // Only Overflow and Error are pushed as pass-through.
+            Slot::Pass(_) => None,
+            Slot::Path(at) => {
+                let (path, state) = paths[at];
+                let path = path.clone();
+                match state {
+                    // Create+Delete inside the window: a transient file.
+                    PathState::Cancelled => None,
+                    PathState::Created => Some(FsChangeEvent::Created { path }),
+                    PathState::Modified => Some(FsChangeEvent::Modified { path }),
+                    PathState::Deleted => Some(FsChangeEvent::Deleted { path }),
+                    PathState::Unknown => Some(FsChangeEvent::Unknown { path }),
                 }
             }
-            None => {
-                // Pass-through Coarse / Error.
-                final_out.push(slot);
-            }
-        }
-    }
-
-    final_out
+        })
+        .collect()
 }
 
 /// State-machine transition. `prev` is the current state for this path
@@ -1485,6 +1471,132 @@ mod tests {
                 FsChangeEvent::Created { path: pb("/e") },
             ]
         );
+    }
+
+    /// A storm the size of an `npm install` or a season-pack copy. The
+    /// quadratic final pass took 86 s on 40k events (release build); one
+    /// pass takes milliseconds even in a debug build on a loaded machine.
+    #[test]
+    fn coalesce_40k_events_is_linear() {
+        let mut raw: Vec<RawEvent> = (0..40_000)
+            .map(|i| RawEvent::Created(PathBuf::from(format!("/lib/Show/S01/ep{i:06}.mkv"))))
+            .collect();
+        // Every file is also written once more, and an overflow and an error
+        // land mid-batch, so the pass-through and repeat paths are exercised.
+        raw.extend(
+            (0..40_000)
+                .map(|i| RawEvent::Modified(PathBuf::from(format!("/lib/Show/S01/ep{i:06}.mkv")))),
+        );
+        raw.insert(20_000, RawEvent::Overflow { root: pb("/lib") });
+        raw.insert(50_000, RawEvent::Error("boom".into()));
+        let start = std::time::Instant::now();
+        let out = coalesce_events(&raw);
+        let elapsed = start.elapsed();
+        assert_eq!(out.len(), 40_002);
+        assert_eq!(
+            out[0],
+            FsChangeEvent::Created {
+                path: pb("/lib/Show/S01/ep000000.mkv")
+            }
+        );
+        assert_eq!(out[20_000], FsChangeEvent::Coarse { root: pb("/lib") });
+        assert_eq!(
+            out[40_001],
+            FsChangeEvent::Error {
+                message: "boom".into()
+            }
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "coalescing 80k events took {elapsed:?}"
+        );
+    }
+
+    /// The pre-fix coalescer, verbatim apart from its name: the oracle the
+    /// one-pass version must agree with on every batch.
+    fn coalesce_reference(raw: &[RawEvent]) -> Vec<FsChangeEvent> {
+        use std::collections::HashMap;
+        let mut state: HashMap<PathBuf, PathState> = HashMap::new();
+        let mut first_seen: Vec<PathBuf> = Vec::new();
+        let mut out: Vec<FsChangeEvent> = Vec::new();
+        let mut path_slot: HashMap<PathBuf, usize> = HashMap::new();
+        for ev in raw {
+            match ev {
+                RawEvent::Overflow { root } => {
+                    out.push(FsChangeEvent::Coarse { root: root.clone() });
+                }
+                RawEvent::Error(msg) => {
+                    out.push(FsChangeEvent::Error {
+                        message: msg.clone(),
+                    });
+                }
+                RawEvent::Created(p)
+                | RawEvent::Modified(p)
+                | RawEvent::Deleted(p)
+                | RawEvent::Any(p) => {
+                    if !path_slot.contains_key(p) {
+                        path_slot.insert(p.clone(), out.len());
+                        first_seen.push(p.clone());
+                        out.push(FsChangeEvent::Unknown { path: p.clone() });
+                    }
+                    let next = transition(state.get(p).copied(), ev);
+                    state.insert(p.clone(), next);
+                }
+            }
+        }
+        let mut final_out: Vec<FsChangeEvent> = Vec::with_capacity(out.len());
+        let mut emitted_path: HashMap<usize, ()> = HashMap::new();
+        for (idx, slot) in out.into_iter().enumerate() {
+            let owner = first_seen.iter().find(|p| path_slot[*p] == idx);
+            match owner {
+                Some(p) => {
+                    if emitted_path.contains_key(&idx) {
+                        continue;
+                    }
+                    emitted_path.insert(idx, ());
+                    match state[p] {
+                        PathState::Cancelled => {}
+                        PathState::Created => {
+                            final_out.push(FsChangeEvent::Created { path: p.clone() })
+                        }
+                        PathState::Modified => {
+                            final_out.push(FsChangeEvent::Modified { path: p.clone() })
+                        }
+                        PathState::Deleted => {
+                            final_out.push(FsChangeEvent::Deleted { path: p.clone() })
+                        }
+                        PathState::Unknown => {
+                            final_out.push(FsChangeEvent::Unknown { path: p.clone() })
+                        }
+                    }
+                }
+                None => final_out.push(slot),
+            }
+        }
+        final_out
+    }
+
+    fn raw_event() -> impl proptest::strategy::Strategy<Value = RawEvent> {
+        use proptest::prelude::*;
+        // Few distinct paths, so most batches revisit paths in every state.
+        let path = (0u8..6).prop_map(|i| PathBuf::from(format!("/r/{i}")));
+        prop_oneof![
+            path.clone().prop_map(RawEvent::Created),
+            path.clone().prop_map(RawEvent::Modified),
+            path.clone().prop_map(RawEvent::Deleted),
+            path.prop_map(RawEvent::Any),
+            Just(RawEvent::Overflow { root: pb("/r") }),
+            Just(RawEvent::Error("e".into())),
+        ]
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn coalesce_matches_the_quadratic_reference(
+            raw in proptest::collection::vec(raw_event(), 0..64)
+        ) {
+            proptest::prop_assert_eq!(coalesce_events(&raw), coalesce_reference(&raw));
+        }
     }
 
     #[test]
