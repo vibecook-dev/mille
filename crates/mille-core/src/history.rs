@@ -966,6 +966,29 @@ mod tests {
         }
     }
 
+    /// A token after which nothing under `root` has been numbered for
+    /// 300 ms. Under load fseventsd numbers events late (seen here: more
+    /// than 800 ms after they happened, and out of order across paths).
+    /// That is safe — an event is never numbered at or below a token
+    /// captured before it was numbered, so lateness only makes a later
+    /// replay a superset — but a test that asserts exact sets must start
+    /// from a quiet point.
+    #[cfg(target_os = "macos")]
+    fn quiet_token(root: &Path) -> HistoryToken {
+        let start = Instant::now();
+        loop {
+            let token = HistoryToken::capture(root).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            let quiet = matches!(
+                replay_since(&token, &ReplayOptions::default()).unwrap().replay,
+                Replay::Changes(ref c) if c.is_empty()
+            );
+            if quiet || start.elapsed() > Duration::from_secs(10) {
+                return token;
+            }
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn a_replay_names_what_changed_since_the_token_and_nothing_else() {
@@ -976,9 +999,7 @@ mod tests {
         for f in ["Show/S01/e1.mkv", "old.mkv", "gone.mkv", "movie.mkv"] {
             fs::write(root.join(f), b"x").unwrap();
         }
-        // Let fseventsd number the setup before the token.
-        std::thread::sleep(Duration::from_millis(500));
-        let token = HistoryToken::capture(&root).unwrap();
+        let token = quiet_token(&root);
         assert_eq!(token.root, root);
 
         fs::write(root.join("new.mkv"), b"new").unwrap();
@@ -1028,12 +1049,13 @@ mod tests {
         assert_eq!(next.volume_uuid, token.volume_uuid);
         assert!(next.event_id >= token.event_id);
 
-        // From the token a replay hands back once all that has long been
-        // numbered: nothing new.
-        std::thread::sleep(Duration::from_millis(300));
+        // Once all that is numbered, the token a replay hands back replays
+        // nothing.
+        let quiet = quiet_token(&root);
         let next = replay_since(&token, &ReplayOptions::default())
             .unwrap()
             .next;
+        assert!(next.event_id >= quiet.event_id);
         let report = replay_since(&next, &ReplayOptions::default()).unwrap();
         assert_eq!(report.replay, Replay::Changes(HistoryChanges::default()));
 
