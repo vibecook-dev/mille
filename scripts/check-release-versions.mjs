@@ -75,7 +75,7 @@ if (workspaceVersion !== expected) {
 // `Cargo.lock` records the local crates too, and a stale entry there fails the
 // `--locked` builds the release matrix runs — long after the release PR merged.
 const lock = read('Cargo.lock');
-for (const name of ['mille-core', 'mille-binding', 'mille-bench']) {
+for (const name of ['mille-core', 'mille-git', 'mille-binding', 'mille-bench']) {
   const actual = lock.match(
     new RegExp(`\\[\\[package\\]\\]\\r?\\nname = "${name}"\\r?\\nversion = "([^"]+)"`),
   )?.[1];

@@ -39,6 +39,8 @@ const require = createRequire(import.meta.url);
 const nativePath = buildIdentity().resolvedPath;
 const native = require(nativePath);
 const hasProbes = typeof native.__panicProbeSync === 'function';
+// Only a `--features panic-probe,git` build (`build:napi:git:probe`) has these.
+const hasGitProbes = typeof native.__gitPanicProbeSync === 'function';
 
 // Run the probe in a child process: if the guard regresses, the callee dies,
 // and a child is the only way to observe that without taking the suite down.
@@ -120,6 +122,35 @@ test(
     assert.equal(exitCode, 0, `child exited ${exitCode}; stdout: ${stdout}`);
     assert.match(stdout, /^CAUGHT: /m);
     assert.match(stdout, /asynchronous panic across the napi boundary/);
+  },
+);
+
+// SPEC mille-git §18.4: the git module must not be the one exception path. The
+// sync probe panics in `mille-git`'s own code; the async one panics inside a
+// task on the git engine's runtime — where a gix panic in a status or diff
+// would happen — and must come back as an `EUNKNOWN` rejection, not an abort.
+test(
+  'a panic inside mille-git (sync) becomes a catchable JS error',
+  { skip: !hasGitProbes && 'built without --features panic-probe,git' },
+  () => {
+    const { exitCode, signal, stdout } = runProbe('git-sync');
+
+    assert.equal(signal ?? null, null, `child died on ${signal} — the git panic was not caught`);
+    assert.equal(exitCode, 0, `child exited ${exitCode}; stdout: ${stdout}`);
+    assert.match(stdout, /^CAUGHT: /m);
+    assert.match(stdout, /synchronous panic inside mille-git/);
+  },
+);
+
+test(
+  'a panic on the git engine runtime rejects with GIT|EUNKNOWN',
+  { skip: !hasGitProbes && 'built without --features panic-probe,git' },
+  () => {
+    const { exitCode, signal, stdout } = runProbe('git-async');
+
+    assert.equal(signal ?? null, null, `child died on ${signal} — the git panic was not caught`);
+    assert.equal(exitCode, 0, `child exited ${exitCode}; stdout: ${stdout}`);
+    assert.match(stdout, /^CAUGHT: GIT\|EUNKNOWN\|\|mille-git task panicked/m);
   },
 );
 

@@ -1,0 +1,39 @@
+[package]
+name = "mille-git"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Git engine for mille: gix reads, git CLI writes, per-worktree queues. No NAPI."
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# Test-only `GitEngine::panic_probe_*`: deliberate panics inside this crate,
+# so the binding's panic-boundary suite can prove a panic in the git engine
+# reaches JS as an error (SPEC mille-git §18.4). Never on in a published build;
+# the binding's own `panic-probe` feature turns it on.
+panic-probe = []
+
+# v1 MUST NOT depend on `mille-core` (a future `gitd` links this crate alone),
+# nor on napi, git2/libgit2-sys or anything JS (SPEC mille-git §8.1).
+[dependencies]
+gix.workspace = true
+notify.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+# Cancelling a git child sends SIGTERM to its whole process group first, so git
+# can remove its own `index.lock` and so a hook's grandchildren die with it.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+serde_json = "1"
+tempfile.workspace = true

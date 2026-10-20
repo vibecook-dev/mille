@@ -195,15 +195,15 @@ pub struct SearchHitJs {
     pub matched_indices: Vec<u32>,
 }
 
-/// Mirror of api.d.ts `SearchOptions`. `signal` and `kinds` on the
-/// public surface are deferred — the Phase 10 engine only wires
-/// limit / includeIgnored / caseSensitive. Extra fields land when
-/// downstream phases justify them.
+/// Mirror of api.d.ts `SearchOptions`. `signal` on the public surface is
+/// not wired — a synchronous native search has nothing to abort. `kinds`
+/// carries `EntryKind` discriminants (0 file, 1 directory, …).
 #[napi(object)]
 pub struct SearchOptionsJs {
     pub limit: Option<u32>,
     pub include_ignored: Option<bool>,
     pub case_sensitive: Option<bool>,
+    pub kinds: Option<Vec<u32>>,
 }
 
 /// Mirror of api.d.ts `FileSystemEvent` union.

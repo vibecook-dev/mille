@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::entry::{Entry, EntryId};
 use crate::error::{ErrorCode, FxError};
 use crate::snapshot::StoreSnapshot;
+use crate::walker::WalkedEntry;
 
 /// Bump when the on-disk shape changes in a way that makes older readers
 /// unsafe. Callers get `FxError::Unsupported` on mismatch.
@@ -129,8 +130,13 @@ pub fn write_snapshot(
     root_stats: &[RootStat],
     path: &Path,
 ) -> Result<(), FxError> {
-    // Require parent to exist — creating it would silently mask a misconfigured
-    // caller-supplied path.
+    require_parent(path)?;
+    write_resume(&snapshot_to_resume(snap, next_entry_id, root_stats), path)
+}
+
+/// Require the parent to exist — creating it would silently mask a
+/// misconfigured caller-supplied path.
+fn require_parent(path: &Path) -> Result<(), FxError> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() && !parent.exists() {
             return Err(FxError::Io {
@@ -140,11 +146,253 @@ pub fn write_snapshot(
             });
         }
     }
+    Ok(())
+}
 
-    let resume = snapshot_to_resume(snap, next_entry_id, root_stats);
+/// [`write_snapshot`] straight from walked entries, without an
+/// [`EntryStore`](crate::store::EntryStore).
+///
+/// Writes what [`populate_store`](crate::walker::populate_store) into a
+/// fresh `EntryStore` followed by `write_snapshot(&store.snapshot(), …)`
+/// writes — the same ids, parents, children in the store's default sibling
+/// order, child counts, visible counts and sizes; only `created_ms`
+/// differs — at a fraction of the cost: no per-entry snapshot bookkeeping,
+/// no path index, no ancestor walk per entry. (Subtree sums are not capped
+/// at the store's 128-level ancestor walk, which only matters below that
+/// depth.)
+///
+/// `root_stats` names the roots, in order; `events_since` pairs the i-th
+/// root with the i-th `RootStat`. A root's own entry is taken from `walked`
+/// (an entry with `parent_path: None` at that path) or, when absent, made
+/// up as a directory with the stat's mtime. Every other entry's
+/// `parent_path` must be a root or another walked entry, and every entry
+/// without a parent must be a root: anything else is `InvalidInput`, as is
+/// a path walked twice.
+pub fn write_snapshot_from(
+    walked: &[WalkedEntry],
+    root_stats: &[RootStat],
+    path: &Path,
+) -> Result<(), FxError> {
+    write_snapshot_from_with(walked, root_stats, path, Durability::Synced)
+}
+
+/// [`write_snapshot_from`], choosing how the file reaches the disk.
+///
+/// On a USB SSD the two `fsync`s are most of a snapshot write: 90–540 ms
+/// (median 186 ms) for a 1.2 MB snapshot, against about 1 ms to write and
+/// rename it unsynced (flux dogfood, docs/prototype/mille-changes.md
+/// Phase D). [`Durability::Unsynced`] is for a snapshot that is only a hint.
+pub fn write_snapshot_from_with(
+    walked: &[WalkedEntry],
+    root_stats: &[RootStat],
+    path: &Path,
+    durability: Durability,
+) -> Result<(), FxError> {
+    require_parent(path)?;
+    let resume = resume_from_walked(walked, root_stats)?;
     let bytes = bincode::serde::encode_to_vec(&resume, bincode_cfg())
         .map_err(|e| FxError::InternalBug(format!("bincode encode: {e}")))?;
+    write_atomically(path, &bytes, durability)
+}
 
+/// How a snapshot write reaches the disk.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Durability {
+    /// `fsync` the file, rename it into place, `fsync` the directory: a write
+    /// that returned `Ok` survives a power loss. [`write_snapshot`]'s
+    /// behaviour.
+    #[default]
+    Synced,
+    /// Write and rename, no `fsync`. Still atomic if the process dies (the
+    /// path holds the old file or the new one), but after a power loss or a
+    /// kernel panic it may hold the previous snapshot, or one that
+    /// [`read_snapshot`] rejects. For a snapshot that only saves work: the
+    /// caller must treat an unreadable one as absent, and must not depend
+    /// on it being the latest.
+    Unsynced,
+}
+
+/// The `ResumeSnapshot` of [`write_snapshot_from`].
+pub(crate) fn resume_from_walked(
+    walked: &[WalkedEntry],
+    root_stats: &[RootStat],
+) -> Result<ResumeSnapshot, FxError> {
+    use crate::entry::EntryKind;
+    use crate::snapshot::VisibilityPolicy;
+    use crate::sort::SiblingOrder;
+
+    // The roots `walked` lacks.
+    let made_up: Vec<WalkedEntry> = root_stats
+        .iter()
+        .filter(|rs| {
+            !walked
+                .iter()
+                .any(|w| w.parent_path.is_none() && w.path == rs.path)
+        })
+        .map(|rs| WalkedEntry {
+            path: rs.path.clone(),
+            parent_path: None,
+            name: rs
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            kind: EntryKind::Directory,
+            size: 0,
+            mtime_ms: rs.mtime_ms,
+            ctime_ms: rs.mtime_ms,
+            is_symlink: false,
+            symlink_target_is_dir: None,
+            is_readonly: false,
+            is_hidden: false,
+            depth: 0,
+        })
+        .collect();
+
+    // Ids as `populate_store` hands them out on a fresh store: in
+    // (depth, path) order, from 0.
+    let mut ordered: Vec<&WalkedEntry> = walked.iter().chain(made_up.iter()).collect();
+    ordered.sort_by(|a, b| a.depth.cmp(&b.depth).then_with(|| a.path.cmp(&b.path)));
+    let mut ids: HashMap<&Path, EntryId> = HashMap::with_capacity(ordered.len());
+    for (i, w) in ordered.iter().enumerate() {
+        if ids.insert(w.path.as_path(), EntryId(i as u64)).is_some() {
+            return Err(FxError::InvalidInput(format!(
+                "path walked twice: {:?}",
+                w.path
+            )));
+        }
+    }
+
+    let visibility = VisibilityPolicy::default();
+    let mut entries: BTreeMap<EntryId, Entry> = BTreeMap::new();
+    let mut parents: Vec<Option<EntryId>> = Vec::with_capacity(ordered.len());
+    let mut roots: Vec<Option<EntryId>> = vec![None; root_stats.len()];
+    // Each entry's own visible count and size, then folded into its
+    // ancestors below.
+    let mut visible: Vec<u32> = Vec::with_capacity(ordered.len());
+    let mut sizes: Vec<u64> = Vec::with_capacity(ordered.len());
+    let mut levels = 0u64;
+    for (i, w) in ordered.iter().enumerate() {
+        if i == 0 || ordered[i - 1].depth != w.depth {
+            levels += 1;
+        }
+        let id = EntryId(i as u64);
+        let parent_id = match &w.parent_path {
+            Some(pp) => {
+                let parent = *ids.get(pp.as_path()).ok_or_else(|| {
+                    FxError::InvalidInput(format!("{:?}: parent {:?} was not walked", w.path, pp))
+                })?;
+                // The subtree sums below rely on a parent sorting first.
+                if parent.0 as usize >= i {
+                    return Err(FxError::InvalidInput(format!(
+                        "{:?}: depth {} is not below its parent's",
+                        w.path, w.depth
+                    )));
+                }
+                Some(parent)
+            }
+            None => {
+                let at = root_stats
+                    .iter()
+                    .position(|rs| rs.path == w.path)
+                    .ok_or_else(|| {
+                        FxError::InvalidInput(format!("{:?} has no parent and no RootStat", w.path))
+                    })?;
+                roots[at] = Some(id);
+                None
+            }
+        };
+        let entry = Entry {
+            id,
+            parent_id,
+            name: w.name.clone(),
+            kind: w.kind,
+            size: w.size,
+            mtime_ms: w.mtime_ms,
+            ctime_ms: w.ctime_ms,
+            symlink_target_is_dir: w.symlink_target_is_dir,
+            path_segments: None,
+            is_ignored: false,
+            is_excluded: false,
+            is_readonly: w.is_readonly,
+            is_hidden: w.is_hidden,
+        };
+        visible.push(visibility.includes(&entry) as u32);
+        sizes.push(entry.size);
+        parents.push(parent_id);
+        entries.insert(id, entry);
+    }
+
+    // Children grouped by parent in id order, then stably sorted the way the
+    // store sorts a level's incoming siblings.
+    let order = SiblingOrder::default();
+    let mut children: BTreeMap<EntryId, Vec<EntryId>> = BTreeMap::new();
+    for (i, parent) in parents.iter().enumerate() {
+        if let Some(p) = parent {
+            children.entry(*p).or_default().push(EntryId(i as u64));
+        }
+    }
+    for kids in children.values_mut() {
+        kids.sort_by(|a, b| order.compare(&entries[a], &entries[b]));
+    }
+    let direct_child_counts: BTreeMap<EntryId, u32> = children
+        .iter()
+        .map(|(p, kids)| (*p, kids.len() as u32))
+        .collect();
+
+    // Subtree sums, deepest first: a child's id is always above its
+    // parent's, since it sorts at a greater depth.
+    for i in (0..ordered.len()).rev() {
+        if let Some(p) = parents[i] {
+            let p = p.0 as usize;
+            visible[p] += visible[i];
+            sizes[p] += sizes[i];
+        }
+    }
+    let descendant_visible_counts = visible
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| (EntryId(i as u64), v))
+        .collect();
+    let descendant_total_sizes = sizes
+        .into_iter()
+        .enumerate()
+        .map(|(i, s)| (EntryId(i as u64), s))
+        .collect();
+
+    Ok(ResumeSnapshot {
+        format_version: CURRENT_FORMAT_VERSION,
+        mille_version: env!("CARGO_PKG_VERSION").to_string(),
+        created_ms: now_ms(),
+        tree_version: levels,
+        // Every RootStat has an entry: walked, or made up above.
+        roots: roots.into_iter().flatten().collect(),
+        next_entry_id: ordered.len() as u64,
+        entries,
+        children,
+        direct_child_counts,
+        descendant_visible_counts,
+        descendant_total_sizes,
+        root_stats: root_stats.to_vec(),
+    })
+}
+
+/// Encode `resume` and write it to `path` atomically.
+fn write_resume(resume: &ResumeSnapshot, path: &Path) -> Result<(), FxError> {
+    let bytes = bincode::serde::encode_to_vec(resume, bincode_cfg())
+        .map_err(|e| FxError::InternalBug(format!("bincode encode: {e}")))?;
+    write_atomically(path, &bytes, Durability::Synced)
+}
+
+/// Write `bytes` to `path` so a crash leaves either the old file or the new
+/// one: `path.tmp`, fsync, rename over `path`, fsync of the parent (the
+/// fsyncs only when `Synced`).
+pub(crate) fn write_atomically(
+    path: &Path,
+    bytes: &[u8],
+    durability: Durability,
+) -> Result<(), FxError> {
+    let synced = durability == Durability::Synced;
     let tmp_path = path.with_extension("tmp");
 
     // Cleanup-on-failure closure: best-effort unlink of the tmp file.
@@ -155,10 +403,12 @@ pub fn write_snapshot(
     let write_result = (|| -> Result<(), FxError> {
         let mut f =
             File::create(&tmp_path).map_err(|e| ErrorCode::from_io_error(&e, tmp_path.clone()))?;
-        f.write_all(&bytes)
+        f.write_all(bytes)
             .map_err(|e| ErrorCode::from_io_error(&e, tmp_path.clone()))?;
-        f.sync_all()
-            .map_err(|e| ErrorCode::from_io_error(&e, tmp_path.clone()))?;
+        if synced {
+            f.sync_all()
+                .map_err(|e| ErrorCode::from_io_error(&e, tmp_path.clone()))?;
+        }
         Ok(())
     })();
 
@@ -184,10 +434,12 @@ pub fn write_snapshot(
     // has different semantics and is tracked as a PLAN 13.x follow-up.
     #[cfg(unix)]
     {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                if let Ok(dir) = std::fs::File::open(parent) {
-                    let _ = dir.sync_all();
+        if synced {
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    if let Ok(dir) = std::fs::File::open(parent) {
+                        let _ = dir.sync_all();
+                    }
                 }
             }
         }
@@ -294,8 +546,23 @@ fn entry_path(snap: &ResumeSnapshot, id: EntryId) -> Option<PathBuf> {
 /// state. Returns the set of events a just-resumed watcher would need to
 /// emit to bring subscribers up to date. Output is sorted by (variant,
 /// path) so replay into the event pipeline is deterministic.
+///
+/// A directory below a root that does not answer (stalled, dataless, an OS
+/// error) fails the call with [`FxError::Incomplete`]: its children are
+/// unknown, and diffing them as absent would report every one of them
+/// `Disappeared` — "the drive is asleep" replayed as "everything was
+/// deleted".
 pub fn events_since(snap: &ResumeSnapshot) -> Result<Vec<ResumeEvent>, FxError> {
-    use crate::walker::{walk, WalkOptions};
+    events_since_bounded(snap, crate::read_boundary::ReadBoundary::shared_default())
+}
+
+/// [`events_since`] through a caller-owned boundary (deadline, dataless
+/// policy; the test seam).
+pub(crate) fn events_since_bounded(
+    snap: &ResumeSnapshot,
+    reads: &crate::read_boundary::ReadBoundary,
+) -> Result<Vec<ResumeEvent>, FxError> {
+    use crate::walker::{walk_bounded, WalkOptions};
 
     let mut out: Vec<ResumeEvent> = Vec::new();
 
@@ -320,14 +587,18 @@ pub fn events_since(snap: &ResumeSnapshot) -> Result<Vec<ResumeEvent>, FxError> 
             continue;
         }
 
-        let walked = match walk(
+        let walked = match walk_bounded(
             root,
             WalkOptions {
                 include_hidden: true,
                 include_root: true,
                 ..WalkOptions::default()
             },
-        ) {
+            None,
+            reads,
+        )
+        .and_then(crate::walker::WalkReport::into_complete)
+        {
             Ok(w) => w,
             Err(FxError::Io {
                 code: ErrorCode::ENOENT,
@@ -819,5 +1090,241 @@ mod tests {
             in_b.is_empty(),
             "root B should have no events, got {in_b:?}"
         );
+    }
+
+    /// A stalled subdirectory used to vanish from the walk, and every file
+    /// the snapshot knew below it came back `Disappeared`.
+    #[test]
+    fn events_since_fails_incomplete_instead_of_reporting_a_stalled_subtree_deleted() {
+        use crate::read_boundary::tests::{boundary, Gate};
+        use crate::read_boundary::{ReadFailure, ReadKind};
+        use std::sync::Arc;
+
+        let td = TempDir::new().unwrap();
+        let season = td.path().join("Show/Season 01");
+        fs::create_dir_all(&season).unwrap();
+        for ep in 1..=3 {
+            fs::write(season.join(format!("S01E0{ep}.mkv")), b"x").unwrap();
+        }
+        let snap = snapshot_of_real_dir(td.path());
+
+        let gate = Arc::new(Gate::default());
+        gate.park(ReadKind::ListDir, &season);
+        let reads = boundary(&gate, 150);
+        let err = events_since_bounded(&snap, &reads).unwrap_err();
+        match &err {
+            FxError::Incomplete { unread } => {
+                assert_eq!(unread.len(), 1);
+                assert_eq!(unread[0].path, season);
+                assert!(matches!(unread[0].failure, ReadFailure::TimedOut { .. }));
+            }
+            other => panic!("expected Incomplete, got {other:?}"),
+        }
+        assert_eq!(err.code(), ErrorCode::ETIMEDOUT);
+        gate.release_all();
+
+        // Once the directory answers, nothing changed and nothing is reported.
+        let start = std::time::Instant::now();
+        while reads.stuck_reads() > 0 {
+            assert!(start.elapsed() < std::time::Duration::from_secs(2));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(events_since_bounded(&snap, &reads).unwrap().is_empty());
+    }
+
+    // ===== write_snapshot_from =====
+
+    /// A tree that exercises every field the store derives: nesting, sizes,
+    /// hidden and noise names (visible counts), natural order with digits
+    /// and folders on top (sibling order), and a link.
+    fn varied_tree() -> TempDir {
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+        for dir in [
+            "Show/Season 10",
+            "Show/Season 2",
+            "Show/.hidden",
+            "Movies/Heat (1995)",
+        ] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let files: [(&str, usize); 9] = [
+            ("Show/Season 2/ep10.mkv", 10),
+            ("Show/Season 2/ep2.mkv", 2),
+            ("Show/Season 2/Ep1.mkv", 1),
+            ("Show/Season 10/ep1.mkv", 7),
+            ("Show/.hidden/x.mkv", 5),
+            ("Show/.DS_Store", 3),
+            ("Movies/Heat (1995)/Heat (1995).mkv", 4096),
+            ("Movies/a-file-before-folders.nfo", 9),
+            ("top.txt", 0),
+        ];
+        for (rel, len) in files {
+            fs::write(root.join(rel), vec![b'x'; len]).unwrap();
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("Heat (1995)", root.join("Movies/heat-link")).unwrap();
+        td
+    }
+
+    fn walk_all(root: &Path) -> Vec<WalkedEntry> {
+        walk(
+            root,
+            WalkOptions {
+                include_hidden: true,
+                include_root: true,
+                ..WalkOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn root_stats_of(root: &Path) -> Vec<RootStat> {
+        let mtime_ms = fs::metadata(root)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        vec![RootStat {
+            path: root.to_path_buf(),
+            mtime_ms,
+        }]
+    }
+
+    fn assert_same_snapshot(got: &ResumeSnapshot, want: &ResumeSnapshot) {
+        assert_eq!(got.format_version, want.format_version);
+        assert_eq!(got.tree_version, want.tree_version);
+        assert_eq!(got.roots, want.roots);
+        assert_eq!(got.entries, want.entries);
+        assert_eq!(got.children, want.children);
+        assert_eq!(got.direct_child_counts, want.direct_child_counts);
+        assert_eq!(
+            got.descendant_visible_counts,
+            want.descendant_visible_counts
+        );
+        assert_eq!(got.descendant_total_sizes, want.descendant_total_sizes);
+        assert_eq!(got.next_entry_id, want.next_entry_id);
+        assert_eq!(got.root_stats, want.root_stats);
+    }
+
+    /// The store-free path writes exactly what populate_store + write_snapshot
+    /// write, field for field (bar `created_ms`), from the same walk, in any
+    /// input order.
+    #[test]
+    fn write_snapshot_from_matches_the_entry_store_path() {
+        let td = varied_tree();
+        let mut walked = walk_all(td.path());
+        let stats = root_stats_of(td.path());
+        let want = {
+            let store = EntryStore::new();
+            let ids = crate::walker::populate_store(&store, td.path(), &walked, None).unwrap();
+            assert_eq!(ids.len(), walked.len());
+            snapshot_to_resume(&store.snapshot(), walked.len() as u64, &stats)
+        };
+        assert_same_snapshot(&resume_from_walked(&walked, &stats).unwrap(), &want);
+        walked.reverse();
+        assert_same_snapshot(&resume_from_walked(&walked, &stats).unwrap(), &want);
+
+        // And through the file, synced or not.
+        let out = td.path().join("snap.bin");
+        write_snapshot_from(&walked, &stats, &out).unwrap();
+        assert!(!out.with_extension("tmp").exists());
+        assert_same_snapshot(&read_snapshot(&out).unwrap(), &want);
+        let unsynced = td.path().join("unsynced.bin");
+        write_snapshot_from_with(&walked, &stats, &unsynced, Durability::Unsynced).unwrap();
+        assert!(!unsynced.with_extension("tmp").exists());
+        assert_same_snapshot(&read_snapshot(&unsynced).unwrap(), &want);
+    }
+
+    /// flux builds no root entry: it is made up from the RootStat, and the
+    /// snapshot diffs like the store-built one.
+    #[test]
+    fn write_snapshot_from_makes_up_a_missing_root_and_diffs_like_the_store_path() {
+        let td = varied_tree();
+        let snap_dir = TempDir::new().unwrap();
+        let out = snap_dir.path().join("snap.bin");
+        let walked: Vec<WalkedEntry> = walk_all(td.path())
+            .into_iter()
+            .filter(|w| w.parent_path.is_some())
+            .collect();
+        let stats = root_stats_of(td.path());
+        write_snapshot_from(&walked, &stats, &out).unwrap();
+        let loaded = read_snapshot(&out).unwrap();
+        let store_built = snapshot_of_real_dir(td.path());
+        // Same tree; only the root's own entry is made up (no ctime, no
+        // hidden flag), so compare the rest.
+        assert_eq!(loaded.roots, store_built.roots);
+        assert_eq!(loaded.children, store_built.children);
+        let root = loaded.roots[0];
+        for (id, entry) in &store_built.entries {
+            if *id != root {
+                assert_eq!(&loaded.entries[id], entry);
+            }
+        }
+        assert_eq!(loaded.entries[&root].parent_id, None);
+        assert_eq!(loaded.entries[&root].kind, EntryKind::Directory);
+        assert!(events_since(&loaded).unwrap().is_empty());
+
+        fs::write(td.path().join("Show/Season 2/ep3.mkv"), b"new").unwrap();
+        fs::remove_file(td.path().join("Show/Season 10/ep1.mkv")).unwrap();
+        fs::write(
+            td.path().join("Movies/a-file-before-folders.nfo"),
+            b"longer now",
+        )
+        .unwrap();
+        let got = events_since(&loaded).unwrap();
+        assert_eq!(got, events_since(&store_built).unwrap());
+        for want in [
+            ResumeEvent::Appeared {
+                path: td.path().join("Show/Season 2/ep3.mkv"),
+            },
+            ResumeEvent::Disappeared {
+                path: td.path().join("Show/Season 10/ep1.mkv"),
+            },
+            ResumeEvent::Modified {
+                path: td.path().join("Movies/a-file-before-folders.nfo"),
+            },
+        ] {
+            assert!(got.contains(&want), "{want:?} missing from {got:?}");
+        }
+    }
+
+    #[test]
+    fn write_snapshot_from_rejects_malformed_walks() {
+        let td = varied_tree();
+        let walked = walk_all(td.path());
+        let stats = root_stats_of(td.path());
+
+        let mut twice = walked.clone();
+        twice.push(walked[1].clone());
+        assert!(matches!(
+            resume_from_walked(&twice, &stats),
+            Err(FxError::InvalidInput(_))
+        ));
+
+        let mut orphan = walked.clone();
+        orphan.retain(|w| !w.path.ends_with("Show"));
+        assert!(matches!(
+            resume_from_walked(&orphan, &stats),
+            Err(FxError::InvalidInput(_))
+        ));
+
+        // A root the caller gave no RootStat for.
+        assert!(matches!(
+            resume_from_walked(&walked, &[]),
+            Err(FxError::InvalidInput(_))
+        ));
+
+        let mut shallow = walked.clone();
+        for w in &mut shallow {
+            if w.path.ends_with("Show/Season 2/ep2.mkv") {
+                w.depth = 1;
+            }
+        }
+        assert!(matches!(
+            resume_from_walked(&shallow, &stats),
+            Err(FxError::InvalidInput(_))
+        ));
     }
 }

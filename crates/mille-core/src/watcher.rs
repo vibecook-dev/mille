@@ -70,7 +70,99 @@ impl Default for WatcherOptions {
 /// watched-roots bookkeeping and shutdown path.
 enum NotifyBackend {
     Raw(RecommendedWatcher),
-    Debounced(notify_debouncer_full::Debouncer<RecommendedWatcher, notify_debouncer_full::NoCache>),
+    Debounced(notify_debouncer_full::Debouncer<DebouncedSource, notify_debouncer_full::NoCache>),
+}
+
+/// The platform watcher under the debouncer. On macOS it drops the stale
+/// halves of FSEvents' accumulated flags before the debouncer sees them
+/// ([`FsEventsHistoryFilter`]); elsewhere it is notify's own.
+#[cfg(target_os = "macos")]
+type DebouncedSource = FsEventsWatcher;
+#[cfg(not(target_os = "macos"))]
+type DebouncedSource = RecommendedWatcher;
+
+/// notify's FSEvents watcher with [`FsEventsHistoryFilter`] in front of the
+/// handler.
+#[cfg(target_os = "macos")]
+struct FsEventsWatcher(RecommendedWatcher);
+
+#[cfg(target_os = "macos")]
+impl NotifyWatcher for FsEventsWatcher {
+    fn new<F: notify::EventHandler>(event_handler: F, config: Config) -> notify::Result<Self> {
+        RecommendedWatcher::new(
+            FsEventsHistoryFilter {
+                inner: event_handler,
+            },
+            config,
+        )
+        .map(Self)
+    }
+
+    fn watch(&mut self, path: &Path, recursive_mode: RecursiveMode) -> notify::Result<()> {
+        self.0.watch(path, recursive_mode)
+    }
+
+    fn unwatch(&mut self, path: &Path) -> notify::Result<()> {
+        self.0.unwatch(path)
+    }
+
+    fn configure(&mut self, option: Config) -> notify::Result<bool> {
+        self.0.configure(option)
+    }
+
+    fn kind() -> notify::WatcherKind {
+        RecommendedWatcher::kind()
+    }
+}
+
+/// FSEvents reports, per path, the flags it has *accumulated*, and notify
+/// turns one record into one event per flag, creates first. A file created
+/// a while ago and deleted now therefore arrives as `Create` + `Remove`,
+/// and `notify-debouncer-full` cancels that pair as a transient file: the
+/// deletion was never delivered (copy a file in, wait 300 ms, delete it —
+/// the raw stream says `Remove`, the debounced one said nothing). A file
+/// removed and re-created arrives the same way, and the replacement was
+/// lost too.
+///
+/// The disk settles which half is history: a `Create` for a path that is
+/// gone, or a `Remove` for a path that exists, is dropped before the
+/// debouncer pairs it. A truly transient file still cancels when both
+/// records land inside the window (its `Create` was queued while it
+/// existed); otherwise the consumer gets a `Remove` for a path it never
+/// saw, which is harmless. Mount and unmount events pass untouched.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct FsEventsHistoryFilter<H> {
+    inner: H,
+}
+
+impl<H: notify::EventHandler> notify::EventHandler for FsEventsHistoryFilter<H> {
+    fn handle_event(&mut self, event: notify::Result<Event>) {
+        if let Ok(ev) = &event {
+            if is_stale_fsevents_flag(ev) {
+                return;
+            }
+        }
+        self.inner.handle_event(event);
+    }
+}
+
+/// See [`FsEventsHistoryFilter`].
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn is_stale_fsevents_flag(ev: &Event) -> bool {
+    if ev.info() == Some("mount") {
+        return false;
+    }
+    let [path] = ev.paths.as_slice() else {
+        return false;
+    };
+    match ev.kind {
+        EventKind::Create(_) => matches!(
+            std::fs::symlink_metadata(path),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+        ),
+        EventKind::Remove(_) => std::fs::symlink_metadata(path).is_ok(),
+        _ => false,
+    }
 }
 
 impl NotifyBackend {
@@ -318,7 +410,7 @@ where
     let config = Config::default().with_poll_interval(Duration::from_secs(2));
     // tick_rate = None lets the debouncer pick ~timeout/4, which
     // matches the recommended upstream default.
-    let debouncer = new_debouncer_opt(
+    let debouncer = new_debouncer_opt::<_, DebouncedSource, _>(
         Duration::from_millis(debounce_ms),
         None,
         move |res: DebounceEventResult| {
@@ -556,87 +648,127 @@ enum PathState {
 /// Algorithm: group by path, run a small state machine per group, then
 /// emit one event per path in first-seen order. `Overflow` and `Error`
 /// are not grouped per path and pass through inline.
+///
+/// One pass, O(n) in the batch: each output slot records which path owns
+/// it, so the final event is a direct lookup. (The previous final pass
+/// searched every first-seen path for each slot's owner — O(n²): 10k
+/// events took 7.4 s and 40k took 86 s, on the forwarder thread, under the
+/// binding's `policy_gate`. An `npm install` or a season-pack copy is easily
+/// that many events.) Keys borrow from `raw`, so a path is cloned once, into
+/// its output event.
 pub fn coalesce_events(raw: &[RawEvent]) -> Vec<FsChangeEvent> {
+    coalesce_events_with(raw, CoalesceOptions::default())
+}
+
+/// What [`coalesce_events_with`] does with a path whose events in the batch
+/// net out to "created, then deleted".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CreateThenDelete {
+    /// Drop the path: a file that lived and died inside the window, which
+    /// nobody downstream can have seen. [`coalesce_events`]' behaviour.
+    #[default]
+    Cancel,
+    /// Report it, by its state on disk when the batch is coalesced (one
+    /// `lstat`): `Deleted` if the path is gone, `Created` if it exists.
+    ///
+    /// For consumers that keep state about paths (a catalog, an index).
+    /// FSEvents reports a path's *accumulated* flags, so a file created a
+    /// while ago and deleted now arrives as created-and-removed, and one
+    /// removed and re-created arrives the same way (notify always lists the
+    /// create first). Cancelling would hide the deletion of a file the
+    /// consumer holds, or the replacement of one. A truly transient file
+    /// comes out as a `Deleted` the consumer has nothing for.
+    Report,
+}
+
+/// Options for [`coalesce_events_with`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CoalesceOptions {
+    pub create_then_delete: CreateThenDelete,
+}
+
+impl CoalesceOptions {
+    /// For consumers that keep per-path state: nothing that touched a path
+    /// is dropped ([`CreateThenDelete::Report`]).
+    pub fn stateful() -> Self {
+        Self {
+            create_then_delete: CreateThenDelete::Report,
+        }
+    }
+}
+
+/// [`coalesce_events`] with options. With the default options it is the
+/// same function, and pure; [`CreateThenDelete::Report`] makes one `lstat`
+/// per path that netted out to created-then-deleted.
+pub fn coalesce_events_with(raw: &[RawEvent], options: CoalesceOptions) -> Vec<FsChangeEvent> {
     use std::collections::HashMap;
 
-    // Per-path running state, plus the index of first appearance so we
-    // can emit in deterministic first-seen order.
-    let mut state: HashMap<PathBuf, PathState> = HashMap::new();
-    let mut first_seen: Vec<PathBuf> = Vec::new();
+    /// One output position: a path's coalesced event (index into
+    /// `paths`), or a Coarse/Error that passes through where it appeared.
+    enum Slot<'a> {
+        Path(usize),
+        Pass(&'a RawEvent),
+    }
 
-    // Output buffer. Overflow/Error events are appended inline at the
-    // position they appeared, preserving relative order with first-seen
-    // path events.
-    let mut out: Vec<FsChangeEvent> = Vec::new();
-    // Marker indices in `out` for each first-seen path so we can patch
-    // the final coalesced event in place once the batch is fully scanned.
-    let mut path_slot: HashMap<PathBuf, usize> = HashMap::new();
+    let mut slots: Vec<Slot<'_>> = Vec::with_capacity(raw.len());
+    // Per-path running state, in first-seen order.
+    let mut paths: Vec<(&PathBuf, PathState)> = Vec::new();
+    let mut index: HashMap<&Path, usize> = HashMap::new();
 
     for ev in raw {
         match ev {
-            RawEvent::Overflow { root } => {
-                out.push(FsChangeEvent::Coarse { root: root.clone() });
-            }
-            RawEvent::Error(msg) => {
-                out.push(FsChangeEvent::Error {
-                    message: msg.clone(),
-                });
-            }
+            RawEvent::Overflow { .. } | RawEvent::Error(_) => slots.push(Slot::Pass(ev)),
             RawEvent::Created(p)
             | RawEvent::Modified(p)
             | RawEvent::Deleted(p)
-            | RawEvent::Any(p) => {
-                // Reserve a slot for this path on first appearance so its
-                // position in the output matches first-seen order.
-                if !path_slot.contains_key(p) {
-                    path_slot.insert(p.clone(), out.len());
-                    first_seen.push(p.clone());
-                    // Placeholder; overwritten below before return.
-                    out.push(FsChangeEvent::Unknown { path: p.clone() });
+            | RawEvent::Any(p) => match index.get(p.as_path()) {
+                Some(&at) => paths[at].1 = transition(Some(paths[at].1), ev),
+                None => {
+                    // Reserve the slot on first appearance, so the path's
+                    // position in the output is its first-seen position.
+                    index.insert(p.as_path(), paths.len());
+                    slots.push(Slot::Path(paths.len()));
+                    paths.push((p, transition(None, ev)));
                 }
-                let next = transition(state.get(p).copied(), ev);
-                state.insert(p.clone(), next);
-            }
+            },
         }
     }
 
-    // Patch each path slot with its final coalesced event, dropping
-    // cancelled paths by collecting into a fresh vector that skips them.
-    let mut final_out: Vec<FsChangeEvent> = Vec::with_capacity(out.len());
-    let mut emitted_path: HashMap<usize, ()> = HashMap::new();
-    for (idx, slot) in out.into_iter().enumerate() {
-        // Find the path that owns this slot, if any.
-        let owner = first_seen.iter().find(|p| path_slot[*p] == idx);
-        match owner {
-            Some(p) => {
-                if emitted_path.contains_key(&idx) {
-                    continue;
-                }
-                emitted_path.insert(idx, ());
-                match state[p] {
-                    PathState::Cancelled => { /* drop transient file */ }
-                    PathState::Created => {
-                        final_out.push(FsChangeEvent::Created { path: p.clone() });
-                    }
-                    PathState::Modified => {
-                        final_out.push(FsChangeEvent::Modified { path: p.clone() });
-                    }
-                    PathState::Deleted => {
-                        final_out.push(FsChangeEvent::Deleted { path: p.clone() });
-                    }
-                    PathState::Unknown => {
-                        final_out.push(FsChangeEvent::Unknown { path: p.clone() });
-                    }
+    slots
+        .into_iter()
+        .filter_map(|slot| match slot {
+            Slot::Pass(RawEvent::Overflow { root }) => {
+                Some(FsChangeEvent::Coarse { root: root.clone() })
+            }
+            Slot::Pass(RawEvent::Error(message)) => Some(FsChangeEvent::Error {
+                message: message.clone(),
+            }),
+            // Only Overflow and Error are pushed as pass-through.
+            Slot::Pass(_) => None,
+            Slot::Path(at) => {
+                let (path, state) = paths[at];
+                let path = path.clone();
+                match state {
+                    // Create+Delete inside the window: a transient file, or
+                    // accumulated FSEvents flags (see `CreateThenDelete`).
+                    PathState::Cancelled => match options.create_then_delete {
+                        CreateThenDelete::Cancel => None,
+                        CreateThenDelete::Report => {
+                            Some(if std::fs::symlink_metadata(&path).is_ok() {
+                                FsChangeEvent::Created { path }
+                            } else {
+                                FsChangeEvent::Deleted { path }
+                            })
+                        }
+                    },
+                    PathState::Created => Some(FsChangeEvent::Created { path }),
+                    PathState::Modified => Some(FsChangeEvent::Modified { path }),
+                    PathState::Deleted => Some(FsChangeEvent::Deleted { path }),
+                    PathState::Unknown => Some(FsChangeEvent::Unknown { path }),
                 }
             }
-            None => {
-                // Pass-through Coarse / Error.
-                final_out.push(slot);
-            }
-        }
-    }
-
-    final_out
+        })
+        .collect()
 }
 
 /// State-machine transition. `prev` is the current state for this path
@@ -1326,6 +1458,182 @@ mod tests {
         );
     }
 
+    // ---- FSEvents accumulated flags under the debouncer ----
+
+    /// A notify watcher the test drives by hand, behind the filter
+    /// `FsEventsWatcher` installs on macOS.
+    struct Injected;
+
+    static INJECTED: StdMutex<Option<Box<dyn notify::EventHandler>>> = StdMutex::new(None);
+
+    impl NotifyWatcher for Injected {
+        fn new<F: notify::EventHandler>(event_handler: F, _config: Config) -> notify::Result<Self> {
+            *INJECTED.lock().unwrap() = Some(Box::new(FsEventsHistoryFilter {
+                inner: event_handler,
+            }));
+            Ok(Injected)
+        }
+
+        fn watch(&mut self, _path: &Path, _mode: RecursiveMode) -> notify::Result<()> {
+            Ok(())
+        }
+
+        fn unwatch(&mut self, _path: &Path) -> notify::Result<()> {
+            Ok(())
+        }
+
+        fn kind() -> notify::WatcherKind {
+            notify::WatcherKind::NullWatcher
+        }
+    }
+
+    /// What `notify-debouncer-full` emits for the events `feed` hands it,
+    /// in order, the way notify's FSEvents callback splits one record
+    /// (`None` if it emitted nothing within 600 ms).
+    fn debounce_through_the_filter(
+        feed: impl FnOnce(&mut dyn FnMut(EventKind, &Path)),
+    ) -> Option<Vec<RawEvent>> {
+        use notify_debouncer_full::{new_debouncer_opt, NoCache};
+        let (tx, rx) = mpsc::channel();
+        let debouncer = new_debouncer_opt::<_, Injected, _>(
+            Duration::from_millis(50),
+            None,
+            tx,
+            NoCache,
+            Config::default(),
+        )
+        .unwrap();
+        let mut handler = INJECTED.lock().unwrap().take().unwrap();
+        feed(&mut |kind, path| {
+            handler.handle_event(Ok(Event::new(kind).add_path(path.to_path_buf())));
+        });
+        let out = rx
+            .recv_timeout(Duration::from_millis(600))
+            .ok()
+            .map(|batch| {
+                batch
+                    .unwrap()
+                    .iter()
+                    .flat_map(|e| raw_events_for(&e.event))
+                    .collect()
+            });
+        debouncer.stop();
+        out
+    }
+
+    /// The flux finding: one FSEvents record for the deletion of a file
+    /// created earlier carries `ItemCreated | ItemRemoved`. notify splits it
+    /// into `Create` + `Remove`, and the debouncer cancelled the pair, so
+    /// the deletion was never delivered. All cases run in one test: the
+    /// injected handler is a process-wide slot.
+    #[test]
+    fn debouncer_delivers_deletions_and_replacements_reported_with_accumulated_flags() {
+        use notify::event::{CreateKind, RemoveKind};
+        fn record(emit: &mut dyn FnMut(EventKind, &Path), path: &Path) {
+            emit(EventKind::Create(CreateKind::File), path);
+            emit(EventKind::Remove(RemoveKind::File), path);
+        }
+        let td = TempDir::new().unwrap();
+
+        let gone = td.path().join("held.mkv");
+        let got = debounce_through_the_filter(|emit| record(emit, gone.as_path()));
+        assert!(
+            matches!(got.as_deref(), Some([RawEvent::Deleted(p)]) if *p == gone),
+            "the deletion must be delivered: {got:?}"
+        );
+
+        // Removed and re-created: the same flags, and the file is there.
+        let replaced = td.path().join("replaced.mkv");
+        fs::write(&replaced, b"new inode").unwrap();
+        let got = debounce_through_the_filter(|emit| record(emit, replaced.as_path()));
+        assert!(
+            matches!(got.as_deref(), Some([RawEvent::Created(p)]) if *p == replaced),
+            "the replacement must be delivered: {got:?}"
+        );
+
+        // A truly transient file still cancels: its first record was queued
+        // while it existed, the second says created + removed.
+        let transient = td.path().join("transient.part");
+        fs::write(&transient, b"x").unwrap();
+        let got = debounce_through_the_filter(|emit| {
+            emit(EventKind::Create(CreateKind::File), transient.as_path());
+            fs::remove_file(&transient).unwrap();
+            record(emit, transient.as_path());
+        });
+        assert!(
+            got.is_none(),
+            "a transient file is still cancelled: {got:?}"
+        );
+    }
+
+    #[test]
+    fn only_the_stale_half_of_accumulated_flags_is_dropped() {
+        use notify::event::{CreateKind, DataChange, ModifyKind, RemoveKind};
+        let td = TempDir::new().unwrap();
+        let here = td.path().join("here");
+        fs::write(&here, b"x").unwrap();
+        let gone = td.path().join("gone");
+        let ev = |kind, p: &PathBuf| Event::new(kind).add_path(p.clone());
+        let create = EventKind::Create(CreateKind::File);
+        let remove = EventKind::Remove(RemoveKind::File);
+        assert!(!is_stale_fsevents_flag(&ev(create, &here)));
+        assert!(is_stale_fsevents_flag(&ev(create, &gone)));
+        assert!(is_stale_fsevents_flag(&ev(remove, &here)));
+        assert!(!is_stale_fsevents_flag(&ev(remove, &gone)));
+        // An unmount leaves its mount point behind: never dropped.
+        let unmount = Event::new(EventKind::Remove(RemoveKind::Other))
+            .add_path(here.clone())
+            .set_info("mount");
+        assert!(!is_stale_fsevents_flag(&unmount));
+        let write = EventKind::Modify(ModifyKind::Data(DataChange::Content));
+        assert!(!is_stale_fsevents_flag(&ev(write, &gone)));
+    }
+
+    /// The flux repro, on real FSEvents: clone a file in, wait 300 ms,
+    /// delete it. The raw backend reported `Deleted`; the debounced one
+    /// reported nothing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn debounced_watcher_reports_deleting_a_file_cloned_in_earlier() {
+        let td = TempDir::new().unwrap();
+        let src = td.path().join("source.mkv");
+        fs::write(&src, vec![7u8; 4096]).unwrap();
+        let watched = td.path().join("library");
+        fs::create_dir(&watched).unwrap();
+        let events: Events = Arc::new(StdMutex::new(Vec::new()));
+        let opts = WatcherOptions {
+            recursive: true,
+            debounce_ms: Some(75),
+        };
+        let w = make_watcher_with(Arc::clone(&events), opts.clone());
+        w.watch(&watched, opts).unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+
+        let clone = watched.join("cloned.mkv");
+        let status = std::process::Command::new("cp")
+            .arg("-c")
+            .arg(&src)
+            .arg(&clone)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        poll_for(&events, Duration::from_secs(3), |evs| {
+            evs.iter().any(|e| path_matches(e, "cloned.mkv"))
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        fs::remove_file(&clone).unwrap();
+
+        let deleted =
+            |e: &RawEvent| matches!(e, RawEvent::Deleted(_)) && path_matches(e, "cloned.mkv");
+        let got = poll_for(&events, Duration::from_secs(3), |evs| {
+            evs.iter().any(deleted)
+        });
+        assert!(
+            got.iter().any(deleted),
+            "no Deleted for cloned.mkv: {got:?}"
+        );
+    }
+
     // ---- Phase 3.6: coalescer ----
 
     fn pb(s: &str) -> PathBuf {
@@ -1344,6 +1652,46 @@ mod tests {
         let raw = vec![RawEvent::Created(pb("/a")), RawEvent::Deleted(pb("/a"))];
         let out = coalesce_events(&raw);
         assert!(out.is_empty(), "C+D should cancel: {out:?}");
+    }
+
+    /// The stateful mode never drops a created-then-deleted path: a gone
+    /// path is `Deleted` — FSEvents' accumulated flags on the deletion of a
+    /// file a consumer already holds — and one that exists again is
+    /// `Created` (removed and re-created, reported create-first).
+    #[test]
+    fn coalesce_stateful_reports_create_then_delete_by_disk_state() {
+        let td = TempDir::new().unwrap();
+        let gone = td.path().join("held-by-the-catalog.mkv");
+        let back = td.path().join("replaced.mkv");
+        fs::write(&back, b"new inode").unwrap();
+        let raw = vec![
+            RawEvent::Created(gone.clone()),
+            RawEvent::Created(back.clone()),
+            RawEvent::Deleted(gone.clone()),
+            RawEvent::Deleted(back.clone()),
+            RawEvent::Modified(pb("/elsewhere")),
+        ];
+        assert_eq!(
+            coalesce_events_with(&raw, CoalesceOptions::stateful()),
+            vec![
+                FsChangeEvent::Deleted { path: gone },
+                FsChangeEvent::Created { path: back },
+                FsChangeEvent::Modified {
+                    path: pb("/elsewhere")
+                },
+            ]
+        );
+        // The default keeps cancelling: same as `coalesce_events`.
+        assert_eq!(
+            coalesce_events_with(&raw, CoalesceOptions::default()),
+            vec![FsChangeEvent::Modified {
+                path: pb("/elsewhere")
+            }]
+        );
+        assert_eq!(
+            coalesce_events_with(&raw, CoalesceOptions::default()),
+            coalesce_events(&raw)
+        );
     }
 
     #[test]
@@ -1485,6 +1833,171 @@ mod tests {
                 FsChangeEvent::Created { path: pb("/e") },
             ]
         );
+    }
+
+    /// A storm the size of an `npm install` or a season-pack copy. The
+    /// quadratic final pass took 86 s on 40k events (release build); one
+    /// pass takes milliseconds even in a debug build on a loaded machine.
+    #[test]
+    fn coalesce_40k_events_is_linear() {
+        let mut raw: Vec<RawEvent> = (0..40_000)
+            .map(|i| RawEvent::Created(PathBuf::from(format!("/lib/Show/S01/ep{i:06}.mkv"))))
+            .collect();
+        // Every file is also written once more, and an overflow and an error
+        // land mid-batch, so the pass-through and repeat paths are exercised.
+        raw.extend(
+            (0..40_000)
+                .map(|i| RawEvent::Modified(PathBuf::from(format!("/lib/Show/S01/ep{i:06}.mkv")))),
+        );
+        raw.insert(20_000, RawEvent::Overflow { root: pb("/lib") });
+        raw.insert(50_000, RawEvent::Error("boom".into()));
+        let start = std::time::Instant::now();
+        let out = coalesce_events(&raw);
+        let elapsed = start.elapsed();
+        assert_eq!(out.len(), 40_002);
+        assert_eq!(
+            out[0],
+            FsChangeEvent::Created {
+                path: pb("/lib/Show/S01/ep000000.mkv")
+            }
+        );
+        assert_eq!(out[20_000], FsChangeEvent::Coarse { root: pb("/lib") });
+        assert_eq!(
+            out[40_001],
+            FsChangeEvent::Error {
+                message: "boom".into()
+            }
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "coalescing 80k events took {elapsed:?}"
+        );
+    }
+
+    /// The pre-fix coalescer, verbatim apart from its name: the oracle the
+    /// one-pass version must agree with on every batch.
+    fn coalesce_reference(raw: &[RawEvent]) -> Vec<FsChangeEvent> {
+        use std::collections::HashMap;
+        let mut state: HashMap<PathBuf, PathState> = HashMap::new();
+        let mut first_seen: Vec<PathBuf> = Vec::new();
+        let mut out: Vec<FsChangeEvent> = Vec::new();
+        let mut path_slot: HashMap<PathBuf, usize> = HashMap::new();
+        for ev in raw {
+            match ev {
+                RawEvent::Overflow { root } => {
+                    out.push(FsChangeEvent::Coarse { root: root.clone() });
+                }
+                RawEvent::Error(msg) => {
+                    out.push(FsChangeEvent::Error {
+                        message: msg.clone(),
+                    });
+                }
+                RawEvent::Created(p)
+                | RawEvent::Modified(p)
+                | RawEvent::Deleted(p)
+                | RawEvent::Any(p) => {
+                    if !path_slot.contains_key(p) {
+                        path_slot.insert(p.clone(), out.len());
+                        first_seen.push(p.clone());
+                        out.push(FsChangeEvent::Unknown { path: p.clone() });
+                    }
+                    let next = transition(state.get(p).copied(), ev);
+                    state.insert(p.clone(), next);
+                }
+            }
+        }
+        let mut final_out: Vec<FsChangeEvent> = Vec::with_capacity(out.len());
+        let mut emitted_path: HashMap<usize, ()> = HashMap::new();
+        for (idx, slot) in out.into_iter().enumerate() {
+            let owner = first_seen.iter().find(|p| path_slot[*p] == idx);
+            match owner {
+                Some(p) => {
+                    if emitted_path.contains_key(&idx) {
+                        continue;
+                    }
+                    emitted_path.insert(idx, ());
+                    match state[p] {
+                        PathState::Cancelled => {}
+                        PathState::Created => {
+                            final_out.push(FsChangeEvent::Created { path: p.clone() })
+                        }
+                        PathState::Modified => {
+                            final_out.push(FsChangeEvent::Modified { path: p.clone() })
+                        }
+                        PathState::Deleted => {
+                            final_out.push(FsChangeEvent::Deleted { path: p.clone() })
+                        }
+                        PathState::Unknown => {
+                            final_out.push(FsChangeEvent::Unknown { path: p.clone() })
+                        }
+                    }
+                }
+                None => final_out.push(slot),
+            }
+        }
+        final_out
+    }
+
+    fn raw_event() -> impl proptest::strategy::Strategy<Value = RawEvent> {
+        use proptest::prelude::*;
+        // Few distinct paths, so most batches revisit paths in every state.
+        let path = (0u8..6).prop_map(|i| PathBuf::from(format!("/r/{i}")));
+        prop_oneof![
+            path.clone().prop_map(RawEvent::Created),
+            path.clone().prop_map(RawEvent::Modified),
+            path.clone().prop_map(RawEvent::Deleted),
+            path.prop_map(RawEvent::Any),
+            Just(RawEvent::Overflow { root: pb("/r") }),
+            Just(RawEvent::Error("e".into())),
+        ]
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn coalesce_matches_the_quadratic_reference(
+            raw in proptest::collection::vec(raw_event(), 0..64)
+        ) {
+            proptest::prop_assert_eq!(coalesce_events(&raw), coalesce_reference(&raw));
+        }
+
+        /// The stateful mode changes nothing but the paths the default
+        /// cancels, which it reports instead (as `Deleted`: `/r/*` never
+        /// exists).
+        #[test]
+        fn coalesce_stateful_only_reports_what_the_default_cancels(
+            raw in proptest::collection::vec(raw_event(), 0..64)
+        ) {
+            let default = coalesce_events(&raw);
+            let stateful = coalesce_events_with(&raw, CoalesceOptions::stateful());
+            let mentioned = |p: &PathBuf| default.iter().any(|e| matches!(e,
+                FsChangeEvent::Created { path }
+                | FsChangeEvent::Modified { path }
+                | FsChangeEvent::Deleted { path }
+                | FsChangeEvent::Unknown { path } if path == p));
+            let mut trimmed = Vec::new();
+            for e in &stateful {
+                match e {
+                    FsChangeEvent::Deleted { path } if !mentioned(path) => {
+                        let created = raw.iter().any(|r| matches!(r, RawEvent::Created(p) if p == path));
+                        let deleted = raw.iter().any(|r| matches!(r, RawEvent::Deleted(p) if p == path));
+                        proptest::prop_assert!(created && deleted, "{path:?} was not created and deleted");
+                    }
+                    other => trimmed.push(other.clone()),
+                }
+            }
+            proptest::prop_assert_eq!(&trimmed, &default);
+            // And every path the default dropped is reported.
+            for r in &raw {
+                if let RawEvent::Created(p) | RawEvent::Modified(p) | RawEvent::Deleted(p) | RawEvent::Any(p) = r {
+                    if !mentioned(p) {
+                        proptest::prop_assert!(
+                            stateful.contains(&FsChangeEvent::Deleted { path: p.clone() }),
+                            "{p:?} dropped"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

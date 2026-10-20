@@ -14,7 +14,6 @@ path = "src/lib.rs"
 # Filesystem walking + watching
 notify.workspace = true
 notify-debouncer-full.workspace = true
-jwalk.workspace = true
 ignore.workspace = true
 globset.workspace = true
 
@@ -55,6 +54,15 @@ smallvec.workspace = true
 
 # Bitflags (Capability mask)
 bitflags.workspace = true
+
+# Directory listers behind `walk_scan` (src/scan_list.rs): `getattrlistbulk`
+# and `fstatfs` on macOS, `getdents64` + `statx` on Linux. Both are already in
+# the lock graph (via mille-git and tempfile).
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2.190"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1", features = ["fs"] }
 
 [dev-dependencies]
 proptest.workspace = true

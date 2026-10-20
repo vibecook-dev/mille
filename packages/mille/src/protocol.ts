@@ -23,6 +23,30 @@
  */
 export const PROTOCOL_VERSION = 1;
 
+import type { ExplorerChannelCloseCode } from './channel/types.js';
+import type { ClientEntry } from './mirror.js';
+
+/**
+ * The result body of `call('search', [query, options])`.
+ *
+ * `hits` are score-ordered ids; `entries` carries each hit and its ancestors
+ * (deduplicated), so a client can show a hit's path and reveal it in the
+ * tree without another round trip — the chain `resolvePath` also returns.
+ * `clipped` means the engine had more hits than the page: it is a fact the
+ * host observed (it asks the engine for one more than the limit), not a
+ * guess from a full page.
+ */
+export interface SearchCallResult {
+  readonly version: number;
+  readonly clipped: boolean;
+  readonly hits: readonly {
+    readonly id: number;
+    readonly score: number;
+    readonly matchedIndices: readonly number[];
+  }[];
+  readonly entries: readonly ClientEntry[];
+}
+
 /**
  * Common envelope for every message on the wire.
  */
@@ -326,7 +350,20 @@ export interface WarningMsg {
 
 export interface ErrorMsg {
   type: 'error';
-  body: { code: string; message: string };
+  body: {
+    code: string;
+    message: string;
+    /**
+     * The session is over, not just one request. A MessagePort has no close
+     * event, so a relay whose upstream channel closed says so with this
+     * flag; the client closes its side and fails later calls fast instead
+     * of posting into a port nobody reads. Additive: an older client treats
+     * it as a plain error.
+     */
+    fatal?: boolean;
+    /** Why the upstream channel closed, when `fatal`. */
+    closeCode?: ExplorerChannelCloseCode;
+  };
 }
 
 export type HostToClientMessage =

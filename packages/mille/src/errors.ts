@@ -23,7 +23,11 @@ export type ErrorCode =
   | 'ECANCELED'
   | 'EFBIG'
   | 'EUNSUPPORTED'
-  | 'EUNKNOWN';
+  | 'EUNKNOWN'
+  /** A native read made no progress within `readTimeoutMs`, or one into the same folder is still stuck. */
+  | 'ETIMEDOUT'
+  /** A cloud placeholder whose contents are not local, and `materializeDataless` is off. */
+  | 'EDATALESS';
 
 export class FileSystemError extends Error {
   readonly code: ErrorCode;

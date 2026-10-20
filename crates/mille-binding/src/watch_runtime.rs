@@ -11,10 +11,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mille_core::{
-    coalesce_events, walk, walk_batched, walk_with_ignore, walk_with_ignore_batched, Entry,
-    EntryId, EntryKind, EntryStore, FsChangeEvent, FxError, IgnoreMatcher, IntentCache, IntentKind,
-    RenamePairer, SymlinkPolicy, WalkOptions, WalkedEntry, Watcher, WatcherOptions,
+    coalesce_events, walk_bounded, walk_bounded_batched, Entry, EntryId, EntryKind, EntryStore,
+    FsChangeEvent, FxError, IgnoreMatcher, IntentCache, IntentKind, ReadBoundary, RenamePairer,
+    SymlinkPolicy, UnreadDirectory, WalkOptions, WalkedEntry, Watcher, WatcherOptions,
 };
+
+use crate::bounded::{probe_exists, probe_is_dir, seed_ignore_files};
 use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -30,6 +32,9 @@ pub(crate) struct WatchConfig {
     pub follow_symlinks: SymlinkPolicy,
     pub walker_concurrency: usize,
     pub debounce_ms: u64,
+    /// The explorer's bounded read pool (M10). Reconciliation runs under
+    /// `policy_gate`, so every probe and walk here goes through it.
+    pub reads: ReadBoundary,
 }
 
 #[derive(Default)]
@@ -156,6 +161,12 @@ fn process_batch(
         public_events.push(to_public_event(store, event, before.as_deref()));
     }
 
+    // `'event'` is the per-path signal every OS change produces, including the
+    // ones that leave the store untouched — content-only saves, saves under a
+    // lazy folder the walker never visited. That makes it the F3 signal for
+    // the git engine (SPEC mille-git §11.1): its native subscriber
+    // (`git.rs`, `bind_explorer`) hears these synchronously, here, still under
+    // `policy_gate`, and only arms a debounce. Nothing here calls git.
     for event in &public_events {
         events.emit_event(clone_event(event));
     }
@@ -246,7 +257,7 @@ fn reconcile_event(
 ) -> Result<ReconcileOutcome, FxError> {
     match event {
         FsChangeEvent::Created { path } => {
-            if path.is_dir() && store.get_by_path(path).is_none() {
+            if store.get_by_path(path).is_none() && probe_is_dir(&config.reads, path)? {
                 // FSEvents may represent a directory rename/move as an
                 // independent delete + create rather than a paired rename. A
                 // depth-1 parent reconciliation would add only the directory
@@ -292,47 +303,66 @@ fn reconcile_event(
             Ok(out)
         }
         FsChangeEvent::Renamed { from, to } => {
+            let Some(entry) = store.get_by_path(from) else {
+                // Nothing known moved, so there is no subtree to keep: build
+                // the destination from disk.
+                return if probe_is_dir(&config.reads, to)? {
+                    reconcile_directory(store, config, to, None)
+                } else {
+                    reconcile_nearest_parent(store, config, to, Some(1))
+                };
+            };
+            // Read the destination before the rename is published. Every
+            // store mutation is visible to readers at once, and these reads
+            // go through the bounded pool, so renaming first left the renamed
+            // row on screen for the whole read. Anything done in reaction to
+            // it could land in the listing ahead of its own event: a file
+            // copied in beside the renamed one and deleted inside one debounce
+            // window was listed, then its create + delete cancelled out and
+            // its row stayed forever. A rename of an ancestor emptied the
+            // listing instead (a directory that lists with an OS error walks
+            // as empty) and dropped every known child of the renamed
+            // directory. The watcher soak caught both. Now nothing is
+            // published until the listing has been read.
+            let read = read_rename_destination(store, config, &entry, to);
             let mut out = ReconcileOutcome::default();
-            let mut preserved_known_subtree = false;
-            if let Some(entry) = store.get_by_path(from) {
-                let parent = entry.parent_id;
-                match store.rename(entry.id, to.clone()) {
-                    Ok(()) => {
-                        // Same-parent file and directory renames preserve EntryId
-                        // and every known descendant. The store rewrites the
-                        // reverse path index for the known subtree, avoiding an
-                        // eager disk walk and preventing expanded children from
-                        // disappearing until the next manual expansion.
-                        preserved_known_subtree = true;
-                        out.changed_ids.insert(entry.id);
-                        if let Some(parent) = parent {
-                            out.child_set_changed.insert(parent);
-                        }
+            let parent = entry.parent_id;
+            match store.rename(entry.id, to.clone()) {
+                Ok(()) => {
+                    // File and directory renames, same-parent or not, keep
+                    // EntryId and every known descendant. The store rewrites
+                    // the reverse path index for the known subtree, avoiding
+                    // an eager disk walk and preventing expanded children from
+                    // disappearing until the next manual expansion.
+                    out.changed_ids.insert(entry.id);
+                    if let Some(parent) = parent {
+                        out.child_set_changed.insert(parent);
                     }
-                    Err(_) => {
-                        // Cross-parent moves are not yet an atomic store
-                        // primitive. Fall back to authoritative removal + disk
-                        // reconciliation below.
-                        let removed = store.remove_subtree(entry.id);
-                        out.changed_ids.extend(removed.iter().map(|entry| entry.id));
-                        if let Some(parent) = parent {
-                            out.child_set_changed.insert(parent);
-                        }
+                    // A read that failed still leaves the rename applied.
+                    if let Some((scope, listing)) = read?.scope {
+                        out.merge(apply_directory(store, config, &scope, Some(1), listing)?);
+                    } else {
+                        out.merge(reconcile_nearest_parent(store, config, to, Some(1))?);
                     }
                 }
-            }
-            let depth = if preserved_known_subtree || !to.is_dir() {
-                Some(1)
-            } else {
-                // A cross-parent directory move lost the old in-memory
-                // structure. Rebuild the destination subtree now so known
-                // descendants do not silently disappear.
-                None
-            };
-            if depth.is_none() && to.is_dir() {
-                out.merge(reconcile_directory(store, config, to, None)?);
-            } else {
-                out.merge(reconcile_nearest_parent(store, config, to, depth)?);
+                Err(_) => {
+                    // The store refused the move (its destination parent is
+                    // not indexed, a root left its parent…). Fall back to
+                    // authoritative removal + disk reconciliation.
+                    let removed = store.remove_subtree(entry.id);
+                    out.changed_ids.extend(removed.iter().map(|entry| entry.id));
+                    if let Some(parent) = parent {
+                        out.child_set_changed.insert(parent);
+                    }
+                    if read?.to_is_dir {
+                        // The old in-memory structure is gone. Rebuild the
+                        // destination subtree now so known descendants do
+                        // not silently disappear.
+                        out.merge(reconcile_directory(store, config, to, None)?);
+                    } else {
+                        out.merge(reconcile_nearest_parent(store, config, to, Some(1))?);
+                    }
+                }
             }
             Ok(out)
         }
@@ -360,7 +390,7 @@ fn reconcile_nearest_parent(
     path: &Path,
     depth: Option<usize>,
 ) -> Result<ReconcileOutcome, FxError> {
-    let start = if path.is_dir() {
+    let start = if probe_is_dir(&config.reads, path)? {
         path.to_path_buf()
     } else {
         path.parent().unwrap_or(path).to_path_buf()
@@ -371,6 +401,44 @@ fn reconcile_nearest_parent(
             FxError::InvalidInput(format!("watch path is outside configured roots: {path:?}"))
         })?;
     reconcile_directory(store, config, &scope, depth)
+}
+
+/// What a rename that keeps its subtree is reconciled against, read from
+/// disk before the rename is published (see the `Renamed` arm of
+/// [`reconcile_event`]).
+struct RenameRead {
+    to_is_dir: bool,
+    /// The directory the reconciliation covers and its depth-one listing:
+    /// `to` itself when both it and the moved entry are directories, else
+    /// `to`'s nearest known parent — the scope `reconcile_nearest_parent`
+    /// picks once the rename is in the store. `None` when `to` is outside
+    /// every root; `reconcile_nearest_parent` reports that.
+    scope: Option<(PathBuf, Option<DiskListing>)>,
+}
+
+fn read_rename_destination(
+    store: &EntryStore,
+    config: &WatchConfig,
+    entry: &Entry,
+    to: &Path,
+) -> Result<RenameRead, FxError> {
+    let to_is_dir = probe_is_dir(&config.reads, to)?;
+    let moved_dir = entry.kind == EntryKind::Directory || entry.symlink_target_is_dir == Some(true);
+    let scope = if to_is_dir && moved_dir {
+        Some(to.to_path_buf())
+    } else {
+        to.parent()
+            .and_then(|parent| nearest_known_directory(store, parent))
+            .or_else(|| containing_root(&config.roots.read(), to))
+    };
+    let scope = match scope {
+        Some(scope) => {
+            let listing = read_directory(config, &scope, Some(1))?;
+            Some((scope, listing))
+        }
+        None => None,
+    };
+    Ok(RenameRead { to_is_dir, scope })
 }
 
 fn nearest_known_directory(store: &EntryStore, path: &Path) -> Option<PathBuf> {
@@ -403,8 +471,63 @@ pub(crate) fn reconcile_directory(
     directory: &Path,
     depth: Option<usize>,
 ) -> Result<ReconcileOutcome, FxError> {
+    let listing = read_directory(config, directory, depth)?;
+    apply_directory(store, config, directory, depth, listing)
+}
+
+/// `directory` as [`reconcile_directory`] read it from disk.
+struct DiskListing {
+    walked: Vec<WalkedEntry>,
+    unread: Vec<UnreadDirectory>,
+    repository_ignore: Option<IgnoreMatcher>,
+    excludes: Option<IgnoreMatcher>,
+}
+
+/// The disk half of [`reconcile_directory`]; `None` when `directory` is
+/// gone. It reads through the bounded pool and never touches the store, so
+/// a caller can finish reading before it publishes anything.
+fn read_directory(
+    config: &WatchConfig,
+    directory: &Path,
+    depth: Option<usize>,
+) -> Result<Option<DiskListing>, FxError> {
+    if !probe_exists(&config.reads, directory)? {
+        return Ok(None);
+    }
+    let walk_options = WalkOptions {
+        max_depth: depth,
+        follow_symlinks: config.follow_symlinks,
+        include_hidden: true,
+        include_root: true,
+        parallelism: config.walker_concurrency,
+    };
+    let (walked, unread, repository_ignore, excludes) =
+        walk_for_reconcile(directory, walk_options, config)?;
+    Ok(Some(DiskListing {
+        walked,
+        unread,
+        repository_ignore,
+        excludes,
+    }))
+}
+
+/// The store half of [`reconcile_directory`]: make the store say what
+/// `listing` says about `directory`. In-memory work only.
+fn apply_directory(
+    store: &EntryStore,
+    config: &WatchConfig,
+    directory: &Path,
+    depth: Option<usize>,
+    listing: Option<DiskListing>,
+) -> Result<ReconcileOutcome, FxError> {
     let mut out = ReconcileOutcome::default();
-    if !directory.exists() {
+    let Some(DiskListing {
+        mut walked,
+        unread,
+        repository_ignore,
+        excludes,
+    }) = listing
+    else {
         if let Some(entry) = store.get_by_path(directory) {
             if entry.parent_id.is_none() && config.roots.read().iter().any(|root| root == directory)
             {
@@ -422,24 +545,18 @@ pub(crate) fn reconcile_directory(
             }
         }
         return Ok(out);
-    }
-
-    let walk_options = WalkOptions {
-        max_depth: depth,
-        follow_symlinks: config.follow_symlinks,
-        include_hidden: true,
-        include_root: true,
-        parallelism: config.walker_concurrency,
     };
-    let (mut walked, repository_ignore, excludes) =
-        walk_for_reconcile(directory, walk_options, config)?;
+
     walked.sort_by(|a, b| a.depth.cmp(&b.depth).then_with(|| a.path.cmp(&b.path)));
     let disk_paths: HashSet<PathBuf> = walked.iter().map(|entry| entry.path.clone()).collect();
 
+    // A subdirectory whose read did not answer (M10) has unknown children,
+    // not none: keep everything the store knows below it.
     let known = store.paths_under(directory);
     let mut missing: Vec<_> = known
         .into_iter()
         .filter(|(path, _)| in_depth(directory, path, depth) && !disk_paths.contains(path))
+        .filter(|(path, _)| !unread.iter().any(|dir| path.starts_with(&dir.path)))
         .collect();
     missing.sort_by_key(|(path, _)| path.components().count());
     for (path, id) in missing {
@@ -511,6 +628,7 @@ pub(crate) fn reconcile_directory(
     // completion marker both cases remain indistinguishable from "loading".
     let completed_ids: Vec<EntryId> = walked
         .iter()
+        .filter(|entry| !unread.iter().any(|dir| dir.path == entry.path))
         .filter(|entry| {
             let directory_like =
                 entry.kind == EntryKind::Directory || entry.symlink_target_is_dir == Some(true);
@@ -550,7 +668,7 @@ pub(crate) fn reconcile_directory_progressive<F>(
 where
     F: FnMut(&ReconcileOutcome),
 {
-    if !directory.exists() {
+    if !probe_exists(&config.reads, directory)? {
         let outcome = reconcile_directory(store, config, directory, Some(1))?;
         publish(&outcome);
         return Ok(outcome);
@@ -593,9 +711,6 @@ where
                 total.merge(batch);
                 *target = target.saturating_mul(2).min(publication_ceiling);
                 pending.reserve(*target);
-                // Give the JS host enough scheduling room to drain and publish a
-                // page instead of coalescing a whole wide folder into one frame.
-                std::thread::sleep(Duration::from_millis(1));
                 Ok(())
             };
 
@@ -608,22 +723,30 @@ where
                 pending_walked.extend(walked);
                 if pending_walked.len() >= publication_target {
                     flush_pending(&mut pending_walked, &mut publication_target)?;
+                    // Give the JS host enough scheduling room to drain and
+                    // publish this page before the next one, instead of
+                    // coalescing a whole wide folder into one frame. The last
+                    // page needs no room: EOF publishes completion right behind
+                    // it, and sleeping there cost every listed folder a
+                    // millisecond — ~8 s to prefetch a 44k-entry tree (M8).
+                    std::thread::sleep(Duration::from_millis(1));
                 }
                 Ok(())
             };
 
-            let cancelled = || token.is_cancelled();
-            match traversal.as_ref() {
-                Some(ignore) => walk_with_ignore_batched(
-                    directory,
-                    walk_options,
-                    ignore,
-                    batch_size,
-                    cancelled,
-                    &mut consume,
-                )?,
-                None => walk_batched(directory, walk_options, batch_size, cancelled, &mut consume)?,
-            }
+            // Depth one reads only `directory`: if that read does not answer,
+            // the walk fails with its typed error before EOF, so nothing below
+            // is removed and the listing is never marked complete. No
+            // subdirectory is read, so the report's `unread` is always empty.
+            let _depth_one = walk_bounded_batched(
+                directory,
+                walk_options,
+                traversal.as_ref(),
+                &config.reads,
+                batch_size,
+                || token.is_cancelled(),
+                &mut consume,
+            )?;
         }
         if token.is_cancelled() {
             return Err(FxError::Cancelled);
@@ -728,8 +851,9 @@ fn in_depth(root: &Path, path: &Path, depth: Option<usize>) -> bool {
     }
 }
 
-// The walk hands back its entries plus the two matchers it resolved; naming
-// the tuple would not make the signature easier to read at the call site.
+// The walk hands back its entries, the directories it could not read, and
+// the two matchers it resolved; naming the tuple would not make the signature
+// easier to read at the call site.
 #[allow(clippy::type_complexity)]
 fn walk_for_reconcile(
     directory: &Path,
@@ -738,6 +862,7 @@ fn walk_for_reconcile(
 ) -> Result<
     (
         Vec<WalkedEntry>,
+        Vec<UnreadDirectory>,
         Option<IgnoreMatcher>,
         Option<IgnoreMatcher>,
     ),
@@ -745,7 +870,8 @@ fn walk_for_reconcile(
 > {
     let exclude_globs = config.exclude_globs.read().clone();
     if !config.respect_ignore && exclude_globs.is_empty() {
-        return Ok((walk(directory, options)?, None, None));
+        let report = walk_bounded(directory, options, None, &config.reads)?;
+        return Ok((report.entries, report.unread, None, None));
     }
 
     let root =
@@ -765,29 +891,33 @@ fn walk_for_reconcile(
         .flat_map(|path| path.iter())
     {
         if config.respect_ignore {
-            add_ignore_files(&mut traversal, &anchor);
-            add_ignore_files(&mut repository_ignore, &anchor);
+            seed_ignore_files(
+                &config.reads,
+                &anchor,
+                &mut [&mut traversal, &mut repository_ignore],
+            )?;
         }
         anchor = anchor.join(segment);
     }
     if config.respect_ignore {
-        add_ignore_files(&mut traversal, directory);
-        add_ignore_files(&mut repository_ignore, directory);
+        seed_ignore_files(
+            &config.reads,
+            directory,
+            &mut [&mut traversal, &mut repository_ignore],
+        )?;
     }
-    let walked = walk_with_ignore(directory, options, &traversal)?;
+    let report = walk_bounded(directory, options, Some(&traversal), &config.reads)?;
     // Keep ancestor rules that were seeded above the bounded walk, while
-    // adding nested ignore files discovered during this reconciliation.
+    // adding nested ignore files discovered during this reconciliation. The
+    // walk already read them, so nothing is opened twice.
     if config.respect_ignore {
-        for entry in &walked {
-            if entry.path.file_name().is_some_and(|name| {
-                mille_core::IGNORE_FILE_NAMES.contains(&name.to_string_lossy().as_ref())
-            }) {
-                let _ = repository_ignore.add_from_file(&entry.path);
-            }
+        for (path, contents) in &report.ignore_files {
+            let _ = repository_ignore.add_from_contents(path, contents);
         }
     }
     Ok((
-        walked,
+        report.entries,
+        report.unread,
         config.respect_ignore.then_some(repository_ignore),
         (!exclude_globs.is_empty()).then_some(excludes),
     ))
@@ -825,29 +955,26 @@ fn build_reconcile_matchers(
         .flat_map(|path| path.iter())
     {
         if config.respect_ignore {
-            add_ignore_files(&mut traversal, &anchor);
-            add_ignore_files(&mut repository_ignore, &anchor);
+            seed_ignore_files(
+                &config.reads,
+                &anchor,
+                &mut [&mut traversal, &mut repository_ignore],
+            )?;
         }
         anchor = anchor.join(segment);
     }
     if config.respect_ignore {
-        add_ignore_files(&mut traversal, directory);
-        add_ignore_files(&mut repository_ignore, directory);
+        seed_ignore_files(
+            &config.reads,
+            directory,
+            &mut [&mut traversal, &mut repository_ignore],
+        )?;
     }
     Ok((
         Some(traversal),
         config.respect_ignore.then_some(repository_ignore),
         (!exclude_globs.is_empty()).then_some(excludes),
     ))
-}
-
-fn add_ignore_files(matcher: &mut IgnoreMatcher, directory: &Path) {
-    for name in mille_core::IGNORE_FILE_NAMES {
-        let candidate = directory.join(name);
-        if candidate.is_file() {
-            let _ = matcher.add_from_file(&candidate);
-        }
-    }
 }
 
 fn entry_from_walked(

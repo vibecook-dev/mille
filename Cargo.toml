@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/mille-core",
+    "crates/mille-git",
     "crates/mille-binding",
     "crates/mille-bench",
 ]
@@ -22,9 +23,6 @@ napi-build = "2.3"
 # Filesystem watching
 notify = "6.1"
 notify-debouncer-full = "0.3"
-
-# Parallel directory walking
-jwalk = "0.8"
 
 # Gitignore matching (ripgrep's crate)
 ignore = "0.4"
@@ -63,6 +61,32 @@ memmap2 = "0.9"
 
 # Errors
 thiserror = "2.0"
+
+# Git reads for `crates/mille-git` only (writes go through the git CLI, see
+# `crates/mille-git/src/cli.rs`). Never a dependency of `mille-core` or of the
+# default `mille-binding` build: FileTree embedders must not link gix (SPEC
+# mille-git §8.2).
+#
+# Default features stay off on purpose — they pull network transports,
+# credentials, blame, merge and archive, none of which v1 uses, and every one
+# of them is `.node` size (§21.4). The list is the spec's §8.1 list plus
+# `sha1`: gix 0.87 moved the hash implementation behind that feature, and
+# without it no SHA-1 repository opens. `parallel` is what makes
+# `gix::Repository` `Send`.
+gix = { version = "0.87.1", default-features = false, features = [
+    "sha1",
+    "status",
+    "parallel",
+    "revision",
+    "index",
+    "excludes",
+    "blob-diff",
+    "attributes",
+] }
+
+# Structured diagnostics for mille-git (status / diff / commit / open spans).
+tracing = "0.1"
+
 
 # Small collections
 smallvec = { version = "1.13", features = ["const_generics", "union"] }

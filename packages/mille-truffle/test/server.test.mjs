@@ -509,7 +509,15 @@ test('heartbeat pings are answered and never reach the explorer host', async () 
     const reply = replies.find((m) => m?.type === 'pong');
     assert.ok(reply, 'got a pong');
     assert.equal(reply.nonce, 'abc123', 'nonce echoed');
-    // The host never saw it: the session is still open and healthy.
+    // The host never saw it. Had it, the host would have answered the ping as
+    // a malformed explorer frame — an EINVAL error, which a real client turns
+    // into a rejection of every pending request.
+    await new Promise((r) => setTimeout(r, 50));
+    assert.deepEqual(
+      replies.filter((m) => m?.type === 'error'),
+      [],
+      'no explorer error frame answered the ping',
+    );
     assert.equal(server.listSessions().length, 1);
   } finally {
     if (server) await server.close();

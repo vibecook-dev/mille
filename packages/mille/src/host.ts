@@ -28,6 +28,10 @@ import {
   authorizeDecorations,
   authorizeMutation,
   effectiveCapabilities,
+  DEFAULT_SEARCH_LIMIT,
+  MAX_SEARCH_LIMIT,
+  MAX_SEARCH_QUERY_LENGTH,
+  viewportRowCap,
 } from './channel/policy.js';
 import { encodeClientEntries } from './entry-codec.js';
 import { encodeChildLists } from './child-list-codec.js';
@@ -39,6 +43,7 @@ import {
   type DecorationOnWire,
   type DecorationsFrameBody,
   type HostToClientMessage,
+  type SearchCallResult,
 } from './protocol.js';
 import { createMessagePortHostChannel } from './channel/message-port.js';
 import { resolveSessionContext } from './channel/types.js';
@@ -235,7 +240,7 @@ interface Session {
    */
   resyncTimes: number[];
   /** Teardown for the message listener + port. Replaced during attach. */
-  detach: () => void;
+  detach: (reason?: string) => void;
 }
 
 interface DirectoryLoadTask {
@@ -493,10 +498,10 @@ class FileExplorerHostImpl implements FileExplorerHost {
     // never the shared host (SPEC NFR-005).
     const closeSub = channel.onClose(() => this.detachSession(id));
 
-    session.detach = (): void => {
+    session.detach = (reason?: string): void => {
       messageSub.dispose();
       closeSub.dispose();
-      channel.close();
+      channel.close(reason);
     };
     this.sessions.set(id, session);
     this.ensureTick();
@@ -977,6 +982,13 @@ class FileExplorerHostImpl implements FileExplorerHost {
       requestedPrefetch !== undefined && Number.isFinite(requestedPrefetch)
         ? Math.min(0xffff_ffff, Math.max(0, Math.trunc(requestedPrefetch)))
         : 100;
+    // The prefetch becomes a viewport on a headless client's first
+    // expansion, so it answers to the same cap.
+    const prefetchCap = viewportRowCap(session.context);
+    const requestedPrefetchRows = session.prefetchRows;
+    if (prefetchCap !== undefined && requestedPrefetchRows > prefetchCap) {
+      session.prefetchRows = prefetchCap;
+    }
     const snap = this.explorer.getSnapshot();
     const roots = snap.roots().map((e) => e.id);
     const rootEntries = roots
@@ -1010,6 +1022,12 @@ class FileExplorerHostImpl implements FileExplorerHost {
         },
       }),
     );
+    if (requestedPrefetchRows !== session.prefetchRows) {
+      this.warnViewportClamped(session, {
+        requested: { prefetchRows: requestedPrefetchRows },
+        granted: { prefetchRows: session.prefetchRows },
+      });
+    }
   }
 
   private handleSetExpanded(
@@ -1358,8 +1376,19 @@ class FileExplorerHostImpl implements FileExplorerHost {
     const normalize = (value: number): number =>
       Number.isFinite(value) ? Math.min(0xffff_ffff, Math.max(0, Math.trunc(value))) : 0;
     const offset = normalize(body.offset);
-    const limit = normalize(body.limit);
-    const overscan = normalize(body.overscan ?? 0);
+    let limit = normalize(body.limit);
+    let overscan = normalize(body.overscan ?? 0);
+    // SPEC §20.2-style bound: a non-admin session's window — limit plus
+    // overscan on both sides — never exceeds its cap. Clamp rather than
+    // refuse, so the visible rows still arrive, and say so: rows past the
+    // cap stay placeholders on the client, and it should know why.
+    const cap = viewportRowCap(session.context);
+    if (cap !== undefined && limit + 2 * overscan > cap) {
+      const requested = { offset, limit, overscan };
+      limit = Math.min(limit, cap);
+      overscan = Math.min(overscan, Math.floor((cap - limit) / 2));
+      this.warnViewportClamped(session, { requested, granted: { offset, limit, overscan } });
+    }
     session.viewport = { offset, limit, overscan };
 
     const snap = this.explorer.getSnapshot();
@@ -1999,6 +2028,53 @@ class FileExplorerHostImpl implements FileExplorerHost {
         }
         return { id, version: snapshot.treeVersion, entries };
       }
+      case 'search': {
+        const [query, rawOptions] = args;
+        if (typeof query !== 'string') {
+          throw new FileSystemError('EINVAL', 'search requires a query string');
+        }
+        if (query.length > MAX_SEARCH_QUERY_LENGTH) {
+          throw new FileSystemError(
+            'EINVAL',
+            `search query exceeds ${MAX_SEARCH_QUERY_LENGTH} characters`,
+          );
+        }
+        const { limit, engine } = parseSearchOptions(rawOptions);
+        // One more than the page, so `clipped` is observed rather than guessed.
+        const found = this.explorer.search(query, { ...engine, limit: limit + 1 });
+        const snapshot = this.explorer.getSnapshot();
+        // Same boundary as resolvePath: a restricted session must not learn
+        // about entries beyond a symlink another session hydrated.
+        const restricted = session.context.policy.access !== 'admin';
+        const hits: { id: number; score: number; matchedIndices: number[] }[] = [];
+        const entries = new Map<number, ClientEntry>();
+        for (const hit of found) {
+          if (hits.length === limit) break;
+          const id = hit.entry.id;
+          if (snapshot.getById(id) === null) continue;
+          if (restricted && crossesSymlink(snapshot, id)) continue;
+          hits.push({ id, score: hit.score, matchedIndices: [...hit.matchedIndices] });
+          // The hit and its ancestors, each shipped once: a chain stops at
+          // the first entry an earlier hit already brought.
+          let cursor: EntryId | null = id;
+          let guard = 0;
+          while (cursor !== null && !entries.has(cursor) && guard < 10_000) {
+            const entry = snapshot.getById(cursor);
+            if (entry === null) break;
+            entries.set(cursor, entryToClient(entry));
+            session.knownIds.add(cursor);
+            cursor = entry.parentId ?? null;
+            guard += 1;
+          }
+        }
+        const result: SearchCallResult = {
+          version: snapshot.treeVersion,
+          clipped: found.length > limit,
+          hits,
+          entries: [...entries.values()],
+        };
+        return result;
+      }
       default:
         throw new Error(`unknown method: ${method}`);
     }
@@ -2010,23 +2086,77 @@ class FileExplorerHostImpl implements FileExplorerHost {
       // body; the channel is typed to the HostToClient union. One cast at
       // the single send site beats threading the union through every caller.
       session.channel.send(msg as HostToClientMessage);
-    } catch {
-      // Port may be closed mid-flight. Detach this session quietly so
-      // the host can keep serving other sessions.
+    } catch (error) {
+      // A channel that is still open refused to *encode* this message — a
+      // framed transport's frame or metadata limit — and is otherwise
+      // healthy. A result can be answered with an error instead; anything
+      // else (a delta, a snapshot) would leave the mirror out of step, so
+      // that session ends. A closed port lands here too, and detaches.
+      if (session.channel.state === 'open') {
+        if (this.answerUnsendableResult(session, msg, error)) return;
+        // Ending the session is the only safe answer, but not a silent one:
+        // the close carries why, so the client is not left guessing.
+        const type = (msg as { type?: unknown } | null)?.type;
+        const reason = error instanceof Error ? error.message : String(error);
+        this.detachSession(session.id, `could not send ${String(type)}: ${reason}`);
+        return;
+      }
       this.detachSession(session.id);
     }
+  }
+
+  /**
+   * Replace a result too large for the channel with an EFBIG error for the
+   * same request. `readText` is the usual case: its text rides in the
+   * frame's JSON metadata, whose cap (4 MiB by default) is below the file
+   * cap a remote session may be granted.
+   */
+  private answerUnsendableResult(session: Session, msg: unknown, error: unknown): boolean {
+    const f = msg as { type?: unknown; body?: { reqId?: unknown } } | null;
+    const type = f?.type;
+    const reqId = f?.body?.reqId;
+    if ((type !== 'mutateResult' && type !== 'callResult') || typeof reqId !== 'number') {
+      return false;
+    }
+    const reason = error instanceof Error ? error.message : String(error);
+    try {
+      session.channel.send(
+        frame(type, {
+          reqId,
+          result: null,
+          error: { code: 'EFBIG', message: `result too large for this channel: ${reason}` },
+        }) as HostToClientMessage,
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Tell a session its viewport (or prefetch) request was cut to its cap. */
+  private warnViewportClamped(
+    session: Session,
+    detail: { requested: Record<string, number>; granted: Record<string, number> },
+  ): void {
+    this.send(
+      session,
+      frame('warning', {
+        code: 'VIEWPORT_CLAMPED',
+        detail: JSON.stringify({ ...detail, maxViewportRows: viewportRowCap(session.context) }),
+      }),
+    );
   }
 
   private sendError(session: Session, code: string, message: string): void {
     this.send(session, frame('error', { code, message }));
   }
 
-  private detachSession(id: number): void {
+  private detachSession(id: number, reason?: string): void {
     const session = this.sessions.get(id);
     if (!session) return;
     for (const expandedId of session.expanded)
       this.releaseDirectoryLoad(session, expandedId, false);
-    session.detach();
+    session.detach(reason);
     // SPEC §23.3 — releasing the claims here is what stops a session that
     // dropped mid-transfer from reserving its operation ids forever.
     session.ownedOperationIds.clear();
@@ -2078,6 +2208,48 @@ function toWireDecoration(d: Decoration): DecorationOnWire {
   if (d.tooltip !== undefined) out.tooltip = d.tooltip;
   if (d.propagate !== undefined) out.propagate = d.propagate;
   return out;
+}
+
+/**
+ * Validate a channel search's options. A limit above the cap is clamped, not
+ * refused — `clipped` tells the client the page was cut either way.
+ */
+function parseSearchOptions(raw: unknown): {
+  limit: number;
+  engine: { includeIgnored?: boolean; caseSensitive?: boolean; kinds?: number[] };
+} {
+  if (raw === undefined || raw === null) return { limit: DEFAULT_SEARCH_LIMIT, engine: {} };
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new FileSystemError('EINVAL', 'search options must be an object');
+  }
+  const o = raw as Record<string, unknown>;
+  let limit = DEFAULT_SEARCH_LIMIT;
+  if (o.limit !== undefined) {
+    if (typeof o.limit !== 'number' || !Number.isInteger(o.limit) || o.limit < 1) {
+      throw new FileSystemError('EINVAL', 'search limit must be a positive integer');
+    }
+    limit = Math.min(o.limit, MAX_SEARCH_LIMIT);
+  }
+  const engine: { includeIgnored?: boolean; caseSensitive?: boolean; kinds?: number[] } = {};
+  for (const flag of ['includeIgnored', 'caseSensitive'] as const) {
+    const value = o[flag];
+    if (value === undefined) continue;
+    if (typeof value !== 'boolean') {
+      throw new FileSystemError('EINVAL', `search ${flag} must be a boolean`);
+    }
+    engine[flag] = value;
+  }
+  if (o.kinds !== undefined) {
+    if (
+      !Array.isArray(o.kinds) ||
+      o.kinds.length > 8 ||
+      !o.kinds.every((k) => typeof k === 'number' && Number.isInteger(k) && k >= 0 && k <= 4)
+    ) {
+      throw new FileSystemError('EINVAL', 'search kinds must be a short list of entry kinds');
+    }
+    engine.kinds = [...(o.kinds as number[])];
+  }
+  return { limit, engine };
 }
 
 function toErrorPayload(e: unknown): { code: string; message: string; path?: string } {

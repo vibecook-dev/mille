@@ -9,7 +9,7 @@
 //! Content search (grep-in-files) is NOT this; SPEC §1 keeps it as a
 //! separate downstream package.
 
-use crate::entry::EntryId;
+use crate::entry::{EntryId, EntryKind};
 use crate::snapshot::StoreSnapshot;
 
 /// Per-hit score. Higher is better. Nucleo emits `u32` under the hood;
@@ -43,6 +43,12 @@ pub struct SearchOptions {
     /// "smart case" — lowercase needle matches case-insensitively, any
     /// uppercase character triggers case-sensitive match.
     pub case_sensitive: bool,
+    /// Only entries of these kinds can match; `None` admits every kind and
+    /// an empty list admits none. Applied before scoring and before
+    /// `limit`, so a directories-only search with `limit: Some(100)` returns
+    /// up to 100 directories — not the directories among the first 100
+    /// hits, which a caller filtering afterwards would get.
+    pub kinds: Option<Vec<EntryKind>>,
 }
 
 impl Default for SearchOptions {
@@ -51,6 +57,7 @@ impl Default for SearchOptions {
             limit: Some(100),
             include_ignored: false,
             case_sensitive: false,
+            kinds: None,
         }
     }
 }
@@ -83,6 +90,11 @@ pub fn search(snap: &StoreSnapshot, query: &str, options: &SearchOptions) -> Vec
     for (id, entry) in snap.entries_iter() {
         if !options.include_ignored && (entry.is_ignored_or_excluded() || entry.is_hidden) {
             continue;
+        }
+        if let Some(kinds) = &options.kinds {
+            if !kinds.contains(&entry.kind) {
+                continue;
+            }
         }
         let haystack = Utf32String::from(entry.name.as_str());
         indices_buf.clear();
@@ -259,6 +271,50 @@ mod tests {
         };
         let hits_all = search(&snap, "main", &opts_unbounded);
         assert_eq!(hits_all.len(), 10);
+    }
+
+    #[test]
+    fn kinds_filter_applies_before_the_limit() {
+        let mut entries: Vec<Entry> = (0..8)
+            .map(|i| mk_entry(EntryId(i + 1), &format!("src_file_{i}.rs")))
+            .collect();
+        for (i, name) in ["src", "src_tools"].iter().enumerate() {
+            let mut dir = mk_entry(EntryId(100 + i as u64), name);
+            dir.kind = EntryKind::Directory;
+            entries.push(dir);
+        }
+        let snap = seed_entries(entries);
+
+        let dirs_only = SearchOptions {
+            limit: Some(1),
+            kinds: Some(vec![EntryKind::Directory]),
+            ..SearchOptions::default()
+        };
+        let hits = search(&snap, "src", &dirs_only);
+        assert_eq!(hits.len(), 1);
+        assert!(
+            hits[0].id.0 >= 100,
+            "a one-hit directory search returns a directory"
+        );
+
+        let all_dirs = SearchOptions {
+            limit: Some(100),
+            kinds: Some(vec![EntryKind::Directory]),
+            ..SearchOptions::default()
+        };
+        let mut ids: Vec<u64> = search(&snap, "src", &all_dirs)
+            .iter()
+            .map(|h| h.id.0)
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![100, 101]);
+
+        let none = SearchOptions {
+            kinds: Some(Vec::new()),
+            ..SearchOptions::default()
+        };
+        assert!(search(&snap, "src", &none).is_empty());
+        assert_eq!(search(&snap, "src", &SearchOptions::default()).len(), 10);
     }
 
     #[test]

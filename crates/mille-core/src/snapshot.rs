@@ -9,8 +9,14 @@
 // caches (descendant_visible_counts, descendant_total_sizes) maintained by
 // ancestor-walks in EntryStore insert/remove. A full Zed-style SumTree port
 // is deferred to Phase 12 behind the same public query API.
+//
+// M8: the id-keyed fields are persistent maps (`IdMap` / `IdSet`), not
+// `BTreeMap`s. Every store mutation clones the snapshot it replaces, and a
+// `BTreeMap` clone copied the whole tree each time — hydration was quadratic.
+// A persistent map clones in O(1) and copies only the path to each key a
+// mutation touches; see `id_map.rs` for the cost model.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -18,6 +24,7 @@ use smallvec::SmallVec;
 
 use crate::entry::{Entry, EntryId, EntryKind};
 use crate::file_nesting::FileNestingPolicy;
+use crate::id_map::{IdMap, IdSet};
 
 /// Max ancestor hops in any summary update — defends against malformed
 /// parent_id cycles (self-reference, etc.). Real trees are ~10-15 deep.
@@ -50,24 +57,31 @@ fn is_os_or_vcs_noise(name: &str) -> bool {
     matches!(name, ".DS_Store" | "Thumbs.db" | "desktop.ini" | ".git")
 }
 
+/// One directory's ordered child ids, shared between snapshots until a
+/// publication changes that directory's membership or order.
+pub(crate) type ChildList = Arc<SmallVec<[EntryId; 8]>>;
+
 pub struct StoreSnapshot {
-    pub(crate) entries: BTreeMap<EntryId, Arc<Entry>>,
-    pub(crate) children: BTreeMap<EntryId, SmallVec<[EntryId; 8]>>,
+    pub(crate) entries: IdMap<Arc<Entry>>,
+    /// Ordered child ids per directory. Each list sits behind its own `Arc`,
+    /// so copying a trie leaf on the way to one directory's list never copies
+    /// the lists of the directories sharing that leaf.
+    pub(crate) children: IdMap<ChildList>,
     /// Directory ids whose immediate child listing has completed.
     ///
     /// This is deliberately separate from `children`: an empty directory has
     /// no child records, while URI hydration can insert a partial ancestor
     /// chain before the directory has ever been listed. Conflating either case
     /// with completeness causes permanent loading spinners or truncated trees.
-    pub(crate) loaded_directories: BTreeSet<EntryId>,
+    pub(crate) loaded_directories: IdSet,
     pub(crate) roots: SmallVec<[EntryId; 4]>,
     pub(crate) tree_version: u64,
-    pub(crate) direct_child_counts: BTreeMap<EntryId, u32>,
+    pub(crate) direct_child_counts: IdMap<u32>,
     /// Count of visible (non-ignored, non-hidden) entries in the subtree rooted at
     /// this id, INCLUDING the root itself. A leaf has count 1 if visible.
-    pub(crate) descendant_visible_counts: BTreeMap<EntryId, u32>,
+    pub(crate) descendant_visible_counts: IdMap<u32>,
     /// Sum of file sizes in the subtree (dirs contribute 0; files their `size`).
-    pub(crate) descendant_total_sizes: BTreeMap<EntryId, u64>,
+    pub(crate) descendant_total_sizes: IdMap<u64>,
     pub(crate) visibility: VisibilityPolicy,
     pub(crate) compact_folders: bool,
     pub(crate) file_nesting: FileNestingPolicy,
@@ -99,14 +113,14 @@ impl Clone for StoreSnapshot {
 impl Default for StoreSnapshot {
     fn default() -> Self {
         Self {
-            entries: BTreeMap::new(),
-            children: BTreeMap::new(),
-            loaded_directories: BTreeSet::new(),
+            entries: IdMap::new(),
+            children: IdMap::new(),
+            loaded_directories: IdSet::new(),
             roots: SmallVec::new(),
             tree_version: 0,
-            direct_child_counts: BTreeMap::new(),
-            descendant_visible_counts: BTreeMap::new(),
-            descendant_total_sizes: BTreeMap::new(),
+            direct_child_counts: IdMap::new(),
+            descendant_visible_counts: IdMap::new(),
+            descendant_total_sizes: IdMap::new(),
             visibility: VisibilityPolicy::default(),
             compact_folders: false,
             file_nesting: FileNestingPolicy::default(),
@@ -310,7 +324,7 @@ impl StoreSnapshot {
     /// Iterate over every (id, entry) pair in the snapshot. Primarily for
     /// bench harnesses and crash-resume serialization.
     pub fn entries_iter(&self) -> impl Iterator<Item = (EntryId, &Arc<Entry>)> + '_ {
-        self.entries.iter().map(|(id, e)| (*id, e))
+        self.entries.iter()
     }
 
     /// Visible-descendant count for the subtree rooted at `id` (inclusive).
@@ -880,7 +894,7 @@ mod tests {
         match parent {
             None => snap.roots.push(id),
             Some(p) => {
-                snap.children.entry(p).or_default().push(id);
+                Arc::make_mut(snap.children.entry(p).or_default()).push(id);
                 *snap.direct_child_counts.entry(p).or_insert(0) += 1;
                 // Snapshot unit fixtures describe complete static trees unless
                 // they deliberately leave a leaf directory childless to test

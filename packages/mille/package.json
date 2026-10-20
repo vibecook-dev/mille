@@ -35,6 +35,10 @@
       "types": "./dist/client-port.d.ts",
       "import": "./dist/client-port.js"
     },
+    "./remote": {
+      "types": "./dist/remote-client.d.ts",
+      "import": "./dist/remote-client.js"
+    },
     "./provider": {
       "types": "./dist/provider.d.ts",
       "import": "./dist/provider.js"
@@ -42,6 +46,10 @@
     "./node": {
       "types": "./dist/node.d.ts",
       "import": "./dist/node.js"
+    },
+    "./git": {
+      "types": "./dist/git/index.d.ts",
+      "import": "./dist/git/index.js"
     }
   },
   "files": [
@@ -58,12 +66,16 @@
     "build:napi:debug": "napi build --platform --manifest-path ../../crates/mille-binding/Cargo.toml --output-dir . --no-js",
     "build:napi:probe": "napi build --platform --manifest-path ../../crates/mille-binding/Cargo.toml --output-dir . --no-js --features panic-probe",
     "build:napi:probe:release": "napi build --platform --release --manifest-path ../../crates/mille-binding/Cargo.toml --output-dir . --no-js --features panic-probe",
+    "build:napi:git": "napi build --platform --release --manifest-path ../../crates/mille-binding/Cargo.toml --output-dir . --no-js --features git",
+    "build:napi:git:debug": "napi build --platform --manifest-path ../../crates/mille-binding/Cargo.toml --output-dir . --no-js --features git",
+    "build:napi:git:probe": "napi build --platform --manifest-path ../../crates/mille-binding/Cargo.toml --output-dir . --no-js --features panic-probe,git",
     "build:ts": "tsc --build",
     "typecheck": "tsc --noEmit",
     "test": "node ../../scripts/run-tests.mjs --test-concurrency=4",
     "bench:viewport": "node bench/viewport-retention.mjs",
     "bench:wide-folder": "node bench/wide-folder-order.mjs",
     "bench:progressive-directory": "node bench/progressive-directory.mjs",
+    "bench:hydration": "node bench/hydration-scaling.mjs",
     "bench:natural-sort": "node bench/natural-sort.mjs",
     "bench:settings": "node bench/explorer-settings.mjs",
     "bench:visibility": "node bench/visibility-projection.mjs",
@@ -82,6 +94,7 @@
     "bench:cross-root": "node bench/cross-root-transfer.mjs",
     "bench:watch:soak": "node bench/watch-soak.mjs",
     "bench:provider": "node bench/provider-memfs.mjs",
+    "bench:transport": "node bench/transport-compare.mjs",
     "artifacts": "napi artifacts",
     "prepublishOnly": "napi prepublish -t npm"
   },
@@ -91,7 +104,8 @@
     "@types/react": "^19.2.0",
     "fast-check": "^4.7.0",
     "react": "^19.2.0",
-    "typescript": "~6.0.0"
+    "typescript": "~6.0.0",
+    "ws": "^8.22.0"
   },
   "peerDependencies": {
     "react": ">=18"

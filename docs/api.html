@@ -913,7 +913,7 @@
             <table class="props">
               <thead><tr><th>Member</th><th>Type</th><th>Notes</th></tr></thead>
               <tbody>
-                <tr><td>code</td><td>ErrorCode</td><td>EACCES, ENOENT, EEXIST, EISDIR, ENOTDIR, ELOOP, ENOSPC, EROFS, EBUSY, EINVAL, ECANCELED, EUNSUPPORTED, EUNKNOWN</td></tr>
+                <tr><td>code</td><td>ErrorCode</td><td>EACCES, ENOENT, EEXIST, EISDIR, ENOTDIR, ELOOP, ENOSPC, EROFS, EBUSY, EINVAL, ECANCELED, EUNSUPPORTED, EUNKNOWN, ETIMEDOUT (a native read stalled), EDATALESS (cloud-evicted folder, not downloaded)</td></tr>
                 <tr><td>path<span class="opt">?</span></td><td>string</td><td>Path involved in the failure</td></tr>
               </tbody>
             </table>
@@ -951,6 +951,9 @@
                 <tr><td>excludeGlobs<span class="opt">?</span></td><td>string[]</td><td>Extra excludes layered on ignore</td></tr>
                 <tr><td>snapshotPath<span class="opt">?</span></td><td>string</td><td>Crash-resume snapshot file</td></tr>
                 <tr><td>maxCachedEntries<span class="opt">?</span></td><td>number</td><td><code>500_000</code></td></tr>
+                <tr><td>readTimeoutMs<span class="opt">?</span></td><td>number</td><td><code>2000</code> — a native read with no progress this long answers <code>ETIMEDOUT</code> for its folder; the kernel call finishes in the background</td></tr>
+                <tr><td>maxStuckReads<span class="opt">?</span></td><td>number</td><td><code>16</code> — reads allowed past the deadline; beyond it new reads answer <code>ETIMEDOUT</code> at once</td></tr>
+                <tr><td>materializeDataless<span class="opt">?</span></td><td>boolean</td><td><code>false</code> — macOS: list cloud-evicted folders by downloading them; off, they answer <code>EDATALESS</code></td></tr>
                 <tr><td>initialWalk<span class="opt">?</span></td><td>'full' | 'roots-only' | 'none'</td><td>Host walk policy. <code>'roots-only'</code> for huge repos. Default <code>'full'</code> (host does not auto-walk; caller populates).</td></tr>
               </tbody>
             </table>

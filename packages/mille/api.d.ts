@@ -49,7 +49,18 @@ export type ErrorCode =
    */
   | 'EFBIG'
   | 'EUNSUPPORTED'
-  | 'EUNKNOWN';
+  | 'EUNKNOWN'
+  /**
+   * A native read made no progress within `readTimeoutMs`, or a read into
+   * the same folder is still stuck (an iCloud folder downloading, a hung
+   * network mount). Nothing about the folder is known; retry later.
+   */
+  | 'ETIMEDOUT'
+  /**
+   * The folder is a cloud placeholder whose contents are not on this
+   * machine (macOS: evicted / dataless), and `materializeDataless` is off.
+   */
+  | 'EDATALESS';
 
 /**
  * Typed error for expected filesystem failures. Methods throw this rather
@@ -251,6 +262,30 @@ export interface ExplorerOptions {
    * Default: 256.
    */
   readonly directoryBatchSize?: number;
+
+  /**
+   * Stall deadline for one native read, in ms. A listing or stat that makes
+   * no progress for this long answers `ETIMEDOUT` for its folder while the
+   * kernel call finishes in the background; a later request retries. A
+   * large folder that keeps reading is never cut off. Default: 2000.
+   */
+  readonly readTimeoutMs?: number;
+
+  /**
+   * Reads allowed to sit past their deadline at once. Each holds a parked
+   * native thread until the kernel returns; beyond this, new reads answer
+   * `ETIMEDOUT` immediately. Default: 16.
+   */
+  readonly maxStuckReads?: number;
+
+  /**
+   * Let listings download cloud-evicted (dataless) folders, as Finder does
+   * when one is opened. Off by default: listing is metadata, and
+   * materializing a dataless folder can fetch a whole package, so such a
+   * folder answers `EDATALESS` instead. Either way the read deadline holds.
+   * macOS only; ignored elsewhere.
+   */
+  readonly materializeDataless?: boolean;
 
   /**
    * Phase B2 — initial walk policy. Consumed by `createFileExplorerHost`
@@ -844,9 +879,14 @@ export interface MessagePortLike {
 //
 // The host and client depend on an ordered, reliable, message-oriented pipe
 // with a close notification — nothing more. `ExplorerChannel` names that
-// contract so a MessagePort (local) and a framed Node Duplex (remote) are
-// interchangeable. Factories for the MessagePort form are exported from the
-// package root; the framed stream form ships from `@vibecook/mille/node`.
+// contract so a MessagePort (local), a framed Node Duplex and a WebSocket
+// (remote) are interchangeable. Factories for the MessagePort form are
+// exported from the package root; the framed stream form and the host side of
+// the WebSocket form (`createWebSocketHostChannel`, `serveWebSocketSession`,
+// `serveRemoteSession` — the credentialed `mille.remote` open) ship from
+// `@vibecook/mille/node`; the browser-safe client side
+// (`createWebSocketClientChannel`, `connectWebSocketChannel`,
+// `openRemoteChannel`, `relayExplorerChannel`) from `@vibecook/mille/remote`.
 
 export type ExplorerChannelState = 'open' | 'closing' | 'closed';
 
@@ -904,6 +944,14 @@ export interface ExplorerSessionPolicy {
   readonly allowExternalImport?: boolean;
   readonly allowUndo?: boolean;
   readonly allowWorkspaceResync?: boolean;
+  /** Filename search over the channel: a whole-tree scan per call, so opt-in remotely. */
+  readonly allowSearch?: boolean;
+  /**
+   * Most rows one viewport may span (limit plus overscan both sides, and the
+   * handshake's prefetchRows). Larger requests are clamped with a
+   * `VIEWPORT_CLAMPED` warning. Unset: admin unbounded, others 2,048.
+   */
+  readonly maxViewportRows?: number;
 }
 
 /**

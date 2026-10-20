@@ -320,6 +320,69 @@ jobs:
           echo "20 clean resync repetitions"
 
   # ------------------------------------------------------------------
+  # The git engine — the `git` cargo feature (SPEC mille-git §8, §28.3).
+  #
+  # Every other job builds the default binary, and the default binary has no
+  # git engine: FileTree-only embedders must not link gix, and the published
+  # platform packages leave it out until its size is measured (§32.1). So no
+  # other job compiles `crates/mille-binding/src/git.rs` or loads `GitEngine`;
+  # `mille-git` itself is tested by `test-rust`'s workspace `cargo test`.
+  #
+  # This job is the feature-on half: clippy over the binding with the feature
+  # (and the panic probe) on, then the whole JS suite against a
+  # `--features panic-probe,git` debug binary — the git tests, the git panic
+  # probes, and proof that turning the feature on breaks nothing FileTree
+  # relies on. `MILLE_EXPECT_GIT=1` makes a binary without the engine a test
+  # failure instead of a skip, so a build that quietly produced the default
+  # artifact cannot report green.
+  # ------------------------------------------------------------------
+  test-git:
+    name: Git engine (feature on)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile=false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: git-feature
+
+      - name: cargo clippy (git feature on)
+        run: cargo clippy -p mille-binding --all-targets --features panic-probe,git -- -D warnings
+
+      - name: Build native (git) + TS packages
+        run: |
+          pnpm --filter @vibecook/mille run build:napi:git:probe
+          pnpm --filter @vibecook/mille run build:ts
+          pnpm --filter @vibecook/mille-ui run build
+          pnpm --filter @vibecook/mille-truffle run build
+
+      - name: Typecheck
+        run: pnpm -r --if-present typecheck
+
+      - name: Test against the git-enabled binary
+        env:
+          MILLE_EXPECT_GIT: '1'
+        run: pnpm -r --if-present test
+
+  # ------------------------------------------------------------------
   # The suite on Windows.
   #
   # Every job above runs on ubuntu-latest, and Windows appeared only in the

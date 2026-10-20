@@ -60,3 +60,9 @@ and inject clients via `FileTree` `hostHooks` (structural `ScmHostHooks`).
 
 `ScmClient` methods accept `{ signal?: AbortSignal }`. The shell client
 terminates the spawned git child on abort (not only pre-flight checks).
+
+An aborted client call rejects with an `Error` whose `code` is `'ABORT_ERR'`,
+from the shell clients and the `GitService` adapters alike (SPEC mille-git
+§12.5). `runScmRevert` / `runScmCompare` report it — or any failure once their
+`signal` has fired — as `ScmActionError('ECANCELED')` and the `cancelled`
+progress phase, the same code a declined confirm throws.

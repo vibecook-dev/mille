@@ -17,6 +17,10 @@ pub use entry::{Capability, Entry, EntryId, EntryKind};
 pub mod fs;
 pub use fs::{DirEntry, Fs, FsMetadata, InMemoryFs, RealFs};
 
+// M8 — persistent id-keyed maps behind the snapshot's O(1) clone.
+pub mod id_map;
+pub use id_map::{IdMap, IdSet};
+
 // TODO: Phase 1–2 — EntryStore (sum-tree, id allocator, path index)
 pub mod store;
 pub use store::EntryStore;
@@ -35,16 +39,42 @@ pub use snapshot::{
 // and the resume-diff walker (events_since / ResumeEvent).
 pub mod resume;
 pub use resume::{
-    events_since, read_snapshot, write_snapshot, ResumeEvent, ResumeSnapshot, RootStat,
-    CURRENT_FORMAT_VERSION,
+    events_since, read_snapshot, write_snapshot, write_snapshot_from, write_snapshot_from_with,
+    Durability, ResumeEvent, ResumeSnapshot, RootStat, CURRENT_FORMAT_VERSION,
 };
 
-// TODO: Phase 2 — jwalk-based walker + coalescer
+// flux dogfood — restart without a rescan: replay a root's changes since a
+// saved point from the volume's journal (macOS FSEvents `sinceWhen`).
+pub mod history;
+pub use history::{
+    replay_since, HistoryChanges, HistoryEvent, HistoryFlags, HistoryToken, Replay, ReplayOptions,
+    ReplayReport, RescanReason,
+};
+
+// Phase 2 walker + coalescer; M10 bounds every read it makes.
 pub mod walker;
 pub use walker::{
     build_ignore_matcher_from_walk, populate_store, populate_store_with_provenance, walk,
-    walk_batched, walk_with_ignore, walk_with_ignore_batched, SymlinkPolicy, WalkOptions,
-    WalkedEntry,
+    walk_batched, walk_bounded, walk_bounded_batched, walk_with_ignore, walk_with_ignore_batched,
+    SymlinkPolicy, UnreadDirectory, WalkOptions, WalkReport, WalkedEntry,
+};
+
+// flux dogfood — streaming media-grade scan: `(dev, ino)`, birth time, ns
+// mtime per entry; getattrlistbulk on macOS, statx on Linux.
+pub mod scan;
+pub mod scan_list;
+pub use scan::{
+    walk_scan, CancelFlag, DirCtx, FileFilter, ListerCounts, ScanEntry, ScanLister, ScanOptions,
+    ScanReport, Visit,
+};
+pub use scan_list::{ScanListing, DEFAULT_IGNORE_PATTERNS};
+
+// M10 — time-bounded native reads: helper pool, stall deadline, stuck cap,
+// dataless policy.
+pub mod read_boundary;
+pub use read_boundary::{
+    IgnoreFile, PathStat, ReadBoundary, ReadBoundaryOptions, ReadFailure, ReadHook, ReadKind,
+    ReadProgress,
 };
 
 // TODO: Phase 2 — ripgrep `ignore` crate wrapper
@@ -54,7 +84,8 @@ pub use crate::ignore::{IgnoreMatcher, IGNORE_FILE_NAMES};
 // Phase 3 — notify + debouncer + rename pairing + volatile throttling
 pub mod watcher;
 pub use watcher::{
-    coalesce_events, FsChangeEvent, RawEvent, RenamePairer, Watcher, WatcherOptions,
+    coalesce_events, coalesce_events_with, CoalesceOptions, CreateThenDelete, FsChangeEvent,
+    RawEvent, RenamePairer, Watcher, WatcherOptions,
 };
 
 // Phase 3.7 — volatile-subtree detection and throttling

@@ -164,3 +164,28 @@ test('search: caseSensitive option respects case', async () => {
     removeTempDir(dir);
   }
 });
+
+test('search: kinds filters by entry kind across the native boundary', async () => {
+  const dir = tempRoot();
+  try {
+    const fx = await seed(dir);
+    const dirs = fx.search('sub', { kinds: [1] });
+    assert.ok(dirs.length >= 1);
+    assert.ok(
+      dirs.every((h) => h.entry.kind === 1),
+      `only directories: ${JSON.stringify(dirs.map((h) => h.entry.name))}`,
+    );
+    assert.ok(dirs.some((h) => h.entry.name === 'sub'));
+
+    const files = fx.search('rs', { kinds: [0] });
+    assert.ok(files.length >= 3);
+    assert.ok(files.every((h) => h.entry.kind === 0));
+
+    // An empty list admits nothing; an unknown kind matches nothing.
+    assert.equal(fx.search('rs', { kinds: [] }).length, 0);
+    assert.equal(fx.search('rs', { kinds: [99] }).length, 0);
+    await fx.dispose();
+  } finally {
+    removeTempDir(dir);
+  }
+});

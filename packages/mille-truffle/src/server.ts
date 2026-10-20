@@ -91,6 +91,35 @@ interface LiveSession {
   disposed: boolean;
 }
 
+/**
+ * The channel a host is attached to: the same transport, but only explorer
+ * frames reach its listeners.
+ *
+ * Service frames — a heartbeat ping or pong, a late open — belong to this
+ * server, which already answers them on the raw channel. Handed to the host
+ * as well, each one is answered as a malformed explorer frame: an EINVAL
+ * `error` that the client applies to every request it has in flight.
+ */
+function explorerFramesOnly(channel: ExplorerHostChannel): ExplorerHostChannel {
+  return {
+    get state() {
+      return channel.state;
+    },
+    get bufferedBytes() {
+      return channel.bufferedBytes;
+    },
+    send: (message) => channel.send(message),
+    drain: () => channel.drain(),
+    onMessage: (listener) =>
+      channel.onMessage((message) => {
+        if (!isRemoteServiceMessage(message)) listener(message);
+      }),
+    onClose: (listener) => channel.onClose(listener),
+    close: (reason) => channel.close(reason),
+    dispose: () => channel.dispose(),
+  };
+}
+
 function log(
   logger: MilleRemoteLogger | undefined,
   level: 'info' | 'warn' | 'debug',
@@ -212,7 +241,7 @@ export async function serveMille(
 
     // The open handshake rides the same framed codec as everything else, so
     // one channel serves both phases. Service frames are filtered out before
-    // the explorer host ever sees them (§13.6).
+    // the explorer host ever sees them (§13.6) — see explorerFramesOnly.
     const channelOptions: FramedStreamChannelOptions = {};
     const channel = createFramedStreamHostChannel(socket, channelOptions);
 
@@ -343,7 +372,7 @@ export async function serveMille(
       // Authorized — only now does an engine come into existence.
       const entry = await acquireHost(ex);
       const sessionId = randomUUID();
-      const detach = entry.host.attachChannel(channel as ExplorerHostChannel, {
+      const detach = entry.host.attachChannel(explorerFramesOnly(channel), {
         kind: 'remote',
         clientId: parsed.client.instanceId,
         peerId: peerId ?? undefined,

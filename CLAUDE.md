@@ -104,10 +104,13 @@ node scripts/axe-check.mjs                       # real axe in the live playgrou
 - Temp-dir teardown goes through `scripts/test-temp.mjs`, which warns rather than throws (Windows
   delete-pending).
 
-CI (`.github/workflows/ci.yml`) gates a PR on four jobs: `test-rust`, `test-js`, `test-release-profile`
-(the release profile once carried `panic = "abort"`, which debug builds can never expose), and
-`test-windows`. The 8-triple `build` matrix compiles binaries but never loads them — that gap is why
-`test-windows` and `smoke-published.yml` exist.
+CI (`.github/workflows/ci.yml`) gates a PR on five jobs: `test-rust`, `test-js`, `test-release-profile`
+(the release profile once carried `panic = "abort"`, which debug builds can never expose), `test-git`
+(the `git` cargo feature on — clippy over the binding and the whole JS suite against a
+`build:napi:git:probe` binary, with `MILLE_EXPECT_GIT=1` so a binary without the engine fails instead
+of skipping; no other job compiles the binding's git half), and `test-windows`. The 8-triple `build`
+matrix compiles binaries but never loads them — that gap is why `test-windows` and
+`smoke-published.yml` exist.
 
 ## Conventions
 

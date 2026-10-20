@@ -40,12 +40,17 @@ import {
   validateFrameVersion,
   type ClientToHostMessage,
   type DecorationOnWire,
+  type SearchCallResult,
 } from './protocol.js';
 import { createMessagePortClientChannel, isExplorerChannel } from './channel/message-port.js';
-import type { ExplorerChannelCloseEvent, ExplorerClientChannel } from './channel/types.js';
+import type {
+  ExplorerChannelCloseCode,
+  ExplorerChannelCloseEvent,
+  ExplorerClientChannel,
+} from './channel/types.js';
 import type { Disposable, MessagePortLike } from './types.js';
 import type { ExplorerProjectionSettings } from './explorer-settings.js';
-import type { ResyncOptions, TransferOptions, Uri } from './client.js';
+import type { ResyncOptions, SearchHit, SearchOptions, TransferOptions, Uri } from './client.js';
 import type { UndoDescriptor, UndoResult } from './undo.js';
 import { normalizeUndoDescriptor, normalizeUndoResult } from './undo.js';
 
@@ -69,6 +74,26 @@ type ChangeListener = () => void;
 export interface ExplorerConnectionEvent {
   readonly state: 'online' | 'closed';
   readonly reason?: ExplorerChannelCloseEvent;
+}
+
+/** One search hit over a port: the engine's hit plus where it lives. */
+export interface PortSearchHit extends SearchHit {
+  /** Names from the hit's root down to the hit itself, e.g. `['repo', 'src', 'a.ts']`. */
+  readonly path: readonly string[];
+}
+
+/**
+ * A page of search hits. It is an array — what `FileTree`'s search mode
+ * consumes — that also says whether the host had more hits than it sent.
+ */
+export type PortSearchResults = readonly PortSearchHit[] & {
+  readonly clipped: boolean;
+  readonly treeVersion: number;
+};
+
+/** `SearchOptions` plus the abort signal mille-ui passes. */
+export interface PortSearchOptions extends SearchOptions {
+  readonly signal?: AbortSignal;
 }
 
 /**
@@ -105,6 +130,9 @@ export class PortFileExplorer {
   private handshakeResolve!: () => void;
   private handshakeReject!: (reason: unknown) => void;
   private disposed = false;
+  private closeReported = false;
+  /** Set by a fatal error frame, so close listeners hear the upstream reason. */
+  private announcedClose: ExplorerChannelCloseEvent | undefined;
   /**
    * Phase A1 — decoration providers registered against this client.
    * Each entry retains a `knownIds` set so the client can push
@@ -155,8 +183,12 @@ export class PortFileExplorer {
    * callers hanging, and leave the last snapshot readable — a stale tree
    * is more useful to a UI than a blank one (SPEC §18.3).
    */
-  private handleChannelClose(reason: ExplorerChannelCloseEvent): void {
-    if (this.disposed) return;
+  private handleChannelClose(closeEvent: ExplorerChannelCloseEvent): void {
+    if (this.disposed || this.closeReported) return;
+    this.closeReported = true;
+    // A relay's fatal error frame names the upstream reason; prefer it over
+    // the LOCAL_CLOSE our own channel reports for the close it triggered.
+    const reason = this.announcedClose ?? closeEvent;
     const err = new FileSystemError('ECANCELED', `connection closed: ${reason.code}`);
     this.handshakeReject(err);
     // The handshake promise is often never awaited after ready() resolves;
@@ -238,6 +270,82 @@ export class PortFileExplorer {
     );
     this.publishSnapshot();
     return payload.id;
+  }
+
+  /**
+   * Filename search on the host's engine, bounded and policy-gated there.
+   *
+   * At most `limit` hits (default 100; the host clamps to 1000) in score
+   * order; `clipped` says the engine had more. Each hit's ancestors arrive
+   * with it, so the mirror can reveal a hit and `path` names it. A session
+   * whose grant lacks `allowSearch` is refused with `EACCES`. An aborted
+   * signal rejects with `ECANCELED`; the host's answer is then dropped.
+   */
+  async search(query: string, options?: PortSearchOptions): Promise<PortSearchResults> {
+    const signal = options?.signal;
+    if (signal?.aborted === true) {
+      throw new FileSystemError('ECANCELED', 'search aborted');
+    }
+    // Only the engine's fields cross the wire. mille-ui passes an
+    // AbortSignal here, which neither a codec nor structured clone carries.
+    const wire: {
+      limit?: number;
+      includeIgnored?: boolean;
+      caseSensitive?: boolean;
+      kinds?: number[];
+    } = {};
+    if (options?.limit !== undefined) wire.limit = options.limit;
+    if (options?.includeIgnored !== undefined) wire.includeIgnored = options.includeIgnored;
+    if (options?.caseSensitive !== undefined) wire.caseSensitive = options.caseSensitive;
+    if (options?.kinds !== undefined) wire.kinds = [...options.kinds];
+
+    const pending = this.call('search', [query, wire]);
+    const raw = signal === undefined ? await pending : await raceAbort(pending, signal);
+    const result = raw as Partial<SearchCallResult> | null;
+    if (
+      result === null ||
+      typeof result !== 'object' ||
+      typeof result.version !== 'number' ||
+      !Array.isArray(result.hits) ||
+      !Array.isArray(result.entries)
+    ) {
+      throw new FileSystemError('EUNSUPPORTED', 'host does not answer search over this channel');
+    }
+
+    const byId = new Map<number, ClientEntry>();
+    for (const entry of result.entries) byId.set(entry.id, entry);
+    this.working = hydrateLookupEntries(
+      this.working,
+      result.entries,
+      result.version,
+      this.mirrorCap,
+    );
+    this.publishSnapshot();
+
+    const hits: PortSearchHit[] = [];
+    for (const hit of result.hits) {
+      const entry = byId.get(hit.id);
+      if (entry === undefined) continue;
+      const path: string[] = [];
+      let cursor: ClientEntry | undefined = entry;
+      let guard = 0;
+      while (cursor !== undefined && guard < 10_000) {
+        path.push(cursor.name);
+        cursor = cursor.parentId === null ? undefined : byId.get(cursor.parentId);
+        guard += 1;
+      }
+      path.reverse();
+      hits.push({
+        entry: clientEntryToEntry(entry),
+        score: hit.score,
+        matchedIndices: hit.matchedIndices,
+        path,
+      });
+    }
+    return Object.assign(hits, {
+      clipped: result.clipped === true,
+      treeVersion: result.version,
+    }) as PortSearchResults;
   }
 
   /**
@@ -782,7 +890,14 @@ export class PortFileExplorer {
         );
         return;
       case 'error':
-        this.handleError(f.body as { code: string; message: string });
+        this.handleError(
+          f.body as {
+            code: string;
+            message: string;
+            fatal?: unknown;
+            closeCode?: unknown;
+          },
+        );
         return;
       case 'warning': {
         const body = f.body as { code?: string; detail?: string };
@@ -974,7 +1089,23 @@ export class PortFileExplorer {
     }
   }
 
-  private handleError(body: { code: string; message: string }): void {
+  private handleError(body: {
+    code: string;
+    message: string;
+    fatal?: unknown;
+    closeCode?: unknown;
+  }): void {
+    if (body.fatal === true) {
+      // The session is over upstream (a relay's WebSocket closed). Close
+      // this side as well, so pending work rejects now and later calls fail
+      // at send() instead of posting into a port nobody reads.
+      this.announcedClose = {
+        code: isCloseCode(body.closeCode) ? body.closeCode : 'REMOTE_CLOSE',
+        reason: body.message,
+      };
+      this.channel.close(body.message);
+      return;
+    }
     const err = new FileSystemError(body.code as ErrorCode, body.message);
     // Session-level failure. If we haven't handshaken yet, fail ready().
     // Either way, reject every pending request so callers bubble out
@@ -1022,6 +1153,37 @@ export async function connectFileExplorerChannel(
   const fx = new PortFileExplorer(channel, options);
   await fx.ready();
   return fx;
+}
+
+const CLOSE_CODES: ReadonlySet<string> = new Set<ExplorerChannelCloseCode>([
+  'LOCAL_CLOSE',
+  'REMOTE_CLOSE',
+  'TRANSPORT_ERROR',
+  'PROTOCOL_ERROR',
+  'BACKPRESSURE',
+  'AUTH_REJECTED',
+]);
+
+function isCloseCode(value: unknown): value is ExplorerChannelCloseCode {
+  return typeof value === 'string' && CLOSE_CODES.has(value);
+}
+
+/** Settle with `promise`, or reject with ECANCELED once `signal` aborts. */
+function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(new FileSystemError('ECANCELED', 'search aborted'));
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      },
+    );
+  });
 }
 
 // ─── Phase A1 helpers ──────────────────────────────────────────────────

@@ -1,33 +1,45 @@
-// Sequential jwalk-based walker (Phase 2.3).
+// Bounded walker (Phase 2.3; petition M10).
 //
 // Produces lightweight `WalkedEntry` records; the coalescer (2.4) converts
 // these into `Entry` with allocated IDs and pushes them into `EntryStore`.
-// No ignore parsing here (2.5), no parallelism (2.4), no rename/compact (2.6).
 //
-// v0.2 B3: when an `IgnoreMatcher` is supplied to `walk_with_ignore`, ignore
-// rules are applied inside jwalk's `process_read_dir` callback — i.e. BEFORE
-// jwalk would resolve a symlinked directory and descend its target. This
-// matters for pnpm monorepos: a root `.gitignore` listing `node_modules/`
-// now stops the walker at the `node_modules` symlink entry itself, rather
-// than letting jwalk follow the link into pnpm's 38k-file store.
+// M10: every directory listing and every `stat` the walk makes goes through a
+// `ReadBoundary` (read_boundary.rs), so a read that blocks in the kernel — an
+// iCloud-evicted folder downloading, a hung network mount — costs the walk one
+// deadline instead of holding the engine. That is why the walk owns its loop
+// rather than delegating it to jwalk: jwalk's `fs::read_dir` is the one call
+// that needed bounding, and nothing outside the crate can reach it. The loop
+// keeps jwalk's observable shape — depth-first, children byte-sorted, the same
+// depth, hidden, symlink and ignore rules — and reads up to `parallelism`
+// directories ahead on the boundary's helper threads, so a parallel walk is
+// still parallel and its output is still deterministic.
+//
+// v0.2 B3: when an `IgnoreMatcher` is supplied, ignore rules are applied to a
+// directory's children BEFORE the walk would descend a symlinked directory.
+// This matters for pnpm monorepos: a root `.gitignore` listing `node_modules/`
+// stops the walker at the `node_modules` symlink entry itself, rather than
+// letting it follow the link into pnpm's 38k-file store.
 
+use std::fs::{FileType, Metadata};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use jwalk::{Parallelism, WalkDir};
-use parking_lot::Mutex;
-
 use crate::entry::EntryKind;
 use crate::error::{ErrorCode, FxError};
-use crate::ignore::{IgnoreMatcher, IGNORE_FILE_NAMES};
+use crate::ignore::IgnoreMatcher;
+use crate::read_boundary::{
+    DirListing, ListOptions, ListedChild, PathStat, ReadBoundary, ReadFailure, ReadOutcome,
+    ReadSignal, Ticket, WAIT_SLICE,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SymlinkPolicy {
     /// Never descend into symlinked directories.
     Never,
-    /// Always descend (risk of cycles — not recommended for real trees).
+    /// Always descend. Cycles are cut by comparing each followed link's
+    /// canonical target with the directories above it.
     Always,
     /// Phase 2.3: behaviorally equivalent to Never. PLAN 13.1 adds (dev,inode)
     /// dedup + ancestor-cycle detection to make this the correct default.
@@ -40,12 +52,13 @@ pub struct WalkOptions {
     /// Max tree depth (None = unlimited). Root is depth 0.
     pub max_depth: Option<usize>,
     pub follow_symlinks: SymlinkPolicy,
-    /// When false, entries whose name starts with `.` are skipped.
+    /// When false, entries whose name starts with `.` are not emitted. Their
+    /// contents are still walked, as they were under jwalk.
     pub include_hidden: bool,
     /// If true, the walk root is returned as the first result.
     pub include_root: bool,
-    /// Worker threads for parallel walk. 0 or 1 = sequential. SPEC §4.3
-    /// recommends capping at 8 to leave headroom for editor work.
+    /// Directories read ahead concurrently. 0 or 1 = one at a time. SPEC
+    /// §4.3 recommends capping at 8 to leave headroom for editor work.
     pub parallelism: usize,
 }
 
@@ -82,36 +95,92 @@ pub struct WalkedEntry {
     pub depth: u16,
 }
 
+/// A directory the walk meant to read and could not, because the read never
+/// answered: it stalled past the deadline, was refused while an earlier read
+/// into the same path is still stuck, or is a dataless placeholder the
+/// boundary will not download. Its own entry was emitted; its children are
+/// unknown, so a caller must neither mark its listing complete nor treat the
+/// children it already knows as deleted.
+#[derive(Clone, Debug)]
+pub struct UnreadDirectory {
+    pub path: PathBuf,
+    pub failure: ReadFailure,
+}
+
+/// The result of a bounded walk.
+#[must_use = "`unread` directories are unknown, not empty; check it or call `into_complete`"]
+#[derive(Debug, Default)]
+pub struct WalkReport {
+    /// Walked entries in walk order. Empty for the batched form, whose
+    /// entries went to `on_batch`.
+    pub entries: Vec<WalkedEntry>,
+    /// Directories whose read did not answer. Never the walk root: a root
+    /// that cannot be read fails the walk with the read's typed error.
+    pub unread: Vec<UnreadDirectory>,
+    /// Ignore files the walk read and emitted, with their text, in walk
+    /// order, so a caller classifies entries without opening them again.
+    /// Collected only when the walk was given an ignore matcher.
+    pub ignore_files: Vec<(PathBuf, String)>,
+}
+
+impl WalkReport {
+    /// The entries, if every directory answered; otherwise
+    /// [`FxError::Incomplete`] carrying `unread`. For callers that need the
+    /// whole tree or nothing.
+    pub fn into_complete(self) -> Result<Vec<WalkedEntry>, FxError> {
+        if self.unread.is_empty() {
+            Ok(self.entries)
+        } else {
+            Err(FxError::Incomplete {
+                unread: self.unread,
+            })
+        }
+    }
+}
+
+/// Walk `root` through the process-wide default [`ReadBoundary`].
+///
+/// All or nothing: if any directory below the root does not answer (stall,
+/// dataless placeholder, OS error), this fails with [`FxError::Incomplete`]
+/// rather than returning a tree with that subtree silently missing — a caller
+/// diffing the result against an earlier walk would otherwise read "drive
+/// asleep" as "everything below it deleted". Use [`walk_bounded`] to keep the
+/// partial result and act on `unread` directly.
 pub fn walk(root: &Path, options: WalkOptions) -> Result<Vec<WalkedEntry>, FxError> {
-    walk_inner(root, options, None)
+    walk_bounded(root, options, None, ReadBoundary::shared_default())?.into_complete()
 }
 
 /// Walk with gitignore rules applied BEFORE symlink resolution.
 ///
-/// When `ignore` is `Some`, each child DirEntry's logical path (parent +
-/// file_name) is checked against the matcher inside jwalk's
-/// `process_read_dir` callback. Ignored directories get
-/// `read_children_path = None` so jwalk never recurses into them — critical
-/// for pnpm-style layouts where `node_modules/` is a symlink into a central
-/// store and letting jwalk canonicalize first would pull in 10k+ unrelated
-/// files.
+/// When `ignore` is `Some`, each child's logical path (parent + file name)
+/// is checked against the matcher as soon as its directory is listed.
+/// Ignored directories are emitted but never read — critical for pnpm-style
+/// layouts where `node_modules/` is a symlink into a central store and
+/// following it first would pull in 10k+ unrelated files.
 ///
-/// The matcher is stacked dynamically during the walk: when a child
-/// `.gitignore` / `.ignore` / `.rgignore` is encountered, its rules are
-/// added to the stack so nested ignore files work the same as the root
-/// one. The caller's matcher is cloned into a shared `Arc<Mutex<_>>` so
-/// the rayon worker threads can mutate it cooperatively.
+/// The rules stack dynamically: when a child `.gitignore` / `.ignore` /
+/// `.rgignore` is listed, its rules apply to its siblings and everything
+/// below them, so nested ignore files work the same as the root one. The
+/// caller's matcher is consulted first and is never modified.
+///
+/// Fails with [`FxError::Incomplete`] when a directory does not answer, as
+/// [`walk`] does.
 pub fn walk_with_ignore(
     root: &Path,
     options: WalkOptions,
     ignore: &IgnoreMatcher,
 ) -> Result<Vec<WalkedEntry>, FxError> {
-    walk_inner(root, options, Some(ignore))
+    walk_bounded(root, options, Some(ignore), ReadBoundary::shared_default())?.into_complete()
 }
 
 /// Stream a walk in bounded batches. The walker keeps its deterministic
 /// per-directory ordering, but callers can publish each completed batch
 /// instead of waiting for the entire subtree to materialize.
+///
+/// Every batch is delivered; then, if a directory did not answer, the walk
+/// fails with [`FxError::Incomplete`], so the caller knows the batches it
+/// published are not the whole tree. [`walk_bounded_batched`] reports the
+/// same directories without failing.
 pub fn walk_batched<C, F>(
     root: &Path,
     options: WalkOptions,
@@ -123,10 +192,21 @@ where
     C: FnMut() -> bool,
     F: FnMut(Vec<WalkedEntry>) -> Result<(), FxError>,
 {
-    walk_inner_batched(root, options, None, batch_size, cancelled, on_batch)
+    walk_bounded_batched(
+        root,
+        options,
+        None,
+        ReadBoundary::shared_default(),
+        batch_size,
+        cancelled,
+        on_batch,
+    )?
+    .into_complete()
+    .map(|_| ())
 }
 
-/// Ignore-aware companion to [`walk_batched`].
+/// Ignore-aware companion to [`walk_batched`]; fails with
+/// [`FxError::Incomplete`] the same way.
 pub fn walk_with_ignore_batched<C, F>(
     root: &Path,
     options: WalkOptions,
@@ -139,252 +219,602 @@ where
     C: FnMut() -> bool,
     F: FnMut(Vec<WalkedEntry>) -> Result<(), FxError>,
 {
-    walk_inner_batched(root, options, Some(ignore), batch_size, cancelled, on_batch)
+    walk_bounded_batched(
+        root,
+        options,
+        Some(ignore),
+        ReadBoundary::shared_default(),
+        batch_size,
+        cancelled,
+        on_batch,
+    )?
+    .into_complete()
+    .map(|_| ())
 }
 
-fn walk_inner(
+/// Walk through `reads`, reporting what could not be read.
+///
+/// The plain `walk*` functions use the process-wide default boundary and
+/// drop the report. An engine with its own deadline, stuck cap and dataless
+/// policy calls this form: a stalled subdirectory then arrives in
+/// `unread` while the rest of the tree walks normally, and a stalled root
+/// fails the walk with `ETIMEDOUT` / `EDATALESS` for that root.
+pub fn walk_bounded(
     root: &Path,
     options: WalkOptions,
     ignore: Option<&IgnoreMatcher>,
-) -> Result<Vec<WalkedEntry>, FxError> {
-    let mut out = Vec::new();
-    walk_inner_visit(root, options, ignore, |entry| {
-        out.push(entry);
+    reads: &ReadBoundary,
+) -> Result<WalkReport, FxError> {
+    let mut entries = Vec::new();
+    let mut report = walk_core(root, &options, ignore, reads, &mut || false, &mut |entry| {
+        entries.push(entry);
         Ok(())
     })?;
-    Ok(out)
+    report.entries = entries;
+    Ok(report)
 }
 
-fn walk_inner_batched<C, F>(
+/// Batched form of [`walk_bounded`]. `cancelled` is also honoured while the
+/// walk waits on a read.
+pub fn walk_bounded_batched<C, F>(
     root: &Path,
     options: WalkOptions,
     ignore: Option<&IgnoreMatcher>,
+    reads: &ReadBoundary,
     batch_size: usize,
     mut cancelled: C,
     mut on_batch: F,
-) -> Result<(), FxError>
+) -> Result<WalkReport, FxError>
 where
     C: FnMut() -> bool,
     F: FnMut(Vec<WalkedEntry>) -> Result<(), FxError>,
 {
     let batch_size = batch_size.max(1);
     let mut batch = Vec::with_capacity(batch_size.min(4096));
-    walk_inner_visit(root, options, ignore, |entry| {
-        if cancelled() {
-            return Err(FxError::Cancelled);
-        }
-        batch.push(entry);
-        if batch.len() >= batch_size {
-            on_batch(std::mem::take(&mut batch))?;
-            // Be cooperative with the host/runtime thread consuming the
-            // immutable snapshots and change notices produced by the batch.
-            std::thread::yield_now();
-        }
-        Ok(())
-    })?;
+    let report = walk_core(
+        root,
+        &options,
+        ignore,
+        reads,
+        &mut cancelled,
+        &mut |entry| {
+            batch.push(entry);
+            if batch.len() >= batch_size {
+                on_batch(std::mem::take(&mut batch))?;
+                // Be cooperative with the host/runtime thread consuming the
+                // immutable snapshots and change notices produced by the batch.
+                std::thread::yield_now();
+            }
+            Ok(())
+        },
+    )?;
     if cancelled() {
         return Err(FxError::Cancelled);
     }
     if !batch.is_empty() {
         on_batch(batch)?;
     }
-    Ok(())
+    Ok(report)
 }
 
-fn walk_inner_visit<F>(
+/// Most listed-but-not-yet-emitted directories a walk holds before it stops
+/// reading ahead. Bounds memory when the consumer is slower than the disk.
+const LISTED_AHEAD_MAX: usize = 1024;
+
+/// A directory the walk will read. Lives in `Walk::dirs` from the moment its
+/// parent is listed until its subtree has been emitted.
+struct Dir {
+    path: PathBuf,
+    depth: usize,
+    /// Canonical path, kept only when following symlinks (cycle checks).
+    canonical: Option<PathBuf>,
+    parent: Option<usize>,
+    dataless: bool,
+    state: DirState,
+}
+
+enum DirState {
+    /// Not yet submitted (read-ahead is full).
+    Waiting,
+    Reading(Ticket),
+    /// Listed and planned; `next` is the next child to emit.
+    Listed {
+        children: Vec<Child>,
+        next: usize,
+    },
+    /// The read did not answer; reported in `WalkReport::unread`.
+    Unread(ReadFailure),
+    /// The read failed with an OS error: emitted without children.
+    Empty,
+}
+
+struct Child {
+    entry: Option<WalkedEntry>,
+    /// Text of an emitted ignore file, reported in `WalkReport::ignore_files`.
+    ignore: Option<String>,
+    dir: Option<usize>,
+}
+
+struct Walk<'a> {
+    options: &'a WalkOptions,
+    follow: bool,
+    list: ListOptions,
+    ignore: Option<&'a IgnoreMatcher>,
+    /// Ignore files found during this walk. Consulted after the caller's
+    /// rules — the order one stack would have held them in. A directory is
+    /// always planned after its ancestors, so the rules that apply to any
+    /// path sit in the same order however the reads interleave.
+    nested: IgnoreMatcher,
+    reads: &'a ReadBoundary,
+    signal: Arc<ReadSignal>,
+    /// Slots are never reused, so a stale id in `waiting` cannot alias a
+    /// newer directory; a finished slot shrinks to `None`.
+    dirs: Vec<Option<Box<Dir>>>,
+    /// Directories to read next, nearest-in-walk-order on top.
+    waiting: Vec<usize>,
+    reading: Vec<usize>,
+    read_ahead: usize,
+    listed_ahead: usize,
+}
+
+fn walk_core(
     root: &Path,
-    options: WalkOptions,
+    options: &WalkOptions,
     ignore: Option<&IgnoreMatcher>,
-    mut visit: F,
-) -> Result<(), FxError>
-where
-    F: FnMut(WalkedEntry) -> Result<(), FxError>,
-{
-    if !root.exists() {
-        return Err(FxError::Io {
-            code: ErrorCode::ENOENT,
-            path: root.to_path_buf(),
-            source: io::Error::from(io::ErrorKind::NotFound),
-        });
-    }
-
+    reads: &ReadBoundary,
+    cancelled: &mut dyn FnMut() -> bool,
+    visit: &mut dyn FnMut(WalkedEntry) -> Result<(), FxError>,
+) -> Result<WalkReport, FxError> {
     let follow = matches!(options.follow_symlinks, SymlinkPolicy::Always);
-    let parallelism = match options.parallelism {
-        0 | 1 => Parallelism::Serial,
-        n => Parallelism::RayonNewPool(n),
-    };
-    let mut builder = WalkDir::new(root)
-        .parallelism(parallelism)
-        .follow_links(follow)
-        .skip_hidden(false) // we handle hidden filtering ourselves per `include_hidden`
-        .sort(true);
-    if let Some(d) = options.max_depth {
-        builder = builder.max_depth(d);
+    let mut report = WalkReport::default();
+
+    let output = reads.stat(root, follow).map_err(|failure| match failure {
+        // `Path::exists`, which this replaced, called every OS failure
+        // "missing". Unanswered reads keep their own typed error.
+        ReadFailure::Io(_) => missing_root(root),
+        other => other.into_fx(root),
+    })?;
+    let stat = output
+        .as_stat()
+        .ok_or_else(|| FxError::InternalBug("bounded stat returned no metadata".into()))?;
+    if stat.metadata.file_type().is_symlink() && stat.target.is_none() {
+        return Err(missing_root(root));
     }
 
-    // Shared matcher state for the jwalk closure. Cloning an IgnoreMatcher
-    // isn't supported (Gitignore doesn't impl Clone), so we hand the Arc
-    // the caller's matcher by rebuilding from its underlying ignore files.
-    // We also track discovered ignore files during the walk so a nested
-    // `.gitignore` takes effect before its sibling directories are
-    // descended.
-    // Seed the live matcher with the caller's pre-loaded rules so the
-    // process_read_dir closure sees them.
-    let matcher_arc: Option<Arc<Mutex<IgnoreMatcher>>> =
-        ignore.map(|existing| Arc::new(Mutex::new(existing.clone_rules())));
+    if options.include_root {
+        if let Some(entry) = root_entry(root, stat, follow) {
+            if cancelled() {
+                return Err(FxError::Cancelled);
+            }
+            visit(entry)?;
+        }
+    }
+    let lists_root = options.max_depth.is_none_or(|limit| limit >= 1);
+    if !lists_root || !stat.is_dir_like() {
+        return Ok(report);
+    }
 
-    if let Some(matcher_arc) = matcher_arc.clone() {
-        // The callback fires once per directory with the directory's full
-        // child list. B3 wants us to emit the ignored entry itself (e.g.
-        // `node_modules` the symlink) but block *further* descent into
-        // it when discovered as a child — clear `read_children_path`.
-        //
-        // jwalk's first process_read_dir call is special: `children` is
-        // a 1-element list containing the *walk root*, and
-        // `parent_path` is the root's parent. If the walk root is itself
-        // gitignored (user expanded `node_modules` / `out`), clearing
-        // read_children_path on that entry would prevent listing any
-        // children — the expand UI would show an empty folder. Never
-        // block descent for the walk root itself.
-        let walk_root = root.to_path_buf();
-        builder = builder.process_read_dir(move |_depth, parent_path, _rds, children| {
-            // First pass: scan for newly-appeared ignore files in this
-            // directory so nested rules apply to their siblings.
-            for dent in children.iter().flatten() {
-                let name = match dent.file_name.to_str() {
-                    Some(s) => s,
-                    None => continue,
-                };
-                if !dent.file_type.is_file() {
+    let mut walk = Walk {
+        options,
+        follow,
+        list: ListOptions {
+            follow_symlinks: follow,
+            ignore_contents: ignore.is_some(),
+        },
+        ignore,
+        nested: IgnoreMatcher::new(),
+        reads,
+        signal: ReadSignal::new(),
+        dirs: Vec::new(),
+        waiting: Vec::new(),
+        reading: Vec::new(),
+        read_ahead: options.parallelism.max(1),
+        listed_ahead: 0,
+    };
+    let root_dir = walk.add_dir(Dir {
+        path: root.to_path_buf(),
+        depth: 0,
+        canonical: if follow { stat.canonical.clone() } else { None },
+        parent: None,
+        dataless: stat.is_dataless(),
+        state: DirState::Waiting,
+    });
+    walk.await_dir(root_dir, cancelled)?;
+    match walk.take_unlisted(root_dir) {
+        None => walk.listed_ahead -= 1,
+        // A root that lists with an OS error walks as an empty directory, as
+        // it did under jwalk. Only a read that never answered fails the walk.
+        Some(None) => return Ok(report),
+        Some(Some(failure)) => return Err(failure.into_fx(root)),
+    }
+
+    let mut stack = vec![root_dir];
+    while let Some(&top) = stack.last() {
+        walk.pump(cancelled)?;
+        let Some(child) = walk.next_child(top) else {
+            stack.pop();
+            walk.dirs[top] = None;
+            continue;
+        };
+        if let Some(entry) = child.entry {
+            if cancelled() {
+                return Err(FxError::Cancelled);
+            }
+            if let Some(contents) = child.ignore {
+                report.ignore_files.push((entry.path.clone(), contents));
+            }
+            visit(entry)?;
+        }
+        let Some(dir) = child.dir else {
+            continue;
+        };
+        walk.await_dir(dir, cancelled)?;
+        match walk.take_unlisted(dir) {
+            None => {
+                walk.listed_ahead -= 1;
+                stack.push(dir);
+            }
+            // Unreadable (EACCES and friends): emitted, no children — the
+            // jwalk behaviour every caller already handles.
+            Some(None) => {}
+            Some(Some(failure)) => report.unread.push(UnreadDirectory {
+                path: walk.dirs[dir]
+                    .take()
+                    .map(|dir| dir.path)
+                    .unwrap_or_default(),
+                failure,
+            }),
+        }
+    }
+    Ok(report)
+}
+
+impl Walk<'_> {
+    fn add_dir(&mut self, dir: Dir) -> usize {
+        self.dirs.push(Some(Box::new(dir)));
+        self.dirs.len() - 1
+    }
+
+    fn dir(&self, id: usize) -> &Dir {
+        self.dirs[id]
+            .as_deref()
+            .expect("walk directory slot is live")
+    }
+
+    fn dir_mut(&mut self, id: usize) -> &mut Dir {
+        self.dirs[id]
+            .as_deref_mut()
+            .expect("walk directory slot is live")
+    }
+
+    /// For a resolved directory: `None` when it is listed, `Some(None)` when
+    /// it read as empty (OS error, slot released), `Some(Some(failure))`
+    /// when the read never answered (slot kept for its path).
+    fn take_unlisted(&mut self, id: usize) -> Option<Option<ReadFailure>> {
+        match &self.dir(id).state {
+            DirState::Listed { .. } => None,
+            DirState::Unread(failure) => Some(Some(failure.clone())),
+            _ => {
+                self.dirs[id] = None;
+                Some(None)
+            }
+        }
+    }
+
+    fn next_child(&mut self, id: usize) -> Option<Child> {
+        let DirState::Listed { children, next } = &mut self.dir_mut(id).state else {
+            return None;
+        };
+        let child = children.get_mut(*next)?;
+        *next += 1;
+        Some(Child {
+            entry: child.entry.take(),
+            ignore: child.ignore.take(),
+            dir: child.dir.take(),
+        })
+    }
+
+    fn submit(&mut self, id: usize) {
+        let dir = self.dir(id);
+        let ticket = self
+            .reads
+            .list_dir(&dir.path, self.list, dir.dataless, Some(&self.signal));
+        self.dir_mut(id).state = DirState::Reading(ticket);
+        self.reading.push(id);
+    }
+
+    /// Plan every read that has finished, then refill read-ahead.
+    fn pump(&mut self, cancelled: &mut dyn FnMut() -> bool) -> Result<(), FxError> {
+        let mut index = 0;
+        while index < self.reading.len() {
+            let id = self.reading[index];
+            let DirState::Reading(ticket) = &self.dir(id).state else {
+                self.reading.swap_remove(index);
+                continue;
+            };
+            match ticket.poll() {
+                Some(outcome) => {
+                    self.reading.swap_remove(index);
+                    self.resolve(id, outcome)?;
+                }
+                None => index += 1,
+            }
+        }
+        while self.reading.len() < self.read_ahead && self.listed_ahead < LISTED_AHEAD_MAX {
+            let Some(id) = self.waiting.pop() else {
+                break;
+            };
+            if self.dirs[id]
+                .as_deref()
+                .is_some_and(|dir| matches!(dir.state, DirState::Waiting))
+            {
+                if cancelled() {
+                    return Err(FxError::Cancelled);
+                }
+                self.submit(id);
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve(&mut self, id: usize, outcome: ReadOutcome) -> Result<(), FxError> {
+        self.dir_mut(id).state = match outcome {
+            Ok(output) => {
+                let listing = output.as_listing().ok_or_else(|| {
+                    FxError::InternalBug("bounded listing returned no children".into())
+                })?;
+                let children = self.plan(id, listing);
+                self.listed_ahead += 1;
+                DirState::Listed { children, next: 0 }
+            }
+            Err(ReadFailure::Io(_)) => DirState::Empty,
+            Err(ReadFailure::Cancelled) => return Err(FxError::Cancelled),
+            Err(failure) => DirState::Unread(failure),
+        };
+        Ok(())
+    }
+
+    /// Block until directory `id` is listed or has failed, planning anything
+    /// else that lands meanwhile.
+    fn await_dir(&mut self, id: usize, cancelled: &mut dyn FnMut() -> bool) -> Result<(), FxError> {
+        loop {
+            let seen = self.signal.seen();
+            self.pump(cancelled)?;
+            let wait = match &self.dir(id).state {
+                DirState::Waiting => {
+                    // Needed now: read it even when read-ahead is full.
+                    self.submit(id);
                     continue;
                 }
-                if IGNORE_FILE_NAMES.contains(&name) {
-                    let ignore_file = parent_path.join(name);
-                    let _ = matcher_arc.lock().add_from_file(&ignore_file);
+                DirState::Reading(ticket) => ticket.until_deadline(),
+                _ => return Ok(()),
+            };
+            if cancelled() {
+                return Err(FxError::Cancelled);
+            }
+            self.signal.wait_past(seen, wait.min(WAIT_SLICE));
+        }
+    }
+
+    /// Plan one listed directory: emitted entries, and which children the
+    /// walk will read.
+    fn plan(&mut self, id: usize, listing: &DirListing) -> Vec<Child> {
+        let (dir_path, depth) = {
+            let dir = self.dir(id);
+            (dir.path.clone(), dir.depth)
+        };
+        // Ignore files first, so their rules govern their own siblings.
+        if self.ignore.is_some() {
+            for listed in &listing.children {
+                if let (true, Some(contents)) =
+                    (listed.effective_type.is_file(), &listed.ignore_contents)
+                {
+                    let _ = self
+                        .nested
+                        .add_from_contents(&dir_path.join(&listed.name), contents);
                 }
             }
+        }
 
-            // Second pass: for each child, decide whether jwalk should
-            // descend. This runs BEFORE jwalk resolves any symlinks, so
-            // `node_modules/` (a symlink) is checked on its logical path
-            // — it matches the `node_modules/` gitignore rule and we
-            // clear `read_children_path` to block descent into pnpm's
-            // store. The entry itself is still yielded, and the emit
-            // phase below will mark it `is_ignored` via the matcher.
-            let matcher = matcher_arc.lock();
-            for dent in children.iter_mut().flatten() {
-                let name = match dent.file_name.to_str() {
-                    Some(s) => s,
-                    None => continue,
+        let child_depth = depth + 1;
+        let reads_at_depth = self
+            .options
+            .max_depth
+            .is_none_or(|limit| child_depth < limit);
+        let mut children = Vec::with_capacity(listing.children.len());
+        let mut descents = Vec::new();
+        for listed in &listing.children {
+            // A followed link that does not resolve is dropped entirely, as
+            // jwalk dropped it.
+            if self.follow && listed.follow_failed {
+                continue;
+            }
+            let followed_dir =
+                self.follow && listed.file_type.is_symlink() && listed.effective_type.is_dir();
+            if followed_dir && self.is_cycle(id, listed.canonical.as_deref()) {
+                continue;
+            }
+            let path = dir_path.join(&listed.name);
+            let descend =
+                reads_at_depth && listed.effective_type.is_dir() && !self.is_pruned(&path, listed);
+            let entry = walked_entry(listed, &path, child_depth, self.options);
+            let ignore = entry.as_ref().and(listed.ignore_contents.as_ref()).cloned();
+            let dir = descend.then(|| {
+                let canonical = if !self.follow {
+                    None
+                } else if followed_dir {
+                    listed.canonical.clone()
+                } else {
+                    self.dir(id)
+                        .canonical
+                        .as_ref()
+                        .map(|parent| parent.join(&listed.name))
                 };
-                let logical = parent_path.join(name);
-                // For directory-like entries (real dirs or symlinks
-                // whose target may be a dir) we pass is_dir=true so
-                // `pattern/` rules match. jwalk gives us the
-                // symlink's own file_type (not the target), so treat
-                // symlinks as dir-like for matching purposes.
-                let is_dir_like = dent.file_type.is_dir() || dent.file_type.is_symlink();
-                if matcher.is_ignored(&logical, is_dir_like) {
-                    // Preserve expand-into-ignored-dir: the walk root
-                    // must keep its read_children_path so depth-1
-                    // listing works when the user opens node_modules.
-                    if logical != walk_root {
-                        dent.read_children_path = None;
-                    }
-                }
+                let child = self.add_dir(Dir {
+                    path,
+                    depth: child_depth,
+                    canonical,
+                    parent: Some(id),
+                    dataless: listed.is_dataless(),
+                    state: DirState::Waiting,
+                });
+                descents.push(child);
+                child
+            });
+            children.push(Child { entry, ignore, dir });
+        }
+        // First child on top: the order the depth-first emission needs them.
+        self.waiting.extend(descents.into_iter().rev());
+        children
+    }
+
+    /// A followed link whose canonical target is this directory or one above
+    /// it would walk forever.
+    fn is_cycle(&self, id: usize, target: Option<&Path>) -> bool {
+        let Some(target) = target else {
+            return false;
+        };
+        let mut current = Some(id);
+        while let Some(index) = current {
+            let dir = self.dir(index);
+            if dir.canonical.as_deref() == Some(target) {
+                return true;
             }
-        });
+            current = dir.parent;
+        }
+        false
     }
 
-    for result in builder {
-        let dent = match result {
-            Ok(d) => d,
-            // Permission-denied on a subtree: skip it and continue the walk.
-            Err(_) => continue,
+    /// Ignore rules stop descent. Symlinks count as directory-like so a
+    /// `pattern/` rule matches a pnpm `node_modules` link before it is read.
+    fn is_pruned(&self, path: &Path, listed: &ListedChild) -> bool {
+        let Some(ignore) = self.ignore else {
+            return false;
         };
-
-        let depth = dent.depth();
-        let is_walk_root = depth == 0;
-        if is_walk_root && !options.include_root {
-            continue;
-        }
-
-        let name = match dent.file_name().to_str() {
-            Some(s) => s.to_string(),
-            None => continue,
-        };
-
-        let is_hidden = name.starts_with('.') && !is_walk_root;
-        if is_hidden && !options.include_hidden {
-            continue;
-        }
-
-        // Prefer the DirEntry's non-following file_type when available so
-        // symlinks stay classified as Symlink (pnpm workspace links). Fall
-        // back to metadata() when the entry type is missing.
-        let path = dent.path();
-        let entry_ft = dent.file_type();
-        let is_symlink = entry_ft.is_symlink();
-
-        // Metadata: for symlinks use lstat-equivalent for size/mtime of the
-        // link itself; for target-is-dir check, follow once with metadata.
-        let meta = match dent.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let ft = meta.file_type();
-
-        let (kind, symlink_target_is_dir) = if is_symlink || ft.is_symlink() {
-            // Follow once to learn if this is a folder link (pnpm / npm).
-            let target_is_dir = std::fs::metadata(&path)
-                .map(|m| m.is_dir())
-                .unwrap_or(false);
-            (EntryKind::Symlink, Some(target_is_dir))
-        } else if ft.is_dir() || entry_ft.is_dir() {
-            (EntryKind::Directory, None)
-        } else if ft.is_file() || entry_ft.is_file() {
-            (EntryKind::File, None)
-        } else {
-            (EntryKind::Unknown, None)
-        };
-
-        let size = if matches!(kind, EntryKind::File) {
-            meta.len()
-        } else {
-            0
-        };
-        let mtime_ms = meta.modified().ok().and_then(system_time_ms).unwrap_or(0);
-        let ctime_ms = ctime_ms_from_metadata(&meta).unwrap_or(mtime_ms);
-        let is_readonly = meta.permissions().readonly();
-
-        let parent_path = if is_walk_root {
-            None
-        } else {
-            path.parent().map(|p| p.to_path_buf())
-        };
-
-        visit(WalkedEntry {
-            path,
-            parent_path,
-            name,
-            kind,
-            size,
-            mtime_ms,
-            ctime_ms,
-            is_symlink: is_symlink || ft.is_symlink(),
-            symlink_target_is_dir,
-            is_readonly,
-            is_hidden,
-            depth: depth as u16,
-        })?;
+        let dir_like = listed.effective_type.is_dir() || listed.effective_type.is_symlink();
+        ignore
+            .decision(path, dir_like)
+            .or_else(|| self.nested.decision(path, dir_like))
+            .unwrap_or(false)
     }
+}
 
-    Ok(())
+fn missing_root(root: &Path) -> FxError {
+    FxError::Io {
+        code: ErrorCode::ENOENT,
+        path: root.to_path_buf(),
+        source: io::Error::from(io::ErrorKind::NotFound),
+    }
+}
+
+fn root_entry(root: &Path, stat: &PathStat, follow: bool) -> Option<WalkedEntry> {
+    let name_os = root.file_name().unwrap_or(root.as_os_str());
+    let name = name_os.to_str()?.to_string();
+    let path = root
+        .parent()
+        .map(|parent| parent.join(name_os))
+        .unwrap_or_else(|| root.to_path_buf());
+    let (entry_type, metadata) = if follow && stat.metadata.file_type().is_symlink() {
+        let target = stat.target.as_ref()?;
+        (target.file_type(), target)
+    } else {
+        (stat.metadata.file_type(), &stat.metadata)
+    };
+    let target_is_dir = stat.target.as_ref().map(Metadata::is_dir);
+    Some(entry_from_metadata(
+        path,
+        None,
+        name,
+        entry_type,
+        metadata,
+        target_is_dir,
+        false,
+        0,
+    ))
+}
+
+fn walked_entry(
+    listed: &ListedChild,
+    path: &Path,
+    depth: usize,
+    options: &WalkOptions,
+) -> Option<WalkedEntry> {
+    let name = listed.name.to_str()?.to_string();
+    let is_hidden = name.starts_with('.');
+    if is_hidden && !options.include_hidden {
+        return None;
+    }
+    let metadata = listed.metadata.as_ref()?;
+    Some(entry_from_metadata(
+        path.to_path_buf(),
+        path.parent().map(Path::to_path_buf),
+        name,
+        listed.effective_type,
+        metadata,
+        listed.target_is_dir,
+        is_hidden,
+        depth,
+    ))
+}
+
+// One record per field of `WalkedEntry`; a struct for the arguments would only
+// rename them.
+#[allow(clippy::too_many_arguments)]
+fn entry_from_metadata(
+    path: PathBuf,
+    parent_path: Option<PathBuf>,
+    name: String,
+    entry_type: FileType,
+    metadata: &Metadata,
+    target_is_dir: Option<bool>,
+    is_hidden: bool,
+    depth: usize,
+) -> WalkedEntry {
+    // Prefer the listing's non-following type so symlinks stay classified as
+    // Symlink (pnpm workspace links); the metadata type backs it up.
+    let ft = metadata.file_type();
+    let is_symlink = entry_type.is_symlink() || ft.is_symlink();
+    let (kind, symlink_target_is_dir) = if is_symlink {
+        (EntryKind::Symlink, Some(target_is_dir.unwrap_or(false)))
+    } else if ft.is_dir() || entry_type.is_dir() {
+        (EntryKind::Directory, None)
+    } else if ft.is_file() || entry_type.is_file() {
+        (EntryKind::File, None)
+    } else {
+        (EntryKind::Unknown, None)
+    };
+
+    let size = if matches!(kind, EntryKind::File) {
+        metadata.len()
+    } else {
+        0
+    };
+    let mtime_ms = metadata
+        .modified()
+        .ok()
+        .and_then(system_time_ms)
+        .unwrap_or(0);
+    let ctime_ms = ctime_ms_from_metadata(metadata).unwrap_or(mtime_ms);
+
+    WalkedEntry {
+        path,
+        parent_path,
+        name,
+        kind,
+        size,
+        mtime_ms,
+        ctime_ms,
+        is_symlink,
+        symlink_target_is_dir,
+        is_readonly: metadata.permissions().readonly(),
+        is_hidden,
+        depth: depth as u16,
+    }
 }
 
 /// Convert a walked entry set into `Entry` records and push them into
-/// `EntryStore`, resolving each entry's `parent_id` from a path-indexed map
-/// built during the insertion pass.
+/// `EntryStore`, resolving each entry's `parent_id` from the store's path
+/// index, one published batch per depth level.
 ///
 /// Internally topo-sorts by (depth asc, path asc) before insertion so that
 /// parents are always processed before their children, regardless of walker
@@ -392,9 +822,11 @@ where
 /// `Parallelism::RayonNewPool(n)` does not — without this sort, children
 /// whose parent had not yet been seen would silently become spurious roots.
 ///
-/// Returns the list of allocated EntryIds in insertion order. Phase 2.4
-/// coalescer: later phases may extend this to stream via a channel rather
-/// than materialize the full Vec first.
+/// Returns the id of every walked entry, level by level: a path the store
+/// already indexed keeps its id (insertion is idempotent by path) and is
+/// listed first within its level, followed by the ids allocated for the
+/// level in insertion order. Phase 2.4 coalescer: later phases may extend
+/// this to stream via a channel rather than materialize the full Vec first.
 pub fn populate_store(
     store: &crate::store::EntryStore,
     root: &Path,
@@ -415,64 +847,77 @@ pub fn populate_store_with_provenance(
     excludes: Option<&crate::ignore::IgnoreMatcher>,
 ) -> Result<Vec<crate::entry::EntryId>, FxError> {
     use crate::entry::{Entry, EntryId, EntryKind};
-    use std::collections::HashMap;
 
-    let mut path_to_id: HashMap<PathBuf, EntryId> = HashMap::with_capacity(walked.len());
     let mut ids = Vec::with_capacity(walked.len());
 
     // Topo-sort by (depth asc, path asc). Walker output under
     // Parallelism::RayonNewPool(n) does not guarantee parent-before-child
     // order; without this sort, children whose parent hadn't been inserted
-    // would look up None in `path_to_id` and attach as spurious roots.
+    // would look up None in the path index and attach as spurious roots.
     let mut ordered: Vec<&WalkedEntry> = walked.iter().collect();
     ordered.sort_by(|a, b| a.depth.cmp(&b.depth).then_with(|| a.path.cmp(&b.path)));
 
-    for w in ordered {
-        // Look in the current-walk map first, then fall back to the
-        // store's path index. The fallback matters for subsequent
-        // `populate_from_path` calls (lazy `prefetch` in v0.2 B2):
-        // the new walk's `path_to_id` starts empty, so children whose
-        // parent was inserted by a prior walk would otherwise get
-        // `parent_id = None` and appear as spurious roots.
-        let parent_id = match &w.parent_path {
-            None => None,
-            Some(pp) => path_to_id
-                .get(pp)
-                .copied()
-                .or_else(|| store.get_by_path(pp).map(|e| e.id)),
-        };
+    // Suppress unused-variable warning on non-ignore paths.
+    let _ = root;
 
-        // Suppress unused-variable warning on non-ignore paths.
-        let _ = root;
+    // Publish one batch per depth level rather than one snapshot per entry
+    // (M8). Every parent of a level sits in an earlier level or was already
+    // in the store, so by the time a level is built its parents are
+    // published and the store's path index resolves them — including parents
+    // inserted by a prior walk (lazy `prefetch` in v0.2 B2), which would
+    // otherwise get `parent_id = None` and appear as spurious roots. A tree
+    // costs one publication per level, and each sibling list is merged once
+    // per level instead of re-inserted per child.
+    for level in ordered.chunk_by(|a, b| a.depth == b.depth) {
+        let batch: Vec<(PathBuf, Entry)> = level
+            .iter()
+            .filter(|w| match store.get_by_path(&w.path) {
+                Some(existing) => {
+                    ids.push(existing.id);
+                    false
+                }
+                None => true,
+            })
+            .map(|w| {
+                let parent_id = w
+                    .parent_path
+                    .as_ref()
+                    .and_then(|pp| store.get_by_path(pp))
+                    .map(|parent| parent.id);
 
-        let is_dir_like = w.kind == EntryKind::Directory || w.symlink_target_is_dir == Some(true);
-        let is_ignored = match repository_ignore {
-            Some(m) => m.is_ignored(&w.path, is_dir_like),
-            None => false,
-        };
-        let is_excluded = match excludes {
-            Some(m) => m.is_ignored(&w.path, is_dir_like),
-            None => false,
-        };
+                let is_dir_like =
+                    w.kind == EntryKind::Directory || w.symlink_target_is_dir == Some(true);
+                let is_ignored = match repository_ignore {
+                    Some(m) => m.is_ignored(&w.path, is_dir_like),
+                    None => false,
+                };
+                let is_excluded = match excludes {
+                    Some(m) => m.is_ignored(&w.path, is_dir_like),
+                    None => false,
+                };
 
-        let entry = Entry {
-            id: EntryId(0),
-            parent_id,
-            name: w.name.clone(),
-            kind: w.kind,
-            size: w.size,
-            mtime_ms: w.mtime_ms,
-            ctime_ms: w.ctime_ms,
-            symlink_target_is_dir: w.symlink_target_is_dir,
-            path_segments: None,
-            is_ignored,
-            is_excluded,
-            is_readonly: w.is_readonly,
-            is_hidden: w.is_hidden,
-        };
-        let id = store.insert(w.path.clone(), entry)?;
-        path_to_id.insert(w.path.clone(), id);
-        ids.push(id);
+                let entry = Entry {
+                    id: EntryId(0),
+                    parent_id,
+                    name: w.name.clone(),
+                    kind: w.kind,
+                    size: w.size,
+                    mtime_ms: w.mtime_ms,
+                    ctime_ms: w.ctime_ms,
+                    symlink_target_is_dir: w.symlink_target_is_dir,
+                    path_segments: None,
+                    is_ignored,
+                    is_excluded,
+                    is_readonly: w.is_readonly,
+                    is_hidden: w.is_hidden,
+                };
+                (w.path.clone(), entry)
+            })
+            .collect();
+        // A path indexed between the filter above and this publication (URI
+        // resolution does not take the caller's policy gate) is skipped by
+        // `insert_batch`: it keeps the id it was given there, unlisted here.
+        ids.extend(store.insert_batch(batch)?);
     }
 
     Ok(ids)
@@ -1215,5 +1660,201 @@ mod expand_ignored_dir {
             "expected children of ignored dir when walking FROM it; got {:?}",
             names
         );
+    }
+}
+
+/// M10: what a walk does when one of its reads never answers.
+#[cfg(test)]
+mod bounded_reads {
+    use std::fs;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use crate::error::ErrorCode;
+    use crate::read_boundary::tests::{boundary, Gate};
+    use crate::read_boundary::{ReadFailure, ReadKind};
+    use crate::walker::{walk_bounded, walk_bounded_batched, WalkOptions};
+
+    fn tree() -> tempfile::TempDir {
+        let td = tempfile::tempdir().unwrap();
+        for dir in ["a/x", "slow/y", "z"] {
+            fs::create_dir_all(td.path().join(dir)).unwrap();
+        }
+        fs::write(td.path().join("slow/y/deep.txt"), b"d").unwrap();
+        fs::write(td.path().join("a/x/file.txt"), b"f").unwrap();
+        td
+    }
+
+    #[test]
+    fn a_stalled_subdirectory_is_reported_unread_and_the_rest_walks() {
+        let gate = Arc::new(Gate::default());
+        let td = tree();
+        let slow = td.path().join("slow");
+        gate.park(ReadKind::ListDir, &slow);
+        let reads = boundary(&gate, 200);
+        let start = Instant::now();
+        let report = walk_bounded(
+            td.path(),
+            WalkOptions {
+                parallelism: 4,
+                ..WalkOptions::default()
+            },
+            None,
+            &reads,
+        )
+        .unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+        let names: Vec<_> = report.entries.iter().map(|e| e.name.as_str()).collect();
+        // The stalled directory itself is listed by its parent; only its
+        // children are unknown.
+        assert_eq!(names, ["a", "x", "file.txt", "slow", "z"]);
+        assert_eq!(report.unread.len(), 1);
+        assert_eq!(report.unread[0].path, slow);
+        assert!(matches!(
+            report.unread[0].failure,
+            ReadFailure::TimedOut { .. }
+        ));
+
+        // While it is still stuck a second walk refuses it at once.
+        let start = Instant::now();
+        let again = walk_bounded(td.path(), WalkOptions::default(), None, &reads).unwrap();
+        assert!(
+            start.elapsed() < Duration::from_millis(150),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(matches!(again.unread[0].failure, ReadFailure::Stuck { .. }));
+
+        // Once the read returns, a retry walks the whole tree.
+        gate.release_all();
+        let start = Instant::now();
+        while reads.stuck_reads() > 0 {
+            assert!(start.elapsed() < Duration::from_secs(2));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let healed = walk_bounded(td.path(), WalkOptions::default(), None, &reads).unwrap();
+        assert!(healed.unread.is_empty());
+        assert!(healed.entries.iter().any(|e| e.name == "deep.txt"));
+    }
+
+    /// The all-or-nothing forms (`walk`, `walk_with_ignore`, the batched
+    /// pair) go through `into_complete`: a stalled subtree is an error, not
+    /// a smaller tree.
+    #[test]
+    fn into_complete_turns_unread_directories_into_an_incomplete_error() {
+        let gate = Arc::new(Gate::default());
+        let td = tree();
+        let slow = td.path().join("slow");
+        gate.park(ReadKind::ListDir, &slow);
+        let reads = boundary(&gate, 150);
+        let report = walk_bounded(td.path(), WalkOptions::default(), None, &reads).unwrap();
+        let err = report.into_complete().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ETIMEDOUT);
+        match err {
+            crate::error::FxError::Incomplete { unread } => {
+                assert_eq!(unread.len(), 1);
+                assert_eq!(unread[0].path, slow);
+            }
+            other => panic!("expected Incomplete, got {other:?}"),
+        }
+        gate.release_all();
+
+        let healthy = tree();
+        let entries = walk_bounded(healthy.path(), WalkOptions::default(), None, &reads)
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        assert!(entries.iter().any(|e| e.name == "deep.txt"));
+    }
+
+    #[test]
+    fn a_stalled_root_fails_the_walk_with_etimedout() {
+        let td = tree();
+        for kind in [ReadKind::Stat, ReadKind::ListDir] {
+            let gate = Arc::new(Gate::default());
+            gate.park(kind, td.path());
+            let reads = boundary(&gate, 100);
+            let err = walk_bounded(td.path(), WalkOptions::default(), None, &reads).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::ETIMEDOUT, "{kind:?}: {err}");
+            gate.release_all();
+        }
+    }
+
+    #[test]
+    fn a_batched_walk_stops_waiting_when_cancelled() {
+        let gate = Arc::new(Gate::default());
+        let td = tree();
+        gate.park(ReadKind::ListDir, td.path());
+        let reads = boundary(&gate, 60_000);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flip = Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            flip.store(true, Ordering::SeqCst);
+        });
+        let start = Instant::now();
+        let err = walk_bounded_batched(
+            td.path(),
+            WalkOptions::default(),
+            None,
+            &reads,
+            16,
+            || cancel.load(Ordering::SeqCst),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ECANCELED);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+        gate.release_all();
+    }
+
+    #[test]
+    fn the_report_carries_emitted_ignore_files_in_walk_order() {
+        let td = tree();
+        fs::write(td.path().join(".gitignore"), "z/\n").unwrap();
+        fs::write(td.path().join("a/.ignore"), "x/\n").unwrap();
+        let gate = Arc::new(Gate::default());
+        let reads = boundary(&gate, 1_000);
+        let matcher = crate::ignore::IgnoreMatcher::new();
+        let report = walk_bounded(
+            td.path(),
+            WalkOptions {
+                parallelism: 4,
+                ..WalkOptions::default()
+            },
+            Some(&matcher),
+            &reads,
+        )
+        .unwrap();
+        let files: Vec<_> = report
+            .ignore_files
+            .iter()
+            .map(|(path, text)| {
+                (
+                    path.strip_prefix(td.path()).unwrap().to_path_buf(),
+                    text.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            files,
+            [(".gitignore".into(), "z/\n"), ("a/.ignore".into(), "x/\n")]
+        );
+        // Both rule files pruned what they name, without a second open.
+        let names: Vec<_> = report.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&"x") && !names.contains(&"file.txt"),
+            "{names:?}"
+        );
+        assert!(names.contains(&"z"));
     }
 }

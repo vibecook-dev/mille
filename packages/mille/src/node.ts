@@ -28,8 +28,64 @@ export {
   type FramedStreamLimitsInput,
 } from './stream/limits.js';
 
-// Exported for tests and for anyone building a non-Duplex transport on the
-// same wire format (a WebSocket, say). Not part of the supported surface
-// yet — the framing is versioned, but these signatures are not.
+// The same framing over a WebSocket: one codec frame per binary message.
+// The host side lives here because it pairs with `createFileExplorerHost`;
+// the browser-safe client side is `@vibecook/mille/remote`.
+export {
+  createWebSocketHostChannel,
+  serveWebSocketSession,
+  type WebSocketHostChannel,
+  type WebSocketServerSocketLike,
+} from './websocket/host.js';
+
+// A `mille.remote` session on any host channel: the open request, the
+// credential check, the policy from the grant, heartbeats kept off the host.
+export { DEFAULT_REMOTE_MAX_VIEWPORT_ROWS } from './channel/policy.js';
+export {
+  DEFAULT_REMOTE_MAX_FILE_BYTES,
+  serveRemoteSession,
+  type RemoteAuthorizeResult,
+  type RemoteOpenContext,
+  type RemoteSession,
+  type RemoteSessionGrant,
+  type RemoteSessionHost,
+  type RemoteSessionInfo,
+  type RemoteSessionLogger,
+  type RemoteSessionRefusal,
+  type ServeRemoteSessionOptions,
+} from './remote/server.js';
+export {
+  MAX_REMOTE_CREDENTIAL_LENGTH,
+  REMOTE_SERVICE,
+  REMOTE_SERVICE_VERSION,
+  RemoteOpenError,
+  isRemoteServiceMessage,
+  parseOpenRequest,
+  ping,
+  pong,
+  rejection,
+  type OpenWorkspaceAccepted,
+  type OpenWorkspaceLimits,
+  type OpenWorkspaceRejectCode,
+  type OpenWorkspaceRejected,
+  type OpenWorkspaceRequest,
+  type RemoteAccess,
+  type RemoteOpenErrorCode,
+  type RemotePing,
+  type RemotePong,
+  type RemoteServiceMessage,
+  type RequestProblem,
+} from './remote/protocol.js';
+export type { WebSocketChannelOptions, WebSocketExplorerChannel } from './websocket/channel.js';
+export {
+  WEBSOCKET_CLOSE,
+  explorerCloseCodeFor,
+  webSocketCloseCodeFor,
+} from './websocket/close-codes.js';
+
+// Exported for tests and for anyone building a transport of their own on the
+// same wire format. Not part of the supported surface — the framing is
+// versioned, but these signatures are not. A WebSocket no longer needs them:
+// use the adapters above.
 export { encodeFrame, decodeFrame, parseHeader, type FrameHeader } from './stream/codec.js';
 export { FrameDecoder } from './stream/decoder.js';
