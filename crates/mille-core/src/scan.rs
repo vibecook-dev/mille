@@ -253,7 +253,13 @@ pub struct ScanOptions {
     ///   followed.
     /// - `Smart`: follow symlinks, but walk a linked directory only if its
     ///   `(dev, ino)` has not been walked yet in this scan. Real directories
-    ///   are always walked. No `canonicalize` per link.
+    ///   are always walked. No `canonicalize` per link. The decision does
+    ///   not depend on which listing answers first: links are decided only
+    ///   once everything reachable without crossing a link has been walked
+    ///   (then, level by level, everything reachable through the links
+    ///   chosen so far), in path order. So a link to a directory of the same
+    ///   tree is never walked, and of several links to one outside
+    ///   directory, the first by path is.
     /// - `Always`: follow symlinks; a linked directory that is one of its own
     ///   ancestors (by `(dev, ino)`) is delivered but not walked.
     pub follow_symlinks: SymlinkPolicy,
@@ -379,6 +385,12 @@ pub struct ScanReport {
     /// Directories reached through a symlink and not walked: already walked
     /// (`Smart`) or an ancestor of the link (`Always`).
     pub links_not_walked: u64,
+    /// The paths of those links (`links_not_walked` of them), each a
+    /// directory entry the visitor saw whose children were never read. A
+    /// caller that records which directories a scan listed must leave
+    /// these out: under `Smart` the decision is taken after the visitor
+    /// returned for the link.
+    pub links_skipped: Vec<PathBuf>,
     /// Ignore files honoured, with their text, as they were found.
     pub ignore_files: Vec<(PathBuf, String)>,
     pub listers: ListerCounts,
@@ -488,6 +500,7 @@ where
         pending: vec![root_job],
         inflight: Vec::new(),
         walked: HashSet::new(),
+        links: Vec::new(),
         nested: IgnoreMatcher::new(),
         next_id: 1,
         report: &mut report,
@@ -557,6 +570,10 @@ struct Scan<'a> {
     inflight: Vec<(DirJob, Ticket)>,
     /// `(dev, ino)` of every directory walked, for `SymlinkPolicy::Smart`.
     walked: HashSet<(u64, u64)>,
+    /// `SymlinkPolicy::Smart`: directory links found since the last
+    /// decision, held until nothing is pending or in flight (see
+    /// `decide_links`).
+    links: Vec<DirJob>,
     /// Ignore files found on the way down (`ignore_file_names`).
     nested: IgnoreMatcher,
     next_id: u64,
@@ -575,6 +592,11 @@ impl Scan<'_> {
             }
             self.fill(parallelism);
             if self.inflight.is_empty() {
+                // Nothing pending either: the links found so far can now be
+                // decided against everything walked.
+                if self.decide_links() {
+                    continue;
+                }
                 return Ok(());
             }
             // Take the token before polling, so a read that finishes between
@@ -607,6 +629,36 @@ impl Scan<'_> {
                 self.signal.wait_past(seen, wait);
             }
         }
+    }
+
+    /// `SymlinkPolicy::Smart`: walk each held directory link whose target
+    /// was not walked, in path order, and report the rest. Called only when
+    /// nothing is pending or in flight, so the set it decides against —
+    /// every directory reachable without crossing a link, and then through
+    /// the links chosen in earlier rounds — does not depend on the order
+    /// listings answered in. (Deciding a link as soon as its listing landed
+    /// made `Alias/X -> ../Real/X` walked or not depending on whether
+    /// `Alias/` or `Real/` answered first.) Returns whether any link was
+    /// queued.
+    fn decide_links(&mut self) -> bool {
+        if self.links.is_empty() {
+            return false;
+        }
+        let mut links = std::mem::take(&mut self.links);
+        links.sort_by(|a, b| a.path.cmp(&b.path));
+        let mut queued = false;
+        for mut link in links {
+            if self.walked.insert((link.dev, link.ino)) {
+                link.id = self.next_id;
+                self.next_id += 1;
+                self.pending.push(link);
+                queued = true;
+            } else {
+                self.report.links_not_walked += 1;
+                self.report.links_skipped.push(link.path);
+            }
+        }
+        queued
     }
 
     /// Submit queued directories until `parallelism` reads are in flight.
@@ -683,11 +735,9 @@ impl Scan<'_> {
         let mut scratch =
             (matcher.is_some() || self.nested.matcher_count() > 0).then(|| job.path.clone());
         // Subdirectories to read, in listing order. Under `Smart`, linked
-        // directories are decided after this directory's real ones, so
-        // `alias -> real` next to `real/` walks `real/` whatever order the
-        // filesystem lists them in.
+        // directories are held in `self.links` and decided once the walk
+        // has nothing else to read (`decide_links`).
         let mut real: Vec<DirJob> = Vec::new();
-        let mut links: Vec<DirJob> = Vec::new();
 
         for entry in listing.iter() {
             if let Some(path) = scratch.as_mut() {
@@ -713,6 +763,7 @@ impl Scan<'_> {
                 && Ancestor::contains(&job.ancestors, entry.dev, entry.ino)
             {
                 report.links_not_walked += 1;
+                report.links_skipped.push(job.path.join(entry.name));
                 continue;
             }
             let child = DirJob {
@@ -733,19 +784,12 @@ impl Scan<'_> {
             };
             if options.follow_symlinks == SymlinkPolicy::Smart {
                 if entry.is_symlink {
-                    links.push(child);
+                    self.links.push(child);
                     continue;
                 }
                 self.walked.insert(entry.identity());
             }
             real.push(child);
-        }
-        for link in links {
-            if self.walked.insert((link.dev, link.ino)) {
-                real.push(link);
-            } else {
-                report.links_not_walked += 1;
-            }
         }
         for mut child in real {
             child.id = self.next_id;
@@ -1349,6 +1393,73 @@ mod tests {
             // `alias/up` points at the root too.
             assert_eq!(report.links_not_walked, 2, "{lister:?}");
         }
+    }
+
+    /// INT-5. A link was decided as soon as its own listing landed, so with
+    /// `Alias/X -> Real/X` in one root, X's files came out twice when
+    /// `Alias/` answered before `Real/` (link walked, then the real
+    /// directory too) and once otherwise; which of two links to one outside
+    /// directory was walked flipped the same way. Here each order is forced
+    /// by parking the other sibling until the first one has been delivered.
+    #[cfg(unix)]
+    #[test]
+    fn smart_link_decisions_do_not_depend_on_which_listing_answers_first() {
+        use std::os::unix::fs::symlink;
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path();
+        let movie = root.join("Real/The Matrix (1999)");
+        fs::create_dir_all(&movie).unwrap();
+        fs::write(movie.join("The Matrix (1999).mkv"), b"mkv").unwrap();
+        fs::create_dir_all(root.join("Alias")).unwrap();
+        symlink(&movie, root.join("Alias/The Matrix (1999)")).unwrap();
+        // Two links to one directory outside the root.
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("extra.mkv"), b"x").unwrap();
+        symlink(outside.path(), root.join("Alias/b-outside")).unwrap();
+        symlink(outside.path(), root.join("Real/a-outside")).unwrap();
+
+        let options = ScanOptions {
+            follow_symlinks: SymlinkPolicy::Smart,
+            ..ScanOptions::default()
+        };
+        let mut views = Vec::new();
+        for (first, second) in [("Alias", "Real"), ("Real", "Alias")] {
+            let (first, second) = (root.join(first), root.join(second));
+            let gate = Arc::new(Gate::default());
+            gate.park(ReadKind::ListDir, &second);
+            let reads = boundary(&gate, 10_000);
+            let mut delivered = BTreeSet::new();
+            let report = walk_scan(root, &options, &reads, |dir, e| {
+                if dir.path == first {
+                    gate.release(ReadKind::ListDir, &second);
+                }
+                let path = dir.join(e.name);
+                delivered.insert(path.strip_prefix(root).unwrap().to_path_buf());
+                Visit::Continue
+            })
+            .unwrap();
+            gate.release_all();
+            assert!(report.is_complete(), "{:?}", report.unread);
+            views.push((delivered, report.links_not_walked, report.links_skipped));
+        }
+        assert_eq!(views[0], views[1], "the walk depends on listing order");
+        let (delivered, not_walked, skipped) = &views[0];
+        assert!(delivered.contains(Path::new("Real/The Matrix (1999)/The Matrix (1999).mkv")));
+        // The alias is delivered, as a directory reached through a link, and
+        // never walked: its target is part of the tree.
+        assert!(delivered.contains(Path::new("Alias/The Matrix (1999)")));
+        assert!(!delivered.contains(Path::new("Alias/The Matrix (1999)/The Matrix (1999).mkv")));
+        // Of the two links to one outside directory, the first by path.
+        assert!(delivered.contains(Path::new("Alias/b-outside/extra.mkv")));
+        assert!(!delivered.contains(Path::new("Real/a-outside/extra.mkv")));
+        assert_eq!(*not_walked, 2);
+        assert_eq!(
+            skipped,
+            &vec![
+                root.join("Alias/The Matrix (1999)"),
+                root.join("Real/a-outside")
+            ]
+        );
     }
 
     #[test]
