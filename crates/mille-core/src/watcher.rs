@@ -657,6 +657,50 @@ enum PathState {
 /// that many events.) Keys borrow from `raw`, so a path is cloned once, into
 /// its output event.
 pub fn coalesce_events(raw: &[RawEvent]) -> Vec<FsChangeEvent> {
+    coalesce_events_with(raw, CoalesceOptions::default())
+}
+
+/// What [`coalesce_events_with`] does with a path whose events in the batch
+/// net out to "created, then deleted".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CreateThenDelete {
+    /// Drop the path: a file that lived and died inside the window, which
+    /// nobody downstream can have seen. [`coalesce_events`]' behaviour.
+    #[default]
+    Cancel,
+    /// Report it, by its state on disk when the batch is coalesced (one
+    /// `lstat`): `Deleted` if the path is gone, `Created` if it exists.
+    ///
+    /// For consumers that keep state about paths (a catalog, an index).
+    /// FSEvents reports a path's *accumulated* flags, so a file created a
+    /// while ago and deleted now arrives as created-and-removed, and one
+    /// removed and re-created arrives the same way (notify always lists the
+    /// create first). Cancelling would hide the deletion of a file the
+    /// consumer holds, or the replacement of one. A truly transient file
+    /// comes out as a `Deleted` the consumer has nothing for.
+    Report,
+}
+
+/// Options for [`coalesce_events_with`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CoalesceOptions {
+    pub create_then_delete: CreateThenDelete,
+}
+
+impl CoalesceOptions {
+    /// For consumers that keep per-path state: nothing that touched a path
+    /// is dropped ([`CreateThenDelete::Report`]).
+    pub fn stateful() -> Self {
+        Self {
+            create_then_delete: CreateThenDelete::Report,
+        }
+    }
+}
+
+/// [`coalesce_events`] with options. With the default options it is the
+/// same function, and pure; [`CreateThenDelete::Report`] makes one `lstat`
+/// per path that netted out to created-then-deleted.
+pub fn coalesce_events_with(raw: &[RawEvent], options: CoalesceOptions) -> Vec<FsChangeEvent> {
     use std::collections::HashMap;
 
     /// One output position: a path's coalesced event (index into
@@ -705,8 +749,18 @@ pub fn coalesce_events(raw: &[RawEvent]) -> Vec<FsChangeEvent> {
                 let (path, state) = paths[at];
                 let path = path.clone();
                 match state {
-                    // Create+Delete inside the window: a transient file.
-                    PathState::Cancelled => None,
+                    // Create+Delete inside the window: a transient file, or
+                    // accumulated FSEvents flags (see `CreateThenDelete`).
+                    PathState::Cancelled => match options.create_then_delete {
+                        CreateThenDelete::Cancel => None,
+                        CreateThenDelete::Report => {
+                            Some(if std::fs::symlink_metadata(&path).is_ok() {
+                                FsChangeEvent::Created { path }
+                            } else {
+                                FsChangeEvent::Deleted { path }
+                            })
+                        }
+                    },
                     PathState::Created => Some(FsChangeEvent::Created { path }),
                     PathState::Modified => Some(FsChangeEvent::Modified { path }),
                     PathState::Deleted => Some(FsChangeEvent::Deleted { path }),
@@ -1600,6 +1654,46 @@ mod tests {
         assert!(out.is_empty(), "C+D should cancel: {out:?}");
     }
 
+    /// The stateful mode never drops a created-then-deleted path: a gone
+    /// path is `Deleted` — FSEvents' accumulated flags on the deletion of a
+    /// file a consumer already holds — and one that exists again is
+    /// `Created` (removed and re-created, reported create-first).
+    #[test]
+    fn coalesce_stateful_reports_create_then_delete_by_disk_state() {
+        let td = TempDir::new().unwrap();
+        let gone = td.path().join("held-by-the-catalog.mkv");
+        let back = td.path().join("replaced.mkv");
+        fs::write(&back, b"new inode").unwrap();
+        let raw = vec![
+            RawEvent::Created(gone.clone()),
+            RawEvent::Created(back.clone()),
+            RawEvent::Deleted(gone.clone()),
+            RawEvent::Deleted(back.clone()),
+            RawEvent::Modified(pb("/elsewhere")),
+        ];
+        assert_eq!(
+            coalesce_events_with(&raw, CoalesceOptions::stateful()),
+            vec![
+                FsChangeEvent::Deleted { path: gone },
+                FsChangeEvent::Created { path: back },
+                FsChangeEvent::Modified {
+                    path: pb("/elsewhere")
+                },
+            ]
+        );
+        // The default keeps cancelling: same as `coalesce_events`.
+        assert_eq!(
+            coalesce_events_with(&raw, CoalesceOptions::default()),
+            vec![FsChangeEvent::Modified {
+                path: pb("/elsewhere")
+            }]
+        );
+        assert_eq!(
+            coalesce_events_with(&raw, CoalesceOptions::default()),
+            coalesce_events(&raw)
+        );
+    }
+
     #[test]
     fn coalesce_create_delete_create_yields_single_create() {
         let raw = vec![
@@ -1864,6 +1958,45 @@ mod tests {
             raw in proptest::collection::vec(raw_event(), 0..64)
         ) {
             proptest::prop_assert_eq!(coalesce_events(&raw), coalesce_reference(&raw));
+        }
+
+        /// The stateful mode changes nothing but the paths the default
+        /// cancels, which it reports instead (as `Deleted`: `/r/*` never
+        /// exists).
+        #[test]
+        fn coalesce_stateful_only_reports_what_the_default_cancels(
+            raw in proptest::collection::vec(raw_event(), 0..64)
+        ) {
+            let default = coalesce_events(&raw);
+            let stateful = coalesce_events_with(&raw, CoalesceOptions::stateful());
+            let mentioned = |p: &PathBuf| default.iter().any(|e| matches!(e,
+                FsChangeEvent::Created { path }
+                | FsChangeEvent::Modified { path }
+                | FsChangeEvent::Deleted { path }
+                | FsChangeEvent::Unknown { path } if path == p));
+            let mut trimmed = Vec::new();
+            for e in &stateful {
+                match e {
+                    FsChangeEvent::Deleted { path } if !mentioned(path) => {
+                        let created = raw.iter().any(|r| matches!(r, RawEvent::Created(p) if p == path));
+                        let deleted = raw.iter().any(|r| matches!(r, RawEvent::Deleted(p) if p == path));
+                        proptest::prop_assert!(created && deleted, "{path:?} was not created and deleted");
+                    }
+                    other => trimmed.push(other.clone()),
+                }
+            }
+            proptest::prop_assert_eq!(&trimmed, &default);
+            // And every path the default dropped is reported.
+            for r in &raw {
+                if let RawEvent::Created(p) | RawEvent::Modified(p) | RawEvent::Deleted(p) | RawEvent::Any(p) = r {
+                    if !mentioned(p) {
+                        proptest::prop_assert!(
+                            stateful.contains(&FsChangeEvent::Deleted { path: p.clone() }),
+                            "{p:?} dropped"
+                        );
+                    }
+                }
+            }
         }
     }
 

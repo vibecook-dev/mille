@@ -76,7 +76,8 @@ pub use crate::ignore::{IgnoreMatcher, IGNORE_FILE_NAMES};
 // Phase 3 — notify + debouncer + rename pairing + volatile throttling
 pub mod watcher;
 pub use watcher::{
-    coalesce_events, FsChangeEvent, RawEvent, RenamePairer, Watcher, WatcherOptions,
+    coalesce_events, coalesce_events_with, CoalesceOptions, CreateThenDelete, FsChangeEvent,
+    RawEvent, RenamePairer, Watcher, WatcherOptions,
 };
 
 // Phase 3.7 — volatile-subtree detection and throttling
