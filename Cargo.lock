@@ -1981,7 +1981,7 @@ dependencies = [
 
 [[package]]
 name = "mille-bench"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "criterion",
  "mille-core",
@@ -1990,7 +1990,7 @@ dependencies = [
 
 [[package]]
 name = "mille-binding"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "bincode",
  "mille-core",
@@ -2008,7 +2008,7 @@ dependencies = [
 
 [[package]]
 name = "mille-core"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "arc-swap",
  "bincode",
@@ -2039,7 +2039,7 @@ dependencies = [
 
 [[package]]
 name = "mille-git"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "gix",
  "libc",

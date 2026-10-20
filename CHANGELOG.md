@@ -1,5 +1,58 @@
 # mille changelog
 
+## [0.3.5](https://github.com/vibecook-dev/mille/compare/v0.3.4...v0.3.5) (2026-10-20)
+
+
+### Features
+
+* **binding:** expanding a folder stuck in the kernel answers ETIMEDOUT for that folder ([e04dd39](https://github.com/vibecook-dev/mille/commit/e04dd39fd879ac4c2fa7dc7424d132490db7d2d7))
+* **binding:** expose GitEngine behind the git napi feature ([5091f6b](https://github.com/vibecook-dev/mille/commit/5091f6ba7f5a9aa4199902cdd5b9585872a322d5))
+* **binding:** native EventBus subscribers and bindExplorer ([85f4c60](https://github.com/vibecook-dev/mille/commit/85f4c60a6733542727f96ae8736c2223a68016d7))
+* **channel:** carry the framed codec over a WebSocket, one frame per message ([ae16177](https://github.com/vibecook-dev/mille/commit/ae1617774691fc346ebcc7d986a8ede52d46c0c5))
+* **core:** a directory read stuck in the kernel times out instead of holding the walk ([97ec3c6](https://github.com/vibecook-dev/mille/commit/97ec3c69d22ed06fa8a7a6652439ab2d880bc387))
+* **core:** add walk_scan, a streaming scan that delivers each entry's (dev, ino), birth time and ns mtime ([bf764f1](https://github.com/vibecook-dev/mille/commit/bf764f1c6b3f34f5f39f9774f4635552f9f5a10b))
+* **core:** coalesce_events_with, with a mode that never drops a path ([c5eb2a1](https://github.com/vibecook-dev/mille/commit/c5eb2a199f91c720793d3cfeac432e482889c30e))
+* **core:** give a read's first answer its own deadline so a waking disk is not "stalled" ([57ee0f6](https://github.com/vibecook-dev/mille/commit/57ee0f62884a0588317367b86c4598b7a4d25d50))
+* **core:** media-grade scanning, watcher fixes and FSEvents resume (for flux) ([c9708f4](https://github.com/vibecook-dev/mille/commit/c9708f4c08d5334a57e0c3c054f0ea264fdfb88f))
+* **core:** replay a root's changes since a saved FSEvents event id ([a152172](https://github.com/vibecook-dev/mille/commit/a152172b7ae4a194af3a3971cd928f282da0d39a))
+* **git:** add mille-git crate with identity and gitdir resolution ([a24b6a4](https://github.com/vibecook-dev/mille/commit/a24b6a4f4209d8531fac60740b59b47d423d2ca2))
+* **git:** CLI stage, restore, and stdin commit ([ce08d93](https://github.com/vibecook-dev/mille/commit/ce08d93aa7851e2d1d814bebcb8301c5d6db7c8e))
+* **git:** compute XY status snapshots via gix ([6bb98d4](https://github.com/vibecook-dev/mille/commit/6bb98d4f5362401a57439f2f89d4033a0021af2d))
+* **git:** per-worktree queue, gitdir watch, and path hints ([e076d7a](https://github.com/vibecook-dev/mille/commit/e076d7ada6f99c0c2312975d6bdb3d7cab9f9290))
+* **git:** pull-based diff caps, log pages, and readObject ([b0f6020](https://github.com/vibecook-dev/mille/commit/b0f60202da654e19c2d0b6f8eaef89908a7f57b8))
+* **git:** say when commitFiles hit its 10 000-file cap ([7fbf733](https://github.com/vibecook-dev/mille/commit/7fbf73376733652168accbad8a80ea759f8a3c33))
+* **host:** cap a non-admin session's viewport, clamped and announced ([5547ea9](https://github.com/vibecook-dev/mille/commit/5547ea998567bf743a04c0268e65ffdfe2ffac1b))
+* **remote:** open a credentialed session on any channel, policy from the grant ([09294ec](https://github.com/vibecook-dev/mille/commit/09294ec5195d21af973ac1278b4ff4d50f088f70))
+* **remote:** relay a remote session into a MessagePort from a Worker ([3e0804b](https://github.com/vibecook-dev/mille/commit/3e0804b70b1e814613fd558b61f831a8dbc2b538))
+* **search:** answer search over the channel, bounded and policy-gated ([cd8c93c](https://github.com/vibecook-dev/mille/commit/cd8c93cbe01f03fd19f0b04778e1cd64c2a279fd))
+* **search:** filter by entry kind in the engine, before the limit ([74b1777](https://github.com/vibecook-dev/mille/commit/74b1777afcd067bcd2fdece45bc27ae802d40f3d))
+* **ui:** adapt GitService onto GitClient, history, and SCM ([baa0de8](https://github.com/vibecook-dev/mille/commit/baa0de874d3a8449a63171080a59d8ae83f8ecd2))
+
+
+### Bug Fixes
+
+* **binding:** read a rename's destination before publishing it, so a change made right after is not lost ([5bf5d91](https://github.com/vibecook-dev/mille/commit/5bf5d91d713d21de5741fe7e32df5a9b0f2c8f98))
+* **core:** decide Smart directory links independently of listing order ([bf778a6](https://github.com/vibecook-dev/mille/commit/bf778a635c63423e5ee39a0369142f6e3b06994b))
+* **core:** deliver deletions FSEvents reports with an accumulated create flag ([0777350](https://github.com/vibecook-dev/mille/commit/07773506e957d5ec81ca64050a864d722e031676))
+* **core:** fail walk() and its siblings with Incomplete instead of silently dropping unread subtrees ([dd246b0](https://github.com/vibecook-dev/mille/commit/dd246b0406df0c01cad71ae0705ac331c867ebe9))
+* **core:** never join a bounded read that already finished ([f53f3c1](https://github.com/vibecook-dev/mille/commit/f53f3c1fa72913b2c50e2c139306461df84b81d9))
+* **git:** refuse gix-only reads on a CLI-only repository with EUNSUPPORTED ([59ed16b](https://github.com/vibecook-dev/mille/commit/59ed16b3b05ddcaaae64513c798143ed1a6518be))
+* **git:** reject an aborted adapter call with ABORT_ERR, as the shell clients do ([c8d3ca1](https://github.com/vibecook-dev/mille/commit/c8d3ca197f05061662881473a2be5655d3b1c211))
+* **host:** answer a result too large for the channel with EFBIG, keep the session ([fb00d07](https://github.com/vibecook-dev/mille/commit/fb00d07c3ab6b7fd8057c63b9037e4563f347355))
+* **truffle:** keep heartbeat frames away from the explorer host ([fe6e4a6](https://github.com/vibecook-dev/mille/commit/fe6e4a65ada9c7b8ac5a1ed7b9c81072fc120d3a))
+
+
+### Performance Improvements
+
+* **binding:** stop sleeping after a folder listing's last page ([be05811](https://github.com/vibecook-dev/mille/commit/be05811dc65225839c7267ccf8810f997dd8e6d8))
+* **core:** coalesce a watcher batch in one pass, so a 40k-event storm takes milliseconds, not 86 s ([deef2f6](https://github.com/vibecook-dev/mille/commit/deef2f630f6ce44ce0dd2ae0e5602cdc41daaabe))
+* **core:** hydrate the store in linear time with structurally shared snapshots ([cf284e6](https://github.com/vibecook-dev/mille/commit/cf284e60d6b2ec269318b8538562bb3c42a27891))
+* **core:** let an idle read helper spin 50 µs for the next read before parking ([963e3f9](https://github.com/vibecook-dev/mille/commit/963e3f970b50c0435a8876e030b2955e82408e81))
+* **core:** list macOS directories with getattrlistbulk, one syscall per ~1,000 entries instead of an lstat each ([3440965](https://github.com/vibecook-dev/mille/commit/344096538cae561d891ad18f8afd27467022fea4))
+* **core:** look up only a path's ancestors' ignore rules ([17f21df](https://github.com/vibecook-dev/mille/commit/17f21dfaf1f15eb8dc299819cd21f73ce682c33f))
+* **core:** spin at most one idle read helper, halving a parallel scan's CPU ([5f421a9](https://github.com/vibecook-dev/mille/commit/5f421a93b9a4e23d9309586b6a95cc9a454a4532))
+* **core:** write_snapshot_from, a resume snapshot without an EntryStore ([6c75111](https://github.com/vibecook-dev/mille/commit/6c751113e690da67fa9a6b698a43b9e9f321ca59))
+
 ## [0.3.4](https://github.com/vibecook-dev/mille/compare/v0.3.3...v0.3.4) (2026-09-08)
 
 
