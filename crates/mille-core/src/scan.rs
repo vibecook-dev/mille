@@ -1241,20 +1241,22 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::ETIMEDOUT);
         gate.release_all();
 
-        // A disk that takes 400 ms to answer its first read, under a 100 ms
-        // stall deadline and a 5 s first-response deadline: a full scan.
+        // A disk that takes 900 ms to answer its first read, under a 300 ms
+        // stall deadline and a 10 s first-response deadline: a full scan.
+        // Once answered, a read has the stall deadline only, so it is wide
+        // enough for a busy CI runner to finish a tiny listing.
         let gate = Arc::new(Gate::default());
         gate.park(ReadKind::ListDir, td.path());
         let patient = ReadBoundary::new(ReadBoundaryOptions {
-            timeout: Duration::from_millis(100),
-            first_response: Some(Duration::from_secs(5)),
+            timeout: Duration::from_millis(300),
+            first_response: Some(Duration::from_secs(10)),
             hook: Some(Arc::clone(&gate) as Arc<dyn crate::read_boundary::ReadHook>),
             ..ReadBoundaryOptions::default()
         });
         let waker = {
             let gate = Arc::clone(&gate);
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(400));
+                std::thread::sleep(Duration::from_millis(900));
                 gate.release_all();
             })
         };

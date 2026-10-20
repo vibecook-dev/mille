@@ -1586,15 +1586,18 @@ pub(crate) mod tests {
         let gate = Arc::new(Gate::default());
         let td = tree();
         let slow = td.path().join("slow");
-        // 8 × 40 ms = 320 ms in total, never 100 ms without progress.
+        // 10 × 40 ms = 400 ms in total, longer than the 250 ms deadline, but
+        // never close to 250 ms without progress. (A 100 ms deadline left too
+        // little room: a loaded windows-latest runner overslept one 40 ms
+        // step past it.)
         gate.slow
             .lock()
-            .insert(slow.clone(), (8, Duration::from_millis(40)));
-        let reads = boundary(&gate, 100);
+            .insert(slow.clone(), (10, Duration::from_millis(40)));
+        let reads = boundary(&gate, 250);
         let start = Instant::now();
         let outcome = list(&reads, &slow).wait();
         assert_eq!(names(&outcome), ["inside.txt", "sub"]);
-        assert!(start.elapsed() >= Duration::from_millis(300));
+        assert!(start.elapsed() >= Duration::from_millis(400));
     }
 
     #[test]
@@ -1909,15 +1912,18 @@ pub(crate) mod tests {
         let td = tree();
         let slow = td.path().join("slow");
         gate.park(ReadKind::ListDir, &slow);
+        // Once released, the read answers and the stall deadline governs it,
+        // so that deadline must cover a busy runner finishing a tiny listing:
+        // at 50 ms one (ubuntu-latest) answered TimedOut after the release.
         let reads = ReadBoundary::new(ReadBoundaryOptions {
-            timeout: Duration::from_millis(50),
-            first_response: Some(Duration::from_secs(5)),
+            timeout: Duration::from_millis(300),
+            first_response: Some(Duration::from_secs(10)),
             hook: Some(Arc::clone(&gate) as Arc<dyn ReadHook>),
             ..ReadBoundaryOptions::default()
         });
         let first = list(&reads, &slow);
         eventually(Duration::from_secs(2), || gate.entered(&slow) == 1);
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(900));
         // Well past the stall deadline, but still inside the first-response
         // one: not stuck, so a second request joins instead of being refused.
         assert_eq!(reads.stuck_reads(), 0);
