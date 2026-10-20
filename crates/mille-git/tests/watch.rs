@@ -163,10 +163,20 @@ async fn worktree_add_and_remove_update_the_list() {
         "feature",
         wt.to_str().unwrap(),
     ]);
-    let added = tokio::time::timeout(SLOW, rx.recv())
-        .await
-        .expect("list refreshed")
-        .unwrap();
+    // The refresh runs one debounce after the first event, which can be
+    // before `git worktree add` has finished: the new worktree is listed
+    // while its HEAD is still the null id git writes first, so without a
+    // branch (seen on windows-latest, where git takes longer than the 75 ms
+    // debounce). Its later writes refresh the list again; wait for that one.
+    let added = loop {
+        let list = tokio::time::timeout(SLOW, rx.recv())
+            .await
+            .expect("list refreshed")
+            .unwrap();
+        if list.iter().any(|w| !w.is_current && w.branch.is_some()) {
+            break list;
+        }
+    };
     assert_eq!(added.len(), 2);
     let linked = added.iter().find(|w| !w.is_current).unwrap();
     assert_eq!(linked.branch.as_deref(), Some("feature"));
