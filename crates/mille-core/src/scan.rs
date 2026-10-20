@@ -1484,9 +1484,25 @@ mod tests {
             parallelism: 16,
             ..ScanOptions::default()
         };
+        // Windows lists with `read_dir`, whose metadata is the copy NTFS keeps
+        // in the parent directory's index, and NTFS refreshes that copy
+        // lazily. `library()` moves `TV`'s mtime when it creates `TV/Show`, so
+        // the first scan can still read the old value and the second the new
+        // one (seen on windows-latest: 1.2 ms apart, btime equal). That is
+        // the filesystem settling, not the two scans disagreeing.
+        let settled = |mut map: BTreeMap<PathBuf, Seen>| {
+            if cfg!(windows) {
+                for seen in map.values_mut() {
+                    if seen.kind == EntryKind::Directory {
+                        seen.mtime_ns = 0;
+                    }
+                }
+            }
+            map
+        };
         assert_eq!(
-            scan(td.path(), &one, &reads()).0,
-            scan(td.path(), &many, &reads()).0
+            settled(scan(td.path(), &one, &reads()).0),
+            settled(scan(td.path(), &many, &reads()).0)
         );
     }
 
