@@ -222,18 +222,31 @@ async fn a_burst_of_forty_writes_coalesces() {
     let runs_after_open = engine.status_runs_started();
     let mut published = Published::subscribe(&engine, &repo.root);
 
+    let started = Instant::now();
     for name in &names {
         repo.write(name, "v2\n");
         engine.hint_os_paths(&[repo.path(name)]);
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    let burst = started.elapsed();
     published
         .until(SLOW, |s| s.entries.len() == 40)
         .await
         .expect("all forty published");
     let runs = engine.status_runs_started() - runs_after_open;
-    eprintln!("40 writes -> {runs} status run(s)");
-    assert!((1..=4).contains(&runs), "{runs} runs for one burst");
+    eprintln!("40 writes in {burst:?} -> {runs} status run(s)");
+    // `max_wait` refreshes a continuous burst at least that often, so the
+    // bound is four runs per `max_wait` window the burst spans: four for the
+    // ~450 ms it takes on Linux. windows-latest stretches it (a 10 ms sleep
+    // is ~16 ms there) and, inside the whole workspace suite, measured 6 runs
+    // for 650 ms and 8 for 1.2 s; with this binary alone, 2–4. Why Windows
+    // runs more often within a window is open (PR #43). Forty still fails.
+    let max_wait = GitEngineOptions::default().max_wait.as_millis();
+    let spans = burst.as_millis().div_ceil(max_wait).max(1) as u64;
+    assert!(
+        (1..=4 * spans).contains(&runs),
+        "{runs} runs for one burst of {burst:?}"
+    );
 }
 
 // AC-008: eight worktrees, no global lock — statuses overlap.
