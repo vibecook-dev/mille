@@ -70,7 +70,99 @@ impl Default for WatcherOptions {
 /// watched-roots bookkeeping and shutdown path.
 enum NotifyBackend {
     Raw(RecommendedWatcher),
-    Debounced(notify_debouncer_full::Debouncer<RecommendedWatcher, notify_debouncer_full::NoCache>),
+    Debounced(notify_debouncer_full::Debouncer<DebouncedSource, notify_debouncer_full::NoCache>),
+}
+
+/// The platform watcher under the debouncer. On macOS it drops the stale
+/// halves of FSEvents' accumulated flags before the debouncer sees them
+/// ([`FsEventsHistoryFilter`]); elsewhere it is notify's own.
+#[cfg(target_os = "macos")]
+type DebouncedSource = FsEventsWatcher;
+#[cfg(not(target_os = "macos"))]
+type DebouncedSource = RecommendedWatcher;
+
+/// notify's FSEvents watcher with [`FsEventsHistoryFilter`] in front of the
+/// handler.
+#[cfg(target_os = "macos")]
+struct FsEventsWatcher(RecommendedWatcher);
+
+#[cfg(target_os = "macos")]
+impl NotifyWatcher for FsEventsWatcher {
+    fn new<F: notify::EventHandler>(event_handler: F, config: Config) -> notify::Result<Self> {
+        RecommendedWatcher::new(
+            FsEventsHistoryFilter {
+                inner: event_handler,
+            },
+            config,
+        )
+        .map(Self)
+    }
+
+    fn watch(&mut self, path: &Path, recursive_mode: RecursiveMode) -> notify::Result<()> {
+        self.0.watch(path, recursive_mode)
+    }
+
+    fn unwatch(&mut self, path: &Path) -> notify::Result<()> {
+        self.0.unwatch(path)
+    }
+
+    fn configure(&mut self, option: Config) -> notify::Result<bool> {
+        self.0.configure(option)
+    }
+
+    fn kind() -> notify::WatcherKind {
+        RecommendedWatcher::kind()
+    }
+}
+
+/// FSEvents reports, per path, the flags it has *accumulated*, and notify
+/// turns one record into one event per flag, creates first. A file created
+/// a while ago and deleted now therefore arrives as `Create` + `Remove`,
+/// and `notify-debouncer-full` cancels that pair as a transient file: the
+/// deletion was never delivered (copy a file in, wait 300 ms, delete it —
+/// the raw stream says `Remove`, the debounced one said nothing). A file
+/// removed and re-created arrives the same way, and the replacement was
+/// lost too.
+///
+/// The disk settles which half is history: a `Create` for a path that is
+/// gone, or a `Remove` for a path that exists, is dropped before the
+/// debouncer pairs it. A truly transient file still cancels when both
+/// records land inside the window (its `Create` was queued while it
+/// existed); otherwise the consumer gets a `Remove` for a path it never
+/// saw, which is harmless. Mount and unmount events pass untouched.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct FsEventsHistoryFilter<H> {
+    inner: H,
+}
+
+impl<H: notify::EventHandler> notify::EventHandler for FsEventsHistoryFilter<H> {
+    fn handle_event(&mut self, event: notify::Result<Event>) {
+        if let Ok(ev) = &event {
+            if is_stale_fsevents_flag(ev) {
+                return;
+            }
+        }
+        self.inner.handle_event(event);
+    }
+}
+
+/// See [`FsEventsHistoryFilter`].
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn is_stale_fsevents_flag(ev: &Event) -> bool {
+    if ev.info() == Some("mount") {
+        return false;
+    }
+    let [path] = ev.paths.as_slice() else {
+        return false;
+    };
+    match ev.kind {
+        EventKind::Create(_) => matches!(
+            std::fs::symlink_metadata(path),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+        ),
+        EventKind::Remove(_) => std::fs::symlink_metadata(path).is_ok(),
+        _ => false,
+    }
 }
 
 impl NotifyBackend {
@@ -318,7 +410,7 @@ where
     let config = Config::default().with_poll_interval(Duration::from_secs(2));
     // tick_rate = None lets the debouncer pick ~timeout/4, which
     // matches the recommended upstream default.
-    let debouncer = new_debouncer_opt(
+    let debouncer = new_debouncer_opt::<_, DebouncedSource, _>(
         Duration::from_millis(debounce_ms),
         None,
         move |res: DebounceEventResult| {
@@ -1309,6 +1401,182 @@ mod tests {
         assert!(
             hot_count < n as usize,
             "debouncer should merge rapid modifies, got {hot_count}: {got:?}"
+        );
+    }
+
+    // ---- FSEvents accumulated flags under the debouncer ----
+
+    /// A notify watcher the test drives by hand, behind the filter
+    /// `FsEventsWatcher` installs on macOS.
+    struct Injected;
+
+    static INJECTED: StdMutex<Option<Box<dyn notify::EventHandler>>> = StdMutex::new(None);
+
+    impl NotifyWatcher for Injected {
+        fn new<F: notify::EventHandler>(event_handler: F, _config: Config) -> notify::Result<Self> {
+            *INJECTED.lock().unwrap() = Some(Box::new(FsEventsHistoryFilter {
+                inner: event_handler,
+            }));
+            Ok(Injected)
+        }
+
+        fn watch(&mut self, _path: &Path, _mode: RecursiveMode) -> notify::Result<()> {
+            Ok(())
+        }
+
+        fn unwatch(&mut self, _path: &Path) -> notify::Result<()> {
+            Ok(())
+        }
+
+        fn kind() -> notify::WatcherKind {
+            notify::WatcherKind::NullWatcher
+        }
+    }
+
+    /// What `notify-debouncer-full` emits for the events `feed` hands it,
+    /// in order, the way notify's FSEvents callback splits one record
+    /// (`None` if it emitted nothing within 600 ms).
+    fn debounce_through_the_filter(
+        feed: impl FnOnce(&mut dyn FnMut(EventKind, &Path)),
+    ) -> Option<Vec<RawEvent>> {
+        use notify_debouncer_full::{new_debouncer_opt, NoCache};
+        let (tx, rx) = mpsc::channel();
+        let debouncer = new_debouncer_opt::<_, Injected, _>(
+            Duration::from_millis(50),
+            None,
+            tx,
+            NoCache,
+            Config::default(),
+        )
+        .unwrap();
+        let mut handler = INJECTED.lock().unwrap().take().unwrap();
+        feed(&mut |kind, path| {
+            handler.handle_event(Ok(Event::new(kind).add_path(path.to_path_buf())));
+        });
+        let out = rx
+            .recv_timeout(Duration::from_millis(600))
+            .ok()
+            .map(|batch| {
+                batch
+                    .unwrap()
+                    .iter()
+                    .flat_map(|e| raw_events_for(&e.event))
+                    .collect()
+            });
+        debouncer.stop();
+        out
+    }
+
+    /// The flux finding: one FSEvents record for the deletion of a file
+    /// created earlier carries `ItemCreated | ItemRemoved`. notify splits it
+    /// into `Create` + `Remove`, and the debouncer cancelled the pair, so
+    /// the deletion was never delivered. All cases run in one test: the
+    /// injected handler is a process-wide slot.
+    #[test]
+    fn debouncer_delivers_deletions_and_replacements_reported_with_accumulated_flags() {
+        use notify::event::{CreateKind, RemoveKind};
+        fn record(emit: &mut dyn FnMut(EventKind, &Path), path: &Path) {
+            emit(EventKind::Create(CreateKind::File), path);
+            emit(EventKind::Remove(RemoveKind::File), path);
+        }
+        let td = TempDir::new().unwrap();
+
+        let gone = td.path().join("held.mkv");
+        let got = debounce_through_the_filter(|emit| record(emit, gone.as_path()));
+        assert!(
+            matches!(got.as_deref(), Some([RawEvent::Deleted(p)]) if *p == gone),
+            "the deletion must be delivered: {got:?}"
+        );
+
+        // Removed and re-created: the same flags, and the file is there.
+        let replaced = td.path().join("replaced.mkv");
+        fs::write(&replaced, b"new inode").unwrap();
+        let got = debounce_through_the_filter(|emit| record(emit, replaced.as_path()));
+        assert!(
+            matches!(got.as_deref(), Some([RawEvent::Created(p)]) if *p == replaced),
+            "the replacement must be delivered: {got:?}"
+        );
+
+        // A truly transient file still cancels: its first record was queued
+        // while it existed, the second says created + removed.
+        let transient = td.path().join("transient.part");
+        fs::write(&transient, b"x").unwrap();
+        let got = debounce_through_the_filter(|emit| {
+            emit(EventKind::Create(CreateKind::File), transient.as_path());
+            fs::remove_file(&transient).unwrap();
+            record(emit, transient.as_path());
+        });
+        assert!(
+            got.is_none(),
+            "a transient file is still cancelled: {got:?}"
+        );
+    }
+
+    #[test]
+    fn only_the_stale_half_of_accumulated_flags_is_dropped() {
+        use notify::event::{CreateKind, DataChange, ModifyKind, RemoveKind};
+        let td = TempDir::new().unwrap();
+        let here = td.path().join("here");
+        fs::write(&here, b"x").unwrap();
+        let gone = td.path().join("gone");
+        let ev = |kind, p: &PathBuf| Event::new(kind).add_path(p.clone());
+        let create = EventKind::Create(CreateKind::File);
+        let remove = EventKind::Remove(RemoveKind::File);
+        assert!(!is_stale_fsevents_flag(&ev(create, &here)));
+        assert!(is_stale_fsevents_flag(&ev(create, &gone)));
+        assert!(is_stale_fsevents_flag(&ev(remove, &here)));
+        assert!(!is_stale_fsevents_flag(&ev(remove, &gone)));
+        // An unmount leaves its mount point behind: never dropped.
+        let unmount = Event::new(EventKind::Remove(RemoveKind::Other))
+            .add_path(here.clone())
+            .set_info("mount");
+        assert!(!is_stale_fsevents_flag(&unmount));
+        let write = EventKind::Modify(ModifyKind::Data(DataChange::Content));
+        assert!(!is_stale_fsevents_flag(&ev(write, &gone)));
+    }
+
+    /// The flux repro, on real FSEvents: clone a file in, wait 300 ms,
+    /// delete it. The raw backend reported `Deleted`; the debounced one
+    /// reported nothing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn debounced_watcher_reports_deleting_a_file_cloned_in_earlier() {
+        let td = TempDir::new().unwrap();
+        let src = td.path().join("source.mkv");
+        fs::write(&src, vec![7u8; 4096]).unwrap();
+        let watched = td.path().join("library");
+        fs::create_dir(&watched).unwrap();
+        let events: Events = Arc::new(StdMutex::new(Vec::new()));
+        let opts = WatcherOptions {
+            recursive: true,
+            debounce_ms: Some(75),
+        };
+        let w = make_watcher_with(Arc::clone(&events), opts.clone());
+        w.watch(&watched, opts).unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+
+        let clone = watched.join("cloned.mkv");
+        let status = std::process::Command::new("cp")
+            .arg("-c")
+            .arg(&src)
+            .arg(&clone)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        poll_for(&events, Duration::from_secs(3), |evs| {
+            evs.iter().any(|e| path_matches(e, "cloned.mkv"))
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        fs::remove_file(&clone).unwrap();
+
+        let deleted =
+            |e: &RawEvent| matches!(e, RawEvent::Deleted(_)) && path_matches(e, "cloned.mkv");
+        let got = poll_for(&events, Duration::from_secs(3), |evs| {
+            evs.iter().any(deleted)
+        });
+        assert!(
+            got.iter().any(deleted),
+            "no Deleted for cloned.mkv: {got:?}"
         );
     }
 
