@@ -43,6 +43,14 @@ pub use resume::{
     Durability, ResumeEvent, ResumeSnapshot, RootStat, CURRENT_FORMAT_VERSION,
 };
 
+// flux dogfood — restart without a rescan: replay a root's changes since a
+// saved point from the volume's journal (macOS FSEvents `sinceWhen`).
+pub mod history;
+pub use history::{
+    replay_since, HistoryChanges, HistoryEvent, HistoryFlags, HistoryToken, Replay, ReplayOptions,
+    ReplayReport, RescanReason,
+};
+
 // Phase 2 walker + coalescer; M10 bounds every read it makes.
 pub mod walker;
 pub use walker::{
