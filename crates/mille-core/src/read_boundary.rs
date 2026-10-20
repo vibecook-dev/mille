@@ -1721,11 +1721,14 @@ pub(crate) mod tests {
         let td = tree();
         let slow = td.path().join("slow");
         gate.panics.lock().insert(slow.clone());
-        let reads = boundary(&gate, 100);
-        assert!(matches!(
-            list(&reads, &slow).wait(),
-            Err(ReadFailure::Io(_))
-        ));
+        // The deadline only has to tell "finished with an error" from "never
+        // finished", so it is generous. The panic hook runs on the read thread
+        // before the unwind reaches `catch_unwind`, and on Windows symbolizing
+        // its backtrace (CI sets RUST_BACKTRACE) outlasts 100 ms by itself:
+        // the read answered TimedOut instead of Io.
+        let reads = boundary(&gate, 10_000);
+        let outcome = list(&reads, &slow).wait();
+        assert!(matches!(outcome, Err(ReadFailure::Io(_))), "{outcome:?}");
         assert_eq!(reads.stuck_reads(), 0);
         gate.panics.lock().clear();
         assert!(list(&reads, &slow).wait().is_ok());
