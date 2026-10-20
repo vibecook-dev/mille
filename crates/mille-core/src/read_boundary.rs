@@ -1547,7 +1547,15 @@ pub(crate) mod tests {
 
         // The folder "materializes": the parked call returns.
         gate.release(ReadKind::ListDir, &slow);
-        eventually(Duration::from_secs(2), || reads.stuck_reads() == 0);
+        // Wait for that read to finish, not just to stop counting as stuck.
+        // It ticks progress as soon as the hook returns, which ends "stuck"
+        // while the listing is still being read, and a request in that window
+        // joins it by design (`requests_for_a_read_in_progress_join_it`):
+        // the right names, but no read of its own. Windows' slower `read_dir`
+        // left that window open long enough to hit.
+        eventually(Duration::from_secs(2), || {
+            reads.stuck_reads() == 0 && reads.shared.state.lock().flights.is_empty()
+        });
         let retry = list(&reads, &slow).wait();
         assert_eq!(names(&retry), ["inside.txt", "sub"]);
         assert_eq!(gate.entered(&slow), 2);
