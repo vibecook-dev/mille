@@ -860,9 +860,19 @@ mod tests {
         (out, report)
     }
 
+    /// Each delivered path below `root`, `/`-separated on every platform so
+    /// one set of expectations holds on Windows too, where the lossy string
+    /// of `Movies\Heat (1995)` would never equal `Movies/Heat (1995)`.
     fn rel(root: &Path, map: &BTreeMap<PathBuf, Seen>) -> BTreeSet<String> {
         map.keys()
-            .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned())
+            .map(|p| {
+                p.strip_prefix(root)
+                    .unwrap()
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
             .collect()
     }
 
@@ -1251,7 +1261,8 @@ mod tests {
         let (map, report) = scan(td.path(), &ScanOptions::default(), &patient);
         waker.join().unwrap();
         assert!(report.is_complete(), "{:?}", report.unread);
-        assert_eq!(map.len(), 14);
+        // `library()` holds 13 entries, plus its `heat-link` symlink on Unix.
+        assert_eq!(map.len(), 13 + usize::from(cfg!(unix)));
     }
 
     #[cfg(unix)]
