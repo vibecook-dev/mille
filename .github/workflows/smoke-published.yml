@@ -119,7 +119,7 @@ jobs:
             image: node:20-alpine
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The Alpine image already ships Node 20; setup-node here would install a
       # glibc build on the host and defeat the point of the musl jobs.
