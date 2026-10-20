@@ -39,8 +39,8 @@ pub use snapshot::{
 // and the resume-diff walker (events_since / ResumeEvent).
 pub mod resume;
 pub use resume::{
-    events_since, read_snapshot, write_snapshot, ResumeEvent, ResumeSnapshot, RootStat,
-    CURRENT_FORMAT_VERSION,
+    events_since, read_snapshot, write_snapshot, write_snapshot_from, write_snapshot_from_with,
+    Durability, ResumeEvent, ResumeSnapshot, RootStat, CURRENT_FORMAT_VERSION,
 };
 
 // Phase 2 walker + coalescer; M10 bounds every read it makes.
