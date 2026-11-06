@@ -54,7 +54,16 @@ replaces it by writing a new file and renaming it over, never by writing into a
 link.
 
 **One drive per root.** `Drive::open` takes `LOCK` exclusively (`flock` on Unix,
-a share-nothing open on Windows) and fails `EBUSY` while another holds it.
+a share-nothing open on Windows) and fails `EBUSY` while another holds it. A
+host's own `staging_dir` is the drive's alone the same way (`LOCK.mdrive` in it,
+since `open` sweeps its `mdrive-*` temporaries), and must be on the drive's
+volume: `open` renames one staged file into `objects/` to prove it (`EINVAL`).
+
+**Host views.** `build_into` builds a version into a folder of the host's,
+never inside the drive, at its root or above it (`EINVAL`). With `replace`, the
+new tree is built beside the old one and swapped in by two renames: the folder
+is briefly absent, and a crash between them leaves the old tree beside it,
+which the next `build_into` to that folder removes.
 
 ## Ids
 
@@ -98,8 +107,11 @@ and a drive mints a fresh Loro peer id every time it opens.
 `HoldPolicy` says what a drive holds eagerly: every item's current version, a
 kept item's current version (or, with `KeptScope::All`, every version), and the
 attachments of what it holds. `wants()` is what that policy names and the drive
-does not hold yet. `gc` removes every object the policy, a build under `built/`
-and the host's own views (`GcOptions::keep`) do not name.
+does not hold yet, less any object every reference declares over
+`max_object_bytes`: such an object can never be held here, so it is counted
+(`SyncStatus::oversized`) rather than pulled and refused again and again. `gc`
+removes every object the policy, a build under `built/` and the host's own
+views (`GcOptions::keep`) do not name.
 
 ## Sync
 
@@ -115,16 +127,26 @@ going, `sync_handle` on each frame, `sync_local_changed` after a local write,
   admits it, consuming the file) or `sync_pull_failed(from, digest)`. The drive
   chooses holders and retries; a host never retries on its own.
 
+`sync_tick` is the drive's clock. A holder a pull failed from is tried again
+after 1, 2, 4 … ticks, doubling with each failure in a row up to
+`MAX_BACKOFF_TICKS` (64), and a peer that closes and comes back starts clean. A
+pull still unsettled after `PULL_EXPIRY_TICKS` (30) counts as failed, so a
+transfer that never ends cannot hold a pull slot for good; a host that times
+its own pulls out sooner reports `sync_pull_failed` as usual.
+
 Frames are a version byte (`1`) and a bincode body: `Hello {vv}`,
 `Updates {bytes}`, `UpdatesChunk {id, seq, total, bytes}` (an update larger
 than `max_frame_bytes`, reassembled in order before import), `Want {digests}`
-and `Have {digests}` (at most 1024 per frame). Every import runs under
-`catch_unwind`; an update that panics Loro is refused and the document reloaded
-from disk.
+and `Have {digests}` (at most 1024 per frame). An update over
+`max_update_bytes` is refused (`EPROTO`) whole or in chunks, and a longer frame
+before it is decoded. Every import runs under `catch_unwind`; an update that
+panics Loro is refused and the document reloaded from disk. A change, local or
+imported, that cannot be saved is undone the same way, so the document in
+memory never holds what the caller was told failed.
 
 `Transport` is the same contract in Rust, `apply_actions` the loop over it, and
-`MemoryNetwork` an in-process transport for tests (with a partition and a
-damaged-copy fault).
+`MemoryNetwork` an in-process transport for tests (with a partition, a
+damaged-copy fault, and a landing folder of a peer's own).
 
 ## Not in this first cut
 

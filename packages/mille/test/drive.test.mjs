@@ -241,6 +241,29 @@ test(
   },
 );
 
+test('attachments name held objects, and null removes one', needsDrive(), async () => {
+  const dir = tempDir();
+  const drive = Drive.open({ root: join(dir, 'drive'), device: 'desk-a' });
+  try {
+    const page = await putText(drive, dir, 'index.html', '<p>');
+    const version = drive.addVersion('app', [{ path: 'index.html', ...page.object }]);
+    const preview = await putText(drive, dir, 'preview.png', 'pixels');
+    drive.setAttachment('app', version, 'preview', preview.object);
+    assert.deepEqual(drive.item('app').versions[0].attachments, { preview: preview.object });
+
+    const absent = { blake3: 'e'.repeat(64), bytes: 1 };
+    assert.throws(
+      () => drive.setAttachment('app', version, 'other', absent),
+      (e) => isDriveError(e) && e.code === 'ENOENT',
+    );
+    drive.setAttachment('app', version, 'preview', null);
+    assert.deepEqual(drive.item('app').versions[0].attachments, {});
+  } finally {
+    drive.dispose();
+    removeTempDir(dir, 'drive attachments');
+  }
+});
+
 test('a local write is heard, and dispose releases the folder', needsDrive(), async () => {
   const dir = tempDir();
   const rootDir = join(dir, 'drive');

@@ -471,7 +471,7 @@ impl DriveJs {
         Ok(())
     }
 
-    /// Where sync stands, as JSON `{peers, pulling, wants, unsourced}`.
+    /// Where sync stands, as JSON `{peers, pulling, wants, unsourced, oversized}`.
     #[napi(js_name = "syncStatus", catch_unwind)]
     pub fn sync_status(&self) -> Result<String> {
         to_json(&self.drive()?.sync_status())

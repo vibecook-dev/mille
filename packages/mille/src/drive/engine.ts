@@ -191,7 +191,10 @@ export interface BuildIntoOptions {
   readonly mode?: DrivePutMode;
   /** Paths of the version to leave out, for the host to provide its own. */
   readonly except?: readonly string[];
-  /** Replace an existing `dest` (an atomic swap) instead of `EEXIST`. */
+  /**
+   * Replace an existing `dest` instead of `EEXIST`: the new tree is built
+   * beside it and swapped in by two renames, so `dest` is briefly absent.
+   */
   readonly replace?: boolean;
 }
 

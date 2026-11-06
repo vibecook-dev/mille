@@ -1,16 +1,17 @@
 //! Two (and three) drives in one process over `MemoryNetwork`: the DR record's
 //! M-D1 witnesses — a version made on A is in B's document and B holds its
 //! objects; Keep on B is kept on A; a mismatched object is refused — plus
-//! catch-up after a partition, convergence of concurrent `current` writes,
-//! gossip through a middle drive, and an update cut into chunks.
+//! attachments, back-off from a holder whose copy is always damaged, an object
+//! over the receiver's limit, a pull landed outside staging, catch-up after a
+//! partition, convergence of concurrent `current` writes, gossip through a
+//! middle drive, and an update cut into chunks.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use mille_drive::{
-    Blake3, Drive, DriveErrorCode, DriveOptions, FileEntry, MemoryNetwork, PutMode,
-    MIN_FRAME_BYTES,
+    Blake3, Drive, DriveErrorCode, DriveOptions, FileEntry, MemoryNetwork, PutMode, MIN_FRAME_BYTES,
 };
 
 struct Net {
@@ -77,6 +78,26 @@ fn publish(drive: &Drive, scratch: &Path, item: &str, files: &[(&str, &str)]) ->
 
 fn digest_of(data: &str) -> Blake3 {
     Blake3::of(data.as_bytes())
+}
+
+/// Overwrite a held object in place, as rot on the holder's disk would.
+#[allow(clippy::permissions_set_readonly_false)]
+fn rot(path: &Path, data: &str) {
+    let mut perms = fs::metadata(path).unwrap().permissions();
+    perms.set_readonly(false);
+    fs::set_permissions(path, perms).unwrap();
+    fs::write(path, data).unwrap();
+}
+
+/// How many pulls on `peer` were refused as damaged since the last call.
+fn refused_on(net: &Net, peer: &str) -> usize {
+    let mut refused = 0;
+    for (on, err) in net.net.take_errors() {
+        if on == peer && err.code() == DriveErrorCode::Mismatch {
+            refused += 1;
+        }
+    }
+    refused
 }
 
 #[test]
@@ -146,13 +167,117 @@ fn a_mismatched_object_is_refused_still_wanted_and_a_retry_succeeds() {
     assert_eq!(b.wants(), vec![damaged]);
     assert!(!b.item("app").unwrap().versions[0].held);
 
-    // Every holder failed it once; the tick starts over.
+    // One tick of back-off, then the same holder is tried again.
     net.net.tick("b");
     net.net.run_until_quiet();
     assert!(net.net.take_errors().is_empty());
     assert!(b.has(&damaged));
     assert!(b.verify(&damaged).unwrap());
     assert!(b.wants().is_empty());
+}
+
+#[test]
+fn an_attachment_made_on_a_is_held_on_b() {
+    let net = pair();
+    let (a, b) = (net.drive(0), net.drive(1));
+    let version = publish(a, &net.scratch, "app", &[("index.html", "<p>")]);
+    let preview = a.put_bytes(b"a preview's pixels").unwrap().object;
+    a.set_attachment("app", &version, "preview", Some(preview))
+        .unwrap();
+    net.net.local_changed("a");
+    net.net.run_until_quiet();
+    assert!(net.net.take_errors().is_empty());
+
+    let item = b.item("app").unwrap();
+    let attached = item.versions[0].attachments.get("preview");
+    assert_eq!(attached, Some(&preview));
+    assert!(
+        b.has(&preview.blake3),
+        "B holds what is attached to what it holds"
+    );
+    assert!(b.wants().is_empty());
+}
+
+#[test]
+fn a_holder_whose_copy_is_always_damaged_is_tried_less_and_less_often() {
+    let net = pair();
+    let (a, b) = (net.drive(0), net.drive(1));
+    let data = "rots on the holder";
+    publish(a, &net.scratch, "app", &[("a.txt", data)]);
+    // A still holds the object by name and says Have; every copy is refused.
+    rot(
+        &a.object_path(&digest_of(data)).unwrap(),
+        "ROTS ON THE HOLDER",
+    );
+    net.net.local_changed("a");
+    net.net.run_until_quiet();
+
+    let mut tried = Vec::new();
+    for tick in 0..=8 {
+        if tick > 0 {
+            net.net.tick("b");
+            net.net.run_until_quiet();
+        }
+        if refused_on(&net, "b") > 0 {
+            tried.push(tick);
+        }
+    }
+    // At once, then after 1, 2 and 4 ticks: never on every tick.
+    assert_eq!(tried, vec![0, 1, 3, 7]);
+    assert!(!b.has(&digest_of(data)));
+    assert_eq!(b.wants(), vec![digest_of(data)]);
+}
+
+#[test]
+fn an_object_over_the_receivers_limit_is_not_wanted_and_is_counted() {
+    let limits = |name: &str| {
+        let mut options = defaults(name);
+        if name == "b" {
+            options.max_object_bytes = 8;
+        }
+        options
+    };
+    let net = network(&["a", "b"], limits);
+    net.net.connect("a", "b");
+    net.net.run_until_quiet();
+    let (a, b) = (net.drive(0), net.drive(1));
+    let files = [("small.txt", "small"), ("big.txt", "more than eight bytes")];
+    publish(a, &net.scratch, "app", &files);
+    net.net.local_changed("a");
+    net.net.run_until_quiet();
+    assert!(net.net.take_errors().is_empty(), "no pull of it is tried");
+
+    assert!(b.has(&digest_of("small")));
+    assert!(!b.has(&digest_of("more than eight bytes")));
+    assert!(b.wants().is_empty());
+    let status = b.sync_status();
+    assert_eq!((status.wants, status.oversized, status.pulling), (0, 1, 0));
+    assert!(!b.item("app").unwrap().versions[0].held);
+}
+
+#[test]
+fn a_pull_landed_outside_staging_is_admitted_from_there() {
+    let net = pair();
+    let (a, b) = (net.drive(0), net.drive(1));
+    let incoming = net.scratch.join("incoming");
+    net.net.land_pulls_in("b", incoming.clone());
+    publish(
+        a,
+        &net.scratch,
+        "app",
+        &[("index.html", "landed elsewhere")],
+    );
+    net.net.local_changed("a");
+    net.net.run_until_quiet();
+    assert!(net.net.take_errors().is_empty());
+
+    assert!(b.has(&digest_of("landed elsewhere")));
+    assert!(b.verify(&digest_of("landed elsewhere")).unwrap());
+    let left: Vec<_> = fs::read_dir(&incoming).unwrap().collect();
+    assert!(
+        left.is_empty(),
+        "admitting a pull consumes the landed file: {left:?}"
+    );
 }
 
 #[test]
@@ -182,13 +307,19 @@ fn concurrent_current_writes_converge() {
     let (a, b) = (net.drive(0), net.drive(1));
     let v1 = publish(a, &net.scratch, "app", &[("index.html", "one")]);
     let v2 = publish(a, &net.scratch, "app", &[("index.html", "two")]);
+    let v3 = publish(a, &net.scratch, "app", &[("index.html", "three")]);
     net.net.local_changed("a");
     net.net.run_until_quiet();
-    assert_eq!(b.item("app").unwrap().versions.len(), 2);
+    assert_eq!(b.item("app").unwrap().versions.len(), 3);
+    assert_eq!(b.item("app").unwrap().current, Some(v3));
 
+    // Each side moves `current` off v3 while they cannot talk, so each
+    // records a write the other has not seen: a real conflict.
     net.net.partition("a", "b", true);
     a.set_current("app", &v1).unwrap();
     b.set_current("app", &v2).unwrap();
+    assert_eq!(a.item("app").unwrap().current, Some(v1.clone()));
+    assert_eq!(b.item("app").unwrap().current, Some(v2.clone()));
     net.net.local_changed("a");
     net.net.local_changed("b");
     net.net.partition("a", "b", false);
@@ -199,7 +330,7 @@ fn concurrent_current_writes_converge() {
     let on_a = a.item("app").unwrap().current;
     let on_b = b.item("app").unwrap().current;
     assert_eq!(on_a, on_b);
-    assert!(on_a == Some(v1) || on_a == Some(v2));
+    assert!(on_a == Some(v1) || on_a == Some(v2), "{on_a:?}");
 }
 
 #[test]

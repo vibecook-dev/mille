@@ -9,6 +9,8 @@
 //!   built/<item>/<version>/   versions built as folders (hard links)
 //!   staging/        temporaries, all named `mdrive-…`, swept at open
 //! ```
+//!
+//! A host's own `staging_dir` holds `LOCK.mdrive` while the drive is open.
 
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -28,6 +30,10 @@ pub(crate) const TEMP_PREFIX: &str = "mdrive-";
 
 /// Temporaries made beside a destination (a build) start with this.
 pub(crate) const SIBLING_TEMP_PREFIX: &str = ".mdrive-";
+
+/// The lock a drive takes in a host's own staging folder. Not `mdrive-…`, so
+/// no sweep ever removes it.
+pub(crate) const STAGING_LOCK: &str = "LOCK.mdrive";
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -184,9 +190,13 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     fs::rename(tmp, path)
 }
 
-/// Remove what a crash left: `staging/mdrive-*` and `built/<item>/.mdrive-*`.
+/// Remove what a crash left: `staging/mdrive-*`, `objects/mdrive-*` (the
+/// probe `open` renames into a host's staging check) and
+/// `built/<item>/.mdrive-*`. Shards under `objects/` are two hex characters,
+/// never `mdrive-…`.
 pub(crate) fn sweep(layout: &Layout) -> io::Result<()> {
     sweep_prefixed(&layout.staging, TEMP_PREFIX)?;
+    sweep_prefixed(&layout.objects, TEMP_PREFIX)?;
     let items = match fs::read_dir(&layout.built) {
         Ok(items) => items,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -201,7 +211,9 @@ pub(crate) fn sweep(layout: &Layout) -> io::Result<()> {
     Ok(())
 }
 
-fn sweep_prefixed(dir: &Path, prefix: &str) -> io::Result<()> {
+/// Remove every entry of `dir` whose name starts with `prefix`. A missing
+/// `dir` is fine.
+pub(crate) fn sweep_prefixed(dir: &Path, prefix: &str) -> io::Result<()> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -239,19 +251,25 @@ mod tests {
         let layout = Layout::new(dir.path(), None);
         fs::create_dir_all(&layout.staging).unwrap();
         fs::create_dir_all(layout.built.join("item")).unwrap();
+        fs::create_dir_all(layout.objects.join("ab")).unwrap();
         fs::write(layout.staging.join("mdrive-put-1"), b"x").unwrap();
         fs::create_dir_all(layout.staging.join("mdrive-build-2/a")).unwrap();
         fs::write(layout.staging.join("someone-elses"), b"y").unwrap();
+        fs::write(layout.staging.join(STAGING_LOCK), b"").unwrap();
         fs::create_dir_all(layout.built.join("item/.mdrive-build-3")).unwrap();
         fs::create_dir_all(layout.built.join("item/0123")).unwrap();
+        fs::write(layout.objects.join("mdrive-probe-4"), b"").unwrap();
 
         sweep(&layout).unwrap();
 
         assert!(!layout.staging.join("mdrive-put-1").exists());
         assert!(!layout.staging.join("mdrive-build-2").exists());
         assert!(layout.staging.join("someone-elses").exists());
+        assert!(layout.staging.join(STAGING_LOCK).exists());
         assert!(!layout.built.join("item/.mdrive-build-3").exists());
         assert!(layout.built.join("item/0123").exists());
+        assert!(!layout.objects.join("mdrive-probe-4").exists());
+        assert!(layout.objects.join("ab").is_dir());
     }
 
     #[test]

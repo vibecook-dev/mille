@@ -1,6 +1,7 @@
-//! One drive on a real file system: the root's lock, persistence, the rules
-//! `add_version` holds, builds by hard link, host views, GC by references,
-//! the export, a forged version record, and change events.
+//! One drive on a real file system: the root's lock, a host's staging folder,
+//! persistence (and a change that cannot be saved), the rules `add_version`
+//! holds, builds by hard link, host views and where they may not go, GC by
+//! references, the export, a forged version record, and change events.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -57,7 +58,9 @@ fn delete_object(path: &Path) {
 fn a_second_open_of_a_root_is_ebusy() {
     let f = fixture();
     let first = open(&f.root);
-    let err = Drive::open(&f.root, DriveOptions::new("desk")).err().unwrap();
+    let err = Drive::open(&f.root, DriveOptions::new("desk"))
+        .err()
+        .unwrap();
     assert_eq!(err.code(), DriveErrorCode::Busy);
     drop(first);
     open(&f.root);
@@ -112,7 +115,9 @@ fn add_version_needs_every_object_held_at_its_size() {
         bytes: 99,
         ..held.clone()
     };
-    let err = drive.add_version("app", vec![wrong_size], true).unwrap_err();
+    let err = drive
+        .add_version("app", vec![wrong_size], true)
+        .unwrap_err();
     assert_eq!(err.code(), DriveErrorCode::Mismatch);
 
     let files = vec![held.clone()];
@@ -141,7 +146,9 @@ fn intents_name_known_items_and_versions() {
     let err = drive.set_current("app", "not-hex").unwrap_err();
     assert_eq!(err.code(), DriveErrorCode::Invalid);
     // Meta may name an item before its first version.
-    drive.set_meta("later", "source", Some("a fold key")).unwrap();
+    drive
+        .set_meta("later", "source", Some("a fold key"))
+        .unwrap();
 }
 
 #[test]
@@ -154,7 +161,7 @@ fn a_build_is_hard_links_and_idempotent() {
     let built = drive.build("app", &id).unwrap();
     assert_eq!(built, f.root.join("built").join("app").join(&id));
     let app_js = built.join("assets").join("js").join("app.js");
-    assert_eq!(fs::read_to_string(&app_js).unwrap(), "go()");
+    assert_eq!(fs::read_to_string(app_js.as_path()).unwrap(), "go()");
     assert_eq!(drive.build("app", &id).unwrap(), built);
 
     #[cfg(unix)]
@@ -222,6 +229,25 @@ fn build_into_makes_a_host_view_with_exceptions() {
     let inside = f.root.join("mine");
     let err = drive.build_into("app", &id, &inside, &replace).unwrap_err();
     assert_eq!(err.code(), DriveErrorCode::Invalid);
+}
+
+#[test]
+fn build_into_never_replaces_the_drive_or_a_folder_above_it() {
+    let f = fixture();
+    let drive = open(&f.root);
+    let id = version(&drive, f.dir.path(), "app", &[("index.html", "<p>")]);
+    let replace = BuildIntoOptions {
+        replace: true,
+        ..BuildIntoOptions::default()
+    };
+    let above = f.dir.path().to_path_buf();
+    for dest in [f.root.clone(), above, f.root.join("..")] {
+        let err = drive.build_into("app", &id, &dest, &replace).unwrap_err();
+        assert_eq!(err.code(), DriveErrorCode::Invalid, "{}", dest.display());
+    }
+    assert!(f.root.join("drive.loro").is_file());
+    assert!(drive.verify(&Blake3::of(b"<p>")).unwrap());
+    assert_eq!(drive.items().len(), 1);
 }
 
 #[test]
@@ -348,7 +374,71 @@ fn local_writes_tell_the_listeners() {
     let seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 2);
     assert!(seen.iter().all(|change| change.kind == ChangeKind::Local));
-    assert!(seen.iter().all(|change| change.items == vec!["app".to_owned()]));
+    assert!(seen
+        .iter()
+        .all(|change| change.items == vec!["app".to_owned()]));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_change_that_cannot_be_saved_is_not_kept_or_heard() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let f = fixture();
+    let drive = open(&f.root);
+    version(&drive, f.dir.path(), "app", &[("index.html", "x")]);
+    let heard: Arc<Mutex<Vec<DriveChange>>> = Arc::default();
+    let sink = Arc::clone(&heard);
+    drive.subscribe(Arc::new(move |change: &DriveChange| {
+        sink.lock().unwrap().push(change.clone());
+    }));
+
+    fs::set_permissions(&f.root, fs::Permissions::from_mode(0o555)).unwrap();
+    let writable = fs::write(f.root.join("probe"), b"").is_ok();
+    let refused = drive.set_kept("app", true);
+    fs::set_permissions(&f.root, fs::Permissions::from_mode(0o755)).unwrap();
+    if writable {
+        // Run as root, the mode refuses nothing: no save can fail here.
+        return;
+    }
+
+    let err = refused.unwrap_err();
+    assert_eq!(err.code(), DriveErrorCode::Io, "{err}");
+    assert!(
+        !drive.item("app").unwrap().kept,
+        "the refused Keep is not in memory"
+    );
+    assert!(heard.lock().unwrap().is_empty());
+
+    drive.set_kept("app", true).unwrap();
+    assert!(drive.item("app").unwrap().kept);
+    drop(drive);
+    assert!(open(&f.root).item("app").unwrap().kept);
+}
+
+#[test]
+fn a_hosts_staging_folder_is_this_drives_alone() {
+    let f = fixture();
+    let staging = f.dir.path().join("host-staging");
+    let mut options = DriveOptions::new("desk");
+    options.staging_dir = Some(staging.clone());
+    let drive = Drive::open(&f.root, options.clone()).unwrap();
+    let id = version(&drive, f.dir.path(), "app", &[("index.html", "staged")]);
+    drive.build("app", &id).unwrap();
+    assert!(drive.has(&Blake3::of(b"staged")));
+    assert!(!f.root.join("staging").exists());
+    let left: Vec<String> = fs::read_dir(&staging)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(left, vec!["LOCK.mdrive".to_owned()]);
+
+    // Another drive would sweep this one's temporaries at its open.
+    let other = f.dir.path().join("other");
+    let err = Drive::open(&other, options.clone()).err().unwrap();
+    assert_eq!(err.code(), DriveErrorCode::Busy);
+    drop(drive);
+    Drive::open(&other, options).unwrap();
 }
 
 #[test]

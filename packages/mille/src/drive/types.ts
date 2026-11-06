@@ -56,7 +56,11 @@ export interface DriveOptions {
   readonly maxUpdateBytes?: number;
   /** Pulls in flight at once (default 4). */
   readonly maxConcurrentPulls?: number;
-  /** Where temporaries go (default `<root>/staging`); on the drive's volume. */
+  /**
+   * Where temporaries go (default `<root>/staging`). A folder given here must
+   * be on the drive's volume (`EINVAL` at open otherwise) and is this drive's
+   * alone while it is open (`EBUSY` for a second drive).
+   */
   readonly stagingDir?: string;
 }
 
@@ -148,6 +152,11 @@ export interface DriveSyncCounts {
   readonly wants: number;
   /** Wants no open peer has offered. */
   readonly unsourced: number;
+  /**
+   * Objects the hold policy names that this drive can never hold: every
+   * reference declares more than its `maxObjectBytes`. Not wanted, never pulled.
+   */
+  readonly oversized: number;
 }
 
 /**
@@ -192,6 +201,8 @@ export interface DriveSyncStatus {
   readonly pulling: number;
   readonly wants: number;
   readonly unsourced: number;
+  /** Objects over this drive's `maxObjectBytes`: named, never to be held here. */
+  readonly oversized: number;
   /** The last failure, kept until a later one replaces it. */
   readonly lastError: DriveSyncError | null;
 }

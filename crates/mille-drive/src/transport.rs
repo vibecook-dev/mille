@@ -100,6 +100,8 @@ struct Net {
     /// Pairs that cannot reach each other, smaller name first.
     cut: BTreeSet<(String, String)>,
     corrupt_next: BTreeSet<Blake3>,
+    /// Where a peer's pulls land instead of the `into` its drive names.
+    landing: BTreeMap<String, PathBuf>,
     errors: Vec<(String, DriveError)>,
 }
 
@@ -114,7 +116,8 @@ fn pair(a: &str, b: &str) -> (String, String) {
 /// Every registered drive connected to every other, in one process: frames
 /// queue until `run_until_quiet` delivers them, and a pull copies straight
 /// from the holder's object. Fault hooks cut a pair off, or damage the next
-/// copy of an object.
+/// copy of an object; `land_pulls_in` lands a peer's pulls in a folder of its
+/// own, as a transport with its own incoming folder does.
 #[derive(Clone, Default)]
 pub struct MemoryNetwork {
     net: Arc<Mutex<Net>>,
@@ -140,7 +143,7 @@ impl Transport for MemoryTransport {
     }
 
     fn pull(&self, from: &str, digest: &Blake3, into: &Path) -> Result<PathBuf, TransportError> {
-        let (source, corrupt) = {
+        let (source, corrupt, landing) = {
             let mut net = self.net.lock();
             if net.cut.contains(&pair(&self.me, from)) {
                 return Err(TransportError(format!("{from} is unreachable")));
@@ -152,7 +155,8 @@ impl Transport for MemoryTransport {
                 return Err(TransportError(format!("{from} does not hold {digest}")));
             };
             let corrupt = net.corrupt_next.remove(digest);
-            (source, corrupt)
+            let landing = net.landing.get(&self.me).cloned();
+            (source, corrupt, landing)
         };
         let failed = |err: std::io::Error| TransportError(err.to_string());
         let mut bytes = fs::read(source).map_err(failed)?;
@@ -162,11 +166,15 @@ impl Transport for MemoryTransport {
                 None => bytes.push(0),
             }
         }
-        if let Some(parent) = into.parent() {
+        let target = match landing {
+            Some(dir) => dir.join(digest.to_hex()),
+            None => into.to_path_buf(),
+        };
+        if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).map_err(failed)?;
         }
-        fs::write(into, bytes).map_err(failed)?;
-        Ok(into.to_path_buf())
+        fs::write(&target, bytes).map_err(failed)?;
+        Ok(target)
     }
 }
 
@@ -249,6 +257,12 @@ impl MemoryNetwork {
         } else {
             net.cut.remove(&key);
         }
+    }
+
+    /// Land `peer`'s pulls in `dir` (created on the first pull) rather than
+    /// at the `into` its drive names.
+    pub fn land_pulls_in(&self, peer: &str, dir: PathBuf) {
+        self.net.lock().landing.insert(peer.to_owned(), dir);
     }
 
     /// Damage the next copy of `digest` any pull makes.

@@ -113,7 +113,8 @@ pub struct BuildIntoOptionsJs {
     pub mode: Option<String>,
     /// Paths of the version to leave out.
     pub except: Option<Vec<String>>,
-    /// Replace an existing destination (an atomic swap) instead of `EEXIST`.
+    /// Replace an existing destination instead of `EEXIST`, by two renames
+    /// (the destination is briefly absent).
     pub replace: Option<bool>,
 }
 

@@ -59,6 +59,7 @@ const IDLE: DriveSyncStatus = {
   pulling: 0,
   wants: 0,
   unsourced: 0,
+  oversized: 0,
   lastError: null,
 };
 
@@ -269,6 +270,7 @@ class DriveSyncLoop implements DriveSync {
       pulling: counts.pulling,
       wants: counts.wants,
       unsourced: counts.unsourced,
+      oversized: counts.oversized,
       lastError: this.#lastError,
     };
     if (sameStatus(next, this.#status)) return;

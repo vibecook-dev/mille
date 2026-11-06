@@ -38,7 +38,10 @@ pub use drive::{
 pub use error::{DriveError, DriveErrorCode, Result};
 pub use export::ExportDescriptor;
 pub use store::{GcReport, ObjectRef, PutHow, PutMode, PutOutcome};
-pub use sync::{SyncAction, SyncStatus, FRAME_VERSION, MAX_DIGESTS_PER_FRAME};
+pub use sync::{
+    SyncAction, SyncStatus, FRAME_VERSION, MAX_BACKOFF_TICKS, MAX_DIGESTS_PER_FRAME,
+    PULL_EXPIRY_TICKS,
+};
 pub use transport::{
     apply_actions, ApplyReport, MemoryNetwork, MemoryTransport, Transport, TransportError,
 };

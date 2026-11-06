@@ -25,7 +25,8 @@ use crate::doc::{DocState, DriveDoc, ImportFailure, VersionRecord, HIDDEN, KEPT}
 use crate::error::{io_err, DriveError, DriveErrorCode, Result};
 use crate::export::ExportDescriptor;
 use crate::layout::{
-    now_ms, remove_tree, set_readonly, sweep, temp_name, write_atomic, Layout, FORMAT,
+    now_ms, remove_file_force, remove_tree, set_readonly, sweep, sweep_prefixed, temp_name,
+    write_atomic, Layout, FORMAT, STAGING_LOCK, TEMP_PREFIX,
 };
 use crate::lock::DriveLock;
 use crate::store::{GcReport, ObjectRef, ObjectStore, PutMode, PutOutcome};
@@ -91,8 +92,11 @@ pub struct DriveOptions {
     /// The largest update a peer may send in chunks.
     pub max_update_bytes: usize,
     pub max_concurrent_pulls: usize,
-    /// Where temporaries go; `<root>/staging` by default. On the drive's
-    /// volume, so a staged file becomes an object by a rename.
+    /// Where temporaries go; `<root>/staging` by default. A folder given here
+    /// must be on the drive's volume, because a staged file becomes an object
+    /// by a rename: `open` tries one (`EINVAL` when it fails). It is this
+    /// drive's alone while open (`EBUSY` for a second drive), because `open`
+    /// sweeps the `mdrive-*` temporaries in it.
     pub staging_dir: Option<PathBuf>,
 }
 
@@ -238,7 +242,10 @@ pub struct BuildIntoOptions {
     pub mode: PutMode,
     /// Paths of the version to leave out, for the host to provide its own.
     pub except: Vec<String>,
-    /// Replace `dest` when it exists (an atomic swap); else `EEXIST`.
+    /// Replace `dest` when it exists; else `EEXIST`. The new tree is built
+    /// beside `dest` and swapped in by two renames, so `dest` is briefly
+    /// absent. A crash between them leaves the old tree beside `dest`, and the
+    /// next `build_into` to `dest` removes it.
     pub replace: bool,
 }
 
@@ -268,6 +275,8 @@ pub struct Drive {
     listeners: Mutex<BTreeMap<u64, ChangeListener>>,
     next_listener: AtomicU64,
     export_root: PathBuf,
+    /// A host's own staging folder's lock (`DriveOptions::staging_dir`).
+    _staging_lock: Option<DriveLock>,
     // Last, so it is released after everything else is dropped.
     _lock: DriveLock,
 }
@@ -299,6 +308,27 @@ fn write_meta(layout: &Layout, device: &str) -> Result<()> {
     let encoded = serde_json::to_vec_pretty(&meta);
     let json = encoded.map_err(|err| DriveError::format(err.to_string()))?;
     write_atomic(&layout.meta, &json).map_err(io_err(&layout.meta))
+}
+
+/// Take a host's staging folder for this drive. Its own lock: another open
+/// drive using it would have its temporaries swept by this one's `open`
+/// (`EBUSY`). And one staged file renamed into `objects/`: on another volume
+/// every put and pull would fail at that rename (`EINVAL`).
+fn own_staging(layout: &Layout) -> Result<DriveLock> {
+    let lock = DriveLock::acquire(&layout.staging.join(STAGING_LOCK))?;
+    let name = temp_name("probe");
+    let staged = layout.staging.join(&name);
+    fs::write(&staged, b"").map_err(io_err(&staged))?;
+    let landed = layout.objects.join(&name);
+    let renamed = fs::rename(&staged, &landed);
+    let _ = remove_file_force(&staged);
+    let _ = remove_file_force(&landed);
+    if let Err(err) = renamed {
+        let shown = layout.staging.display();
+        let message = format!("{shown} is not on the drive's volume: {err}");
+        return Err(DriveError::invalid(message).with_path(&layout.staging));
+    }
+    Ok(lock)
 }
 
 fn load_doc(layout: &Layout) -> Result<DriveDoc> {
@@ -404,23 +434,32 @@ pub(crate) fn catalog(
     items
 }
 
-/// A version's objects, unless it is quarantined.
-fn version_objects(view: &VersionView, attachments: bool, out: &mut BTreeSet<Blake3>) {
+/// A version's objects, unless it is quarantined, each with the smallest size
+/// any reference to it declares.
+fn version_objects(view: &VersionView, attachments: bool, out: &mut BTreeMap<Blake3, u64>) {
     if view.quarantined {
         return;
     }
-    out.extend(view.files.iter().map(|file| file.blake3));
+    let mut add = |digest: Blake3, bytes: u64| {
+        let least = out.entry(digest).or_insert(bytes);
+        *least = (*least).min(bytes);
+    };
+    for file in &view.files {
+        add(file.blake3, file.bytes);
+    }
     if attachments {
-        out.extend(view.attachments.values().map(|object| object.blake3));
+        for object in view.attachments.values() {
+            add(object.blake3, object.bytes);
+        }
     }
 }
 
-/// What the hold policy says this drive holds.
+/// What the hold policy says this drive holds, with declared sizes.
 pub(crate) fn retained_by_policy(
     items: &BTreeMap<String, ItemView>,
     hold: &HoldPolicy,
-) -> BTreeSet<Blake3> {
-    let mut out = BTreeSet::new();
+) -> BTreeMap<Blake3, u64> {
+    let mut out = BTreeMap::new();
     for item in items.values() {
         let current = item.current_version();
         if let (true, Some(version)) = (hold.current, current) {
@@ -489,7 +528,9 @@ fn fingerprints(state: &DocState) -> BTreeMap<String, Blake3> {
 
 impl Drive {
     /// Open (or create) the drive at `root`. `EBUSY` when another `Drive`
-    /// holds it; `EFORMAT` when its metadata or document does not load.
+    /// holds it or its `staging_dir`; `EINVAL` when that folder is not on
+    /// the drive's volume; `EFORMAT` when its metadata or document does not
+    /// load.
     pub fn open(root: &Path, options: DriveOptions) -> Result<Drive> {
         options.validate()?;
         fs::create_dir_all(root).map_err(io_err(root))?;
@@ -499,6 +540,12 @@ impl Drive {
         for dir in [&layout.objects, &layout.built, &layout.staging] {
             fs::create_dir_all(dir).map_err(io_err(dir))?;
         }
+        // Before the sweep, which must never reach another drive's staging.
+        let staging_lock = if options.staging_dir.is_some() {
+            Some(own_staging(&layout)?)
+        } else {
+            None
+        };
         sweep(&layout).map_err(io_err(&layout.root))?;
         let doc = load_doc(&layout)?;
         let built = &layout.built;
@@ -514,6 +561,7 @@ impl Drive {
             listeners: Mutex::new(BTreeMap::new()),
             next_listener: AtomicU64::new(0),
             export_root,
+            _staging_lock: staging_lock,
             _lock: lock,
         })
     }
@@ -580,6 +628,7 @@ impl Drive {
                 version_objects(version, false, &mut retained);
             }
         }
+        let retained: BTreeSet<Blake3> = retained.into_keys().collect();
         self.store.gc(&retained, options.dry_run)
     }
 
@@ -642,7 +691,7 @@ impl Drive {
         check_item_id(item)?;
         self.mutate(item, |doc| {
             let items = catalog(&doc.state(), |_| true);
-            if !items.get(item).is_some_and(|entry| !entry.versions.is_empty()) {
+            if items.get(item).is_none_or(|e| e.versions.is_empty()) {
                 return Err(unknown_item(item));
             }
             doc.set_flag(map, item, value)
@@ -696,11 +745,28 @@ impl Drive {
         self.missing(&self.catalog()).into_iter().collect()
     }
 
-    /// What the hold policy retains in `items` and this drive does not hold.
+    /// What the hold policy retains in `items` and this drive does not hold,
+    /// leaving out what it can never hold (see `oversized`).
     pub(crate) fn missing(&self, items: &BTreeMap<String, ItemView>) -> BTreeSet<Blake3> {
-        let mut missing = retained_by_policy(items, &self.options.hold);
-        missing.retain(|digest| !self.store.has(digest));
-        missing
+        let max = self.options.max_object_bytes;
+        let retained = retained_by_policy(items, &self.options.hold);
+        let wanted = |(digest, bytes): &(Blake3, u64)| *bytes <= max && !self.store.has(digest);
+        retained
+            .into_iter()
+            .filter(wanted)
+            .map(|(digest, _)| digest)
+            .collect()
+    }
+
+    /// How many objects the hold policy names that this drive can never hold:
+    /// every reference to each declares more than `max_object_bytes`. They are
+    /// not wanted, so no pull of one is tried again and again; the count is
+    /// for an honest status (DR-L8).
+    pub(crate) fn oversized(&self, items: &BTreeMap<String, ItemView>) -> usize {
+        let max = self.options.max_object_bytes;
+        let retained = retained_by_policy(items, &self.options.hold);
+        let over = |(digest, bytes): &(Blake3, u64)| *bytes > max && !self.store.has(digest);
+        retained.into_iter().filter(over).count()
     }
 
     // ── builds and the export (DR-D8 (a)) ────────────────────────────────
@@ -732,7 +798,9 @@ impl Drive {
 
     /// Build a version into a host's own folder, `dest`, outside the drive.
     /// `except` leaves paths out for the host to provide; `replace` swaps an
-    /// existing `dest` for the new tree atomically.
+    /// existing `dest` for the new tree (see `BuildIntoOptions::replace`).
+    /// `dest` is never inside the drive, the drive's root or a folder above
+    /// it (`EINVAL`): replacing one of those would delete the drive.
     pub fn build_into(
         &self,
         item: &str,
@@ -752,8 +820,13 @@ impl Drive {
         let real_parent = fs::canonicalize(parent).map_err(io_err(parent))?;
         let root = &self.layout.root;
         let real_root = fs::canonicalize(root).map_err(io_err(root))?;
-        if real_parent.starts_with(&real_root) {
-            let message = format!("{} is inside the drive", dest.display());
+        // `dest` as the name a rename moves (never a link's target), and,
+        // when it exists, what it resolves to.
+        let real_dest = real_parent.join(name);
+        let resolved = fs::canonicalize(dest).ok();
+        let overlaps = |path: &Path| path.starts_with(&real_root) || real_root.starts_with(path);
+        if overlaps(&real_dest) || resolved.as_deref().is_some_and(overlaps) {
+            let message = format!("{} is the drive, inside it or above it", dest.display());
             return Err(DriveError::invalid(message).with_path(dest));
         }
         let exists = fs::symlink_metadata(dest).is_ok();
@@ -764,6 +837,9 @@ impl Drive {
         }
         let name = name.to_string_lossy();
         let except: BTreeSet<String> = options.except.iter().cloned().collect();
+        let _gate = self.build_gate.lock();
+        // What an interrupted build_into to `dest` left beside it.
+        let _ = sweep_prefixed(parent, &format!(".{name}.{TEMP_PREFIX}"));
         let tmp = parent.join(format!(".{name}.{}", temp_name("build")));
         if let Err(err) = materialize(&self.store, &files, &tmp, options.mode, &except) {
             let _ = remove_tree(&tmp);
@@ -916,18 +992,33 @@ impl Drive {
         write_atomic(path, &bytes).map_err(io_err(path))
     }
 
+    /// Persist `doc`. When that fails, put back what is on disk, so a change
+    /// the caller hears failed is not kept in memory and synced anyway
+    /// (DR-L8). The reload mints a fresh peer id, as every open does, so the
+    /// discarded changes' ids are never reused.
+    fn persist_or_reload(&self, doc: &mut DriveDoc) -> Result<()> {
+        let Err(err) = self.persist(doc) else {
+            return Ok(());
+        };
+        if let Ok(fresh) = load_doc(&self.layout) {
+            *doc = fresh;
+        }
+        Err(err)
+    }
+
     /// Run `write` against the document, commit, and — when it changed the
     /// document — persist and tell the listeners. `write` checks everything
-    /// before it writes anything, so a refusal leaves no half-made change.
+    /// before it writes anything, so a refusal leaves no half-made change,
+    /// and a change that cannot be saved is undone.
     fn mutate(&self, item: &str, write: impl FnOnce(&DriveDoc) -> Result<()>) -> Result<()> {
         let changed = {
-            let doc = self.doc.lock();
+            let mut doc = self.doc.lock();
             let before = doc.oplog_vv();
             write(&doc)?;
             doc.commit();
             let changed = doc.oplog_vv() != before;
             if changed {
-                self.persist(&doc)?;
+                self.persist_or_reload(&mut doc)?;
             }
             changed
         };
@@ -976,7 +1067,9 @@ impl Drive {
                 ));
             }
         }
-        self.persist(&doc)?;
+        // An update that cannot be saved is refused whole; the peer sends it
+        // again after the next `Hello`.
+        self.persist_or_reload(&mut doc)?;
         let new = doc.state();
         let after = doc.oplog_vv();
         drop(doc);

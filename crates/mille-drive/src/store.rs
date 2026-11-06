@@ -157,13 +157,25 @@ fn regular_file(path: &Path) -> Result<fs::Metadata> {
     Ok(meta)
 }
 
-/// Whether two stats of one file say its content cannot have changed between
-/// them: same length and, where the stat is the inode's own, same
-/// modification time. NTFS caches times per directory entry, so a second
-/// name's times can lag; Windows compares length alone.
-fn same_stamp(before: &fs::Metadata, after: &fs::Metadata) -> bool {
-    let same_time = cfg!(windows) || before.modified().ok() == after.modified().ok();
-    before.len() == after.len() && same_time
+/// Whether two stats name one file whose content has not visibly changed
+/// between them: the same device and inode, length and modification time. A
+/// path swapped for another file in between fails the inode check, however
+/// alike the two files' sizes and times are.
+#[cfg(unix)]
+fn same_file(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let same_inode = (before.dev(), before.ino()) == (after.dev(), after.ino());
+    let same_time = before.modified().ok() == after.modified().ok();
+    same_inode && same_time && before.len() == after.len()
+}
+
+/// Without Unix's inode in std, and with NTFS caching times per directory
+/// entry (a second name's can lag), only the length compares here;
+/// `put_by_link` hashes the linked name again instead.
+#[cfg(not(unix))]
+fn same_file(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    before.len() == after.len()
 }
 
 impl ObjectStore {
@@ -221,9 +233,12 @@ impl ObjectStore {
     }
 
     /// Hash `src` where it is, then link it in. Hashing in place means an
-    /// object the drive already holds costs no link at all; the stat taken
-    /// before hashing is compared with the linked file's, so a source that
-    /// changed in between is refused rather than published under a stale name.
+    /// object the drive already holds costs no link at all. The stat taken
+    /// before hashing is compared with the linked file's (`same_file`), and
+    /// where there is no inode to compare the linked name is hashed again, so
+    /// a source swapped for another file in between is refused rather than
+    /// published under a stale name. A write into the shared inode itself, in
+    /// place and at any time, is what `verify` exists to find.
     fn put_by_link(
         &self,
         src: &Path,
@@ -245,9 +260,10 @@ impl ObjectStore {
             return Ok(LinkAttempt::Refused(err));
         }
         let unchanged = match fs::symlink_metadata(&tmp) {
-            Ok(after) => same_stamp(before, &after) && after.len() == bytes,
+            Ok(after) => same_file(before, &after) && after.len() == bytes,
             Err(_) => false,
         };
+        let unchanged = unchanged && (cfg!(unix) || self.hashes_to(&tmp, &digest));
         if !unchanged {
             let _ = remove_file_force(&tmp);
             let message = format!("{} changed while it was being put", src.display());
@@ -259,6 +275,12 @@ impl ObjectStore {
             PutHow::Existed
         };
         Ok(LinkAttempt::Done(PutOutcome { object, how }))
+    }
+
+    /// Whether the file at `path` hashes to `digest`, within the size limit.
+    fn hashes_to(&self, path: &Path, digest: &Blake3) -> bool {
+        let hashed = hash_file(path, self.max_object_bytes);
+        hashed.is_ok_and(|(actual, _)| actual == *digest)
     }
 
     fn put_by_copy(&self, src: &Path, expect: Option<&Blake3>) -> Result<PutOutcome> {
@@ -574,10 +596,32 @@ mod tests {
         let (dir, store) = store(1 << 20);
         let target = source(&dir, "real", b"r");
         let link = dir.path().join("link");
-        std::os::unix::fs::symlink(&target, &link).unwrap();
+        std::os::unix::fs::symlink(target, &link).unwrap();
         let mode = PutMode::LinkOrCopy;
         let err = store.put_file(&link, mode, None).unwrap_err();
         assert_eq!(err.code(), DriveErrorCode::Invalid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn another_file_of_the_same_length_and_time_is_not_the_same_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let one = source(&dir, "one", b"same size");
+        let two = source(&dir, "two", b"SAME SIZE");
+        let time = fs::metadata(&one).unwrap().modified().unwrap();
+        let file = OpenOptions::new().write(true).open(&two).unwrap();
+        file.set_modified(time).unwrap();
+        drop(file);
+
+        let a = fs::symlink_metadata(&one).unwrap();
+        let b = fs::symlink_metadata(&two).unwrap();
+        assert_eq!(a.len(), b.len());
+        assert_eq!(a.modified().unwrap(), b.modified().unwrap());
+        assert!(
+            !same_file(&a, &b),
+            "a swapped-in file must not pass for the hashed one"
+        );
+        assert!(same_file(&a, &fs::symlink_metadata(&one).unwrap()));
     }
 
     #[test]

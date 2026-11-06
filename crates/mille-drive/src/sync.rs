@@ -25,6 +25,12 @@
 //! report back: `sync_pulled` with the landed path, which verifies it (DR-L3),
 //! or `sync_pull_failed`. Either way the drive picks the next holder itself;
 //! a host never retries on its own.
+//!
+//! **Retries.** `sync_tick` is the drive's clock. A holder a pull failed from
+//! is tried again after 1, 2, 4 … ticks, doubling with each failure in a row,
+//! at most `MAX_BACKOFF_TICKS`; a pull that has not settled after
+//! `PULL_EXPIRY_TICKS` counts as failed. An object every reference declares
+//! over `max_object_bytes` is not wanted at all (`SyncStatus::oversized`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::panic::catch_unwind;
@@ -50,19 +56,33 @@ const MAX_CHUNKS: u32 = 1 << 20;
 const MAX_PEER_WANTED: usize = 65_536;
 /// bincode's allocation ceiling while decoding one frame.
 const FRAME_DECODE_LIMIT: usize = 1 << 30;
+/// The longest a failed holder of an object waits, in ticks, to be tried
+/// again.
+pub const MAX_BACKOFF_TICKS: u64 = 64;
+/// Ticks after which a pull that has not settled counts as failed, so a
+/// transfer that never ends cannot hold one of `max_concurrent_pulls` for good.
+pub const PULL_EXPIRY_TICKS: u64 = 30;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Frame {
-    Hello { vv: Vec<u8> },
-    Updates { bytes: Vec<u8> },
+    Hello {
+        vv: Vec<u8>,
+    },
+    Updates {
+        bytes: Vec<u8>,
+    },
     UpdatesChunk {
         id: u64,
         seq: u32,
         total: u32,
         bytes: Vec<u8>,
     },
-    Want { digests: Vec<[u8; 32]> },
-    Have { digests: Vec<[u8; 32]> },
+    Want {
+        digests: Vec<[u8; 32]>,
+    },
+    Have {
+        digests: Vec<[u8; 32]>,
+    },
 }
 
 /// What the host does next.
@@ -91,6 +111,10 @@ pub struct SyncStatus {
     pub wants: usize,
     /// Wants no open peer has offered: waiting for a holder to appear.
     pub unsourced: usize,
+    /// Objects the hold policy names that this drive can never hold: every
+    /// reference to each declares more than its `max_object_bytes`. They are
+    /// not wanted and never pulled; a version naming one stays `held: false`.
+    pub oversized: usize,
 }
 
 #[derive(Default)]
@@ -98,13 +122,50 @@ pub(crate) struct SyncState {
     peers: BTreeMap<String, PeerState>,
     /// Peers that said `Have`, per wanted object, in the order they said it.
     holders: BTreeMap<Blake3, Vec<String>>,
-    /// Peers a pull of the object failed from.
-    failed: BTreeMap<Blake3, BTreeSet<String>>,
-    /// The peer each object is being pulled from.
-    inflight: BTreeMap<Blake3, String>,
+    /// Per wanted object, the peers a pull of it failed from, and when each
+    /// may be tried again.
+    failed: BTreeMap<Blake3, BTreeMap<String, Backoff>>,
+    /// The pull in flight for each object.
+    inflight: BTreeMap<Blake3, InflightPull>,
     /// Wants already asked of every open peer.
     asked: BTreeSet<Blake3>,
     next_chunk_id: u64,
+    /// `sync_tick`s so far: the clock of back-offs and of pull expiry.
+    ticks: u64,
+}
+
+struct InflightPull {
+    from: String,
+    /// The tick it started on.
+    since: u64,
+}
+
+/// One holder's failures of one object, in a row.
+#[derive(Default)]
+struct Backoff {
+    failures: u32,
+    /// The tick from which the holder may be tried again.
+    until: u64,
+}
+
+impl SyncState {
+    /// The pull of `digest` from `peer` failed, if it is the one in flight:
+    /// free its slot and back that holder off. A second report of one
+    /// failure (a refused copy, then the host's `sync_pull_failed`) finds no
+    /// pull in flight and counts nothing.
+    fn end_failed(&mut self, digest: &Blake3, peer: &str) {
+        let in_flight = self.inflight.get(digest).is_some_and(|p| p.from == peer);
+        if !in_flight {
+            return;
+        }
+        self.inflight.remove(digest);
+        let now = self.ticks;
+        let holders = self.failed.entry(*digest).or_default();
+        let backoff = holders.entry(peer.to_owned()).or_default();
+        backoff.failures = backoff.failures.saturating_add(1);
+        let doubled = 1u64.checked_shl(backoff.failures - 1).unwrap_or(u64::MAX);
+        backoff.until = now.saturating_add(doubled.min(MAX_BACKOFF_TICKS));
+    }
 }
 
 #[derive(Default)]
@@ -175,6 +236,11 @@ fn decode_vv(bytes: &[u8]) -> Result<VersionVector> {
         Ok(Ok(vv)) => Ok(vv),
         _ => Err(DriveError::format("a version vector did not decode")),
     }
+}
+
+fn over_update_limit(bytes: usize, max: usize) -> DriveError {
+    let message = format!("{bytes} bytes of update is over the drive's {max}-byte limit");
+    DriveError::proto(message)
 }
 
 fn digests_of(raw: Vec<[u8; 32]>) -> Result<Vec<Blake3>> {
@@ -261,12 +327,21 @@ impl Drive {
     }
 
     /// A frame from `peer`. `EPROTO` or `EFORMAT` for a frame this drive
-    /// cannot accept; the peer stays open.
+    /// cannot accept; the peer stays open. An update over `max_update_bytes`
+    /// is `EPROTO` whether it came whole or in chunks, and a frame that could
+    /// only carry one is refused before it is decoded.
     pub fn sync_handle(&self, peer: &str, frame: &[u8]) -> Result<Vec<SyncAction>> {
+        let max = self.options.max_update_bytes;
+        if frame.len() > max.saturating_add(FRAME_OVERHEAD) {
+            return Err(over_update_limit(frame.len(), max));
+        }
         match decode_frame(frame)? {
             Frame::Hello { vv } => {
                 let theirs = decode_vv(&vv)?;
                 self.react(Trigger::Hello(peer, theirs))
+            }
+            Frame::Updates { bytes } if bytes.len() > max => {
+                Err(over_update_limit(bytes.len(), max))
             }
             Frame::Updates { bytes } => self.on_updates(peer, &bytes),
             Frame::UpdatesChunk {
@@ -290,8 +365,9 @@ impl Drive {
     }
 
     /// A pull landed at `landed`. The file is consumed: verified and admitted
-    /// as the object, or refused (`EMISMATCH`) and removed. On a refusal the
-    /// host calls `sync_pull_failed`, which picks the next holder.
+    /// as the object, or refused (`EMISMATCH`) and removed, which counts as
+    /// that holder's failure. On a refusal the host calls `sync_pull_failed`,
+    /// which picks the next holder.
     pub fn sync_pulled(
         &self,
         peer: &str,
@@ -299,7 +375,7 @@ impl Drive {
         landed: &Path,
     ) -> Result<Vec<SyncAction>> {
         if let Err(err) = self.store.admit(digest, None, landed) {
-            self.forget_pull(peer, digest);
+            self.sync.lock().end_failed(digest, peer);
             return Err(err);
         }
         let actions = self.react(Trigger::Pulled(*digest))?;
@@ -311,20 +387,24 @@ impl Drive {
     }
 
     /// A pull from `peer` failed (the transport refused it, or its copy was
-    /// refused). The drive tries the next holder that offered the object;
-    /// when every one has failed, `sync_tick` starts over.
+    /// refused). The drive tries the next holder that offered the object, and
+    /// that one again once its back-off has passed (see the module's
+    /// Retries).
     pub fn sync_pull_failed(&self, peer: &str, digest: &Blake3) -> Result<Vec<SyncAction>> {
         self.react(Trigger::PullFailed(peer, *digest))
     }
 
-    /// Periodically (the host picks the period): greet every peer again, so
-    /// one that missed a frame catches up by version vector, retry pulls whose
-    /// every holder failed, and re-ask for wants no peer has offered.
+    /// Periodically (the host picks the period; it is the drive's clock):
+    /// greet every peer again, so one that missed a frame catches up by
+    /// version vector; count a pull unsettled for `PULL_EXPIRY_TICKS` as
+    /// failed; retry holders whose back-off has passed; and re-ask for wants
+    /// no peer has offered.
     pub fn sync_tick(&self) -> Result<Vec<SyncAction>> {
         self.react(Trigger::Tick)
     }
 
-    /// A peer went away.
+    /// A peer went away. If it comes back, its failures are forgotten: they
+    /// may have been the connection's.
     pub fn sync_close(&self, peer: &str) {
         let mut guard = self.sync.lock();
         let sync = &mut *guard;
@@ -332,11 +412,16 @@ impl Drive {
         for holders in sync.holders.values_mut() {
             holders.retain(|holder| holder != peer);
         }
-        sync.inflight.retain(|_, from| from != peer);
+        for holders in sync.failed.values_mut() {
+            holders.remove(peer);
+        }
+        sync.inflight.retain(|_, pull| pull.from != peer);
     }
 
     pub fn sync_status(&self) -> SyncStatus {
-        let wants = self.wants();
+        let items = self.catalog();
+        let wants = self.missing(&items);
+        let oversized = self.oversized(&items);
         let sync = self.sync.lock();
         let mut unsourced = 0;
         for digest in &wants {
@@ -350,6 +435,7 @@ impl Drive {
             pulling: sync.inflight.len(),
             wants: wants.len(),
             unsourced,
+            oversized,
         }
     }
 
@@ -412,16 +498,6 @@ impl Drive {
             return Ok(None);
         }
         Ok(state.assembly.take().map(|done| done.bytes))
-    }
-
-    fn forget_pull(&self, peer: &str, digest: &Blake3) {
-        let mut guard = self.sync.lock();
-        let sync = &mut *guard;
-        if sync.inflight.get(digest).is_some_and(|from| from == peer) {
-            sync.inflight.remove(digest);
-        }
-        let failed = sync.failed.entry(*digest).or_default();
-        failed.insert(peer.to_owned());
     }
 
     /// Apply one trigger, then do what every trigger implies: send each peer
@@ -497,28 +573,23 @@ impl Drive {
                 sync.failed.remove(&digest);
                 sync.asked.remove(&digest);
             }
-            Trigger::PullFailed(peer, digest) => {
-                if sync.inflight.get(&digest).is_some_and(|from| from == peer) {
-                    sync.inflight.remove(&digest);
-                }
-                let failed = sync.failed.entry(digest).or_default();
-                failed.insert(peer.to_owned());
-            }
+            Trigger::PullFailed(peer, digest) => sync.end_failed(&digest, peer),
             Trigger::Tick => {
+                sync.ticks += 1;
+                let tick = sync.ticks;
                 let peers: Vec<String> = sync.peers.keys().cloned().collect();
                 for peer in &peers {
                     out.push(hello(peer, &ours));
                 }
-                // A want whose every holder failed starts over.
-                let mut exhausted = Vec::new();
-                for (digest, failed) in &sync.failed {
-                    let holders = sync.holders.get(digest);
-                    if holders.is_none_or(|h| h.iter().all(|p| failed.contains(p))) {
-                        exhausted.push(*digest);
+                // A pull that never settled frees its slot, as a failure.
+                let mut expired = Vec::new();
+                for (digest, pull) in &sync.inflight {
+                    if tick.saturating_sub(pull.since) >= PULL_EXPIRY_TICKS {
+                        expired.push((*digest, pull.from.clone()));
                     }
                 }
-                for digest in exhausted {
-                    sync.failed.remove(&digest);
+                for (digest, from) in expired {
+                    sync.end_failed(&digest, &from);
                 }
                 // Ask again for what no peer has offered.
                 let mut lonely = Vec::new();
@@ -577,11 +648,13 @@ impl Drive {
         // Forget the bookkeeping of objects no longer wanted.
         sync.holders.retain(|digest, _| wants.contains(digest));
         sync.failed.retain(|digest, _| wants.contains(digest));
+        sync.failed.retain(|_, holders| !holders.is_empty());
         sync.asked.retain(|digest| wants.contains(digest));
 
-        // Start pulls, up to the limit, each from the first holder that has
-        // not failed it.
+        // Start pulls, up to the limit, each from the first holder that is
+        // not backing off.
         let limit = self.options.max_concurrent_pulls;
+        let tick = sync.ticks;
         for digest in &wants {
             if sync.inflight.len() >= limit {
                 break;
@@ -590,10 +663,17 @@ impl Drive {
                 continue;
             }
             let failed = sync.failed.get(digest);
-            let usable = |holder: &&String| failed.is_none_or(|f| !f.contains(*holder));
-            let source = sync.holders.get(digest).and_then(|h| h.iter().find(usable));
+            let ready = |holder: &&String| {
+                let backoff = failed.and_then(|holders| holders.get(*holder));
+                backoff.is_none_or(|backoff| backoff.until <= tick)
+            };
+            let source = sync.holders.get(digest).and_then(|h| h.iter().find(ready));
             if let Some(from) = source.cloned() {
-                sync.inflight.insert(*digest, from.clone());
+                let pull = InflightPull {
+                    from: from.clone(),
+                    since: tick,
+                };
+                sync.inflight.insert(*digest, pull);
                 let into = self.store.temp_path("pull");
                 let digest = *digest;
                 out.push(SyncAction::Pull { from, digest, into });
@@ -608,6 +688,14 @@ impl Drive {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::drive::{DriveOptions, MIN_FRAME_BYTES};
+    use crate::error::DriveErrorCode;
+    use crate::version::FileEntry;
+
+    fn pulls(actions: &[SyncAction]) -> usize {
+        let is_pull = |action: &&SyncAction| matches!(action, SyncAction::Pull { .. });
+        actions.iter().filter(is_pull).count()
+    }
 
     #[test]
     fn frames_round_trip() {
@@ -656,9 +744,7 @@ mod tests {
 
     #[test]
     fn a_long_want_list_is_split_and_an_oversized_one_refused() {
-        let digests: Vec<Blake3> = (0..2500u32)
-            .map(|i| Blake3::of(&i.to_le_bytes()))
-            .collect();
+        let digests: Vec<Blake3> = (0..2500u32).map(|i| Blake3::of(&i.to_le_bytes())).collect();
         let mut out = Vec::new();
         digest_frames(&mut out, "peer", &digests, false, MAX_DIGESTS_PER_FRAME);
         assert_eq!(out.len(), 3);
@@ -694,10 +780,7 @@ mod tests {
             assert!(size <= 4096, "frame {i} is {size} bytes");
             match decode_frame(frame).unwrap() {
                 Frame::UpdatesChunk {
-                    seq,
-                    total,
-                    bytes,
-                    ..
+                    seq, total, bytes, ..
                 } => {
                     assert_eq!(seq as usize, i);
                     assert_eq!(total as usize, frames.len());
@@ -710,5 +793,75 @@ mod tests {
 
         let small = update_frames(&mut sync, "peer", vec![1, 2, 3], 4096);
         assert_eq!(small.len(), 1);
+    }
+
+    #[test]
+    fn an_update_over_the_limit_is_refused_whole_as_in_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = DriveOptions::new("desk");
+        options.max_frame_bytes = MIN_FRAME_BYTES;
+        options.max_update_bytes = MIN_FRAME_BYTES;
+        let drive = Drive::open(&dir.path().join("drive"), options).unwrap();
+
+        // Just over: it decodes, and is refused as an update.
+        let over = encode_frame(&Frame::Updates {
+            bytes: vec![0; MIN_FRAME_BYTES + 1],
+        });
+        let err = drive.sync_handle("peer", &over).unwrap_err();
+        assert_eq!(err.code(), DriveErrorCode::Proto, "{err}");
+        // Far over: refused before it is decoded.
+        let huge = encode_frame(&Frame::Updates {
+            bytes: vec![0; 4 * MIN_FRAME_BYTES],
+        });
+        let err = drive.sync_handle("peer", &huge).unwrap_err();
+        assert_eq!(err.code(), DriveErrorCode::Proto, "{err}");
+        // Within it, the bytes reach the document, which judges them itself.
+        let fits = encode_frame(&Frame::Updates { bytes: vec![0; 16] });
+        let within = drive.sync_handle("peer", &fits);
+        let refused = within.err().map(|err| err.code());
+        assert_ne!(refused, Some(DriveErrorCode::Proto));
+    }
+
+    #[test]
+    fn a_pull_that_never_settles_expires_and_its_holder_is_tried_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Drive::open(&dir.path().join("a"), DriveOptions::new("a")).unwrap();
+        let b = Drive::open(&dir.path().join("b"), DriveOptions::new("b")).unwrap();
+        let object = a.put_bytes(b"slow").unwrap().object;
+        let file = FileEntry {
+            path: "slow.txt".to_owned(),
+            blake3: object.blake3,
+            bytes: object.bytes,
+        };
+        a.add_version("app", vec![file], true).unwrap();
+        let update = a.export_updates_since(&b.version_vector()).unwrap();
+        b.import_updates(&update).unwrap();
+        assert_eq!(b.wants(), vec![object.blake3]);
+
+        b.sync_open("a").unwrap();
+        let have = encode_frame(&Frame::Have {
+            digests: vec![*object.blake3.as_bytes()],
+        });
+        assert_eq!(pulls(&b.sync_handle("a", &have).unwrap()), 1);
+        assert_eq!(b.sync_status().pulling, 1);
+
+        // The host never reports the pull. It holds its slot until it
+        // expires, a failure like any other: one tick of back-off, then the
+        // holder is tried again.
+        let mut again = None;
+        for tick in 1..=PULL_EXPIRY_TICKS + 1 {
+            if pulls(&b.sync_tick().unwrap()) > 0 {
+                again = Some(tick);
+                break;
+            }
+            let expired = tick >= PULL_EXPIRY_TICKS;
+            assert_eq!(
+                b.sync_status().pulling,
+                usize::from(!expired),
+                "tick {tick}"
+            );
+        }
+        assert_eq!(again, Some(PULL_EXPIRY_TICKS + 1));
+        assert_eq!(b.sync_status().pulling, 1);
     }
 }
