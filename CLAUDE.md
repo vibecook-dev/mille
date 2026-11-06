@@ -10,6 +10,7 @@ same version; `scripts/check-release-versions.mjs` compares them all against `pa
 
 ```
 crates/mille-core/     Pure Rust engine, zero NAPI — walker, watcher, store, snapshot, search
+crates/mille-drive/    The drive, zero NAPI — blake3 object store, Loro doc of versions, I/O-free sync core
 crates/mille-binding/  napi-rs cdylib; marshaling + the undo journal and watch runtime
 crates/mille-bench/    Criterion benches + fixture-tree generators
 packages/mille/        TS client: host/renderer split, wire protocol, mirror, provider SDK
@@ -104,13 +105,21 @@ node scripts/axe-check.mjs                       # real axe in the live playgrou
 - Temp-dir teardown goes through `scripts/test-temp.mjs`, which warns rather than throws (Windows
   delete-pending).
 
-CI (`.github/workflows/ci.yml`) gates a PR on five jobs: `test-rust`, `test-js`, `test-release-profile`
+CI (`.github/workflows/ci.yml`) gates a PR on six jobs: `test-rust`, `test-js`, `test-release-profile`
 (the release profile once carried `panic = "abort"`, which debug builds can never expose), `test-git`
 (the `git` cargo feature on — clippy over the binding and the whole JS suite against a
 `build:napi:git:probe` binary, with `MILLE_EXPECT_GIT=1` so a binary without the engine fails instead
-of skipping; no other job compiles the binding's git half), and `test-windows`. The 8-triple `build`
-matrix compiles binaries but never loads them — that gap is why `test-windows` and
+of skipping; no other job compiles the binding's git half), `test-drive-off` and `test-windows`. The
+8-triple `build` matrix compiles binaries but never loads them — that gap is why `test-windows` and
 `smoke-published.yml` exist.
+
+The `drive` cargo feature is the opposite of `git`: **on by default**, because the published packages
+and a host's plain `build:napi` take no `--features`, and the drive's first host (VibeField's files
+worker) builds mille that way. So every job compiles and loads it — `test-js` runs the drive's tests
+with `MILLE_EXPECT_DRIVE=1` — and `test-drive-off` is the other half: clippy with
+`--no-default-features` and the feature-off contract against a `build:napi:probe:no-drive` binary.
+`@vibecook/mille/drive` is a top-level `src/drive.ts` that imports exactly `./native.js` (a bundling
+host swaps that specifier); never move it under `src/drive/` or route it through `native-loader.js`.
 
 ## Conventions
 
