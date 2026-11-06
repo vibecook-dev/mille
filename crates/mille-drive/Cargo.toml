@@ -18,6 +18,11 @@ path = "src/lib.rs"
 bincode.workspace = true
 blake3.workspace = true
 loro.workspace = true
+# Never imported: listed only so the workspace's exact pins hold loro's family
+# on loro's own line in every resolution, a consumer's included.
+loro-common.workspace = true
+loro-internal.workspace = true
+loro-kv-store.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
 # Version records are JSON text inside the document, so a record is one

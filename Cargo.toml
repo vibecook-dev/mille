@@ -101,6 +101,17 @@ tracing = "0.1"
 # are the ones here too. mille-drive makes no nested container and no shallow
 # snapshot, which keeps it clear of both hazards 1.13's changelog names.
 loro = "=1.13.9"
+# loro asks its own family for caret versions, which admit a release that
+# breaks it: a fresh resolution of loro 1.13.9 takes loro-internal 1.17.1,
+# loro-common 1.17.0 and loro-kv-store 1.17.0, and loro 1.13.9 fails to compile
+# against loro-internal 1.17.1 (measured on 2026-11-06). So the family is pinned
+# exactly to the line loro 1.13.9 was published on (read from crates.io's
+# index), and the four move together in one event. loro-delta 1.13.0, loro-rle
+# 1.6.0 and loro_fractional_index 1.13.0 are each still the newest of its line;
+# the lock holds them.
+loro-common = "=1.13.1"
+loro-internal = "=1.13.9"
+loro-kv-store = "=1.13.9"
 
 
 # Small collections
