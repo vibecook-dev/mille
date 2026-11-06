@@ -583,12 +583,12 @@ jobs:
       fail-fast: false
       matrix:
         settings:
-          - host: macos-14
+          - host: macos-latest
             target: aarch64-apple-darwin
             build: pnpm build:napi --target aarch64-apple-darwin
 
-          # Cross-compile on arm64 macos-14 — macos-13 Intel is retired/scarce.
-          - host: macos-14
+          # Cross-compile on the arm64 macos-latest — macos-13 Intel is retired/scarce.
+          - host: macos-latest
             target: x86_64-apple-darwin
             build: pnpm build:napi --target x86_64-apple-darwin
 
