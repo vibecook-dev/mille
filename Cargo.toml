@@ -4,6 +4,7 @@ members = [
     "crates/mille-git",
     "crates/mille-binding",
     "crates/mille-bench",
+    "crates/mille-drive",
 ]
 resolver = "2"
 
@@ -86,6 +87,31 @@ gix = { version = "0.87.1", default-features = false, features = [
 
 # Structured diagnostics for mille-git (status / diff / commit / open spans).
 tracing = "0.1"
+
+# The drive's document, for `crates/mille-drive` only: a flat set of root maps
+# holding item names, version manifests (path, blake3, size) and intents —
+# never an object's bytes. Pinned exactly because a Loro upgrade changes the
+# encoding two drives exchange, so it moves as one deliberate event across
+# every host that syncs with this one, never by a `cargo update`.
+#
+# Why 1.13.9: it is the first Rust release on the core line of the JS
+# `loro-crdt` 1.13.8 that VibeField pins (crates.io has no Rust 1.13.8). The
+# two never exchange bytes — a host reads a drive only through mille-drive's
+# API — but sharing a line means the snapshot fixes VibeField has measured
+# are the ones here too. mille-drive makes no nested container and no shallow
+# snapshot, which keeps it clear of both hazards 1.13's changelog names.
+loro = "=1.13.9"
+# loro asks its own family for caret versions, which admit a release that
+# breaks it: a fresh resolution of loro 1.13.9 takes loro-internal 1.17.1,
+# loro-common 1.17.0 and loro-kv-store 1.17.0, and loro 1.13.9 fails to compile
+# against loro-internal 1.17.1 (measured on 2026-11-06). So the family is pinned
+# exactly to the line loro 1.13.9 was published on (read from crates.io's
+# index), and the four move together in one event. loro-delta 1.13.0, loro-rle
+# 1.6.0 and loro_fractional_index 1.13.0 are each still the newest of its line;
+# the lock holds them.
+loro-common = "=1.13.1"
+loro-internal = "=1.13.9"
+loro-kv-store = "=1.13.9"
 
 
 # Small collections

@@ -73,7 +73,7 @@ jobs:
       matrix:
         include:
           - target: darwin-arm64
-            host: macos-14
+            host: macos-latest
 
           # An x64 Node on the arm64 runner, under Rosetta, rather than an
           # Intel host. `macos-13` was tried first and never got picked up —
@@ -84,7 +84,7 @@ jobs:
           # darwin-x64 package, and the smoke script asserts the loaded binary
           # agrees.
           - target: darwin-x64
-            host: macos-14
+            host: macos-latest
             node_arch: x64
 
           - target: win32-x64-msvc

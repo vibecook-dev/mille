@@ -41,6 +41,11 @@
         {
           "type": "toml",
           "path": "Cargo.lock",
+          "jsonpath": "$.package[?(@.name.value==='mille-drive')].version"
+        },
+        {
+          "type": "toml",
+          "path": "Cargo.lock",
           "jsonpath": "$.package[?(@.name.value==='mille-binding')].version"
         },
         {

@@ -47,13 +47,18 @@ export interface NativeBinding {
     readonly profile: string;
     readonly target: string;
     readonly panicStrategy?: string;
-    /** Optional cargo features compiled in, e.g. `['git']`. Absent before 0.3.5. */
+    /** Optional cargo features compiled in, e.g. `['drive', 'git']`. Absent before 0.3.5. */
     readonly features?: readonly string[];
   };
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   FileExplorer: any;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   FileReadStream: any;
+  /**
+   * The drive's class, typed by `@vibecook/mille/drive`. In every binary
+   * built with the default features; absent from `--no-default-features`.
+   */
+  readonly Drive?: unknown;
 }
 
 function readPackageVersion(): string {

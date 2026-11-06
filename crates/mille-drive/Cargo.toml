@@ -1,0 +1,39 @@
+[package]
+name = "mille-drive"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The drive engine for mille: a blake3 object store, a Loro document of versions and intents, and a sync core with no I/O of its own. No NAPI."
+
+[lib]
+path = "src/lib.rs"
+
+# Like mille-git, this crate MUST NOT depend on `mille-core`, napi or tokio:
+# it is synchronous and host-agnostic, so any mille host — the napi binding, a
+# daemon, a test — links it alone. Its transport is a trait (`Transport`), and
+# the sync core does no I/O of its own: frames in, actions out.
+[dependencies]
+bincode.workspace = true
+blake3.workspace = true
+loro.workspace = true
+# Never imported: listed only so the workspace's exact pins hold loro's family
+# on loro's own line in every resolution, a consumer's included.
+loro-common.workspace = true
+loro-internal.workspace = true
+loro-kv-store.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+# Version records are JSON text inside the document, so a record is one
+# immutable Loro value rather than a nested container (see `doc.rs`).
+serde_json = "1"
+thiserror.workspace = true
+
+# `flock` for the root's LOCK, and `ENOSPC`/`EDQUOT` for an honest out-of-room
+# error. Already in the lock graph through mille-git and tempfile.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true

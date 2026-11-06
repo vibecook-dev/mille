@@ -31,11 +31,22 @@ read-probe = []
 # every published platform package until its size is measured (§32.1):
 # FileTree-only embedders must not link gix. `build:napi:git*` turn it on.
 git = ["dep:mille-git", "dep:serde_json"]
+# The drive engine (`Drive`, `crates/mille-drive`). ON by default, unlike
+# `git`: the published platform packages are built with no `--features`
+# (`release.yml`), and so is every host that builds mille through its plain
+# `build` script, so a feature that is off by default never reaches them —
+# VibeField's files worker, the drive's first host, among them. The cost is
+# Loro's Rust crate in every `.node`; measure it with
+# `--no-default-features` before arguing it back off.
+drive = ["dep:mille-drive", "dep:serde_json"]
+default = ["drive"]
 
 [dependencies]
 mille-core = { path = "../mille-core" }
 mille-git = { path = "../mille-git", optional = true }
-# Git results cross napi as JSON text (see `src/git.rs`); FileTree never does.
+mille-drive = { path = "../mille-drive", optional = true }
+# Git and drive results cross napi as JSON text (see `src/git.rs`); FileTree
+# never does.
 serde_json = { version = "1", optional = true }
 bincode.workspace = true
 napi.workspace = true

@@ -128,7 +128,12 @@ jobs:
       - name: Typecheck
         run: pnpm -r --if-present typecheck
 
+      # The drive is a default feature, so this binary carries it and the
+      # drive's tests run here. `MILLE_EXPECT_DRIVE=1` makes a binary that
+      # quietly lost it a failure rather than a skip.
       - name: Test
+        env:
+          MILLE_EXPECT_DRIVE: '1'
         run: pnpm -r --if-present test
 
       - name: FileTree structural invariant bench
@@ -383,6 +388,64 @@ jobs:
         run: pnpm -r --if-present test
 
   # ------------------------------------------------------------------
+  # The drive with its feature OFF (crates/mille-drive, the `drive` cargo
+  # feature).
+  #
+  # The drive is the binding's one default feature, the opposite of git: the
+  # published platform packages and a host's plain `build:napi` take no
+  # `--features`, so a feature off by default would never reach the host it
+  # exists for. Every other job therefore compiles and loads it — `test-rust`
+  # tests mille-drive and lints the binding with it on, and `test-js` and
+  # `test-windows` run its napi and sync tests — and none compiles the
+  # binding without it.
+  #
+  # This job is that half: clippy over the binding with
+  # `--no-default-features`, so a `cfg(feature = "drive")` slip cannot hide
+  # until an embedder turns it off, and the drive's JS tests against a binary
+  # built without it, where the native half skips and what remains is the
+  # feature-off contract — the entry still imports, `isNativeDriveAvailable()`
+  # is false, and `Drive.open` refuses with `EUNSUPPORTED`.
+  # ------------------------------------------------------------------
+  test-drive-off:
+    name: Drive (feature off)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile=false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: drive-off
+
+      - name: cargo clippy (drive feature off)
+        run: cargo clippy -p mille-binding --all-targets --no-default-features --features panic-probe -- -D warnings
+
+      - name: Build native (no drive) + TS
+        run: |
+          pnpm --filter @vibecook/mille run build:napi:probe:no-drive
+          pnpm --filter @vibecook/mille run build:ts
+
+      - name: The feature-off contract
+        run: node --test packages/mille/test/drive.test.mjs packages/mille/test/drive-sync.test.mjs
+
+  # ------------------------------------------------------------------
   # The suite on Windows.
   #
   # Every job above runs on ubuntu-latest, and Windows appeared only in the
@@ -520,12 +583,12 @@ jobs:
       fail-fast: false
       matrix:
         settings:
-          - host: macos-14
+          - host: macos-latest
             target: aarch64-apple-darwin
             build: pnpm build:napi --target aarch64-apple-darwin
 
-          # Cross-compile on arm64 macos-14 — macos-13 Intel is retired/scarce.
-          - host: macos-14
+          # Cross-compile on the arm64 macos-latest — macos-13 Intel is retired/scarce.
+          - host: macos-latest
             target: x86_64-apple-darwin
             build: pnpm build:napi --target x86_64-apple-darwin
 
