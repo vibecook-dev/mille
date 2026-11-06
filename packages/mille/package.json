@@ -50,6 +50,10 @@
     "./git": {
       "types": "./dist/git/index.d.ts",
       "import": "./dist/git/index.js"
+    },
+    "./drive": {
+      "types": "./dist/drive.d.ts",
+      "import": "./dist/drive.js"
     }
   },
   "files": [
@@ -69,6 +73,7 @@
     "build:napi:git": "napi build --platform --release --manifest-path ../../crates/mille-binding/Cargo.toml --output-dir . --no-js --features git",
     "build:napi:git:debug": "napi build --platform --manifest-path ../../crates/mille-binding/Cargo.toml --output-dir . --no-js --features git",
     "build:napi:git:probe": "napi build --platform --manifest-path ../../crates/mille-binding/Cargo.toml --output-dir . --no-js --features panic-probe,git",
+    "build:napi:probe:no-drive": "napi build --platform --manifest-path ../../crates/mille-binding/Cargo.toml --output-dir . --no-js --no-default-features --features panic-probe",
     "build:ts": "tsc --build",
     "typecheck": "tsc --noEmit",
     "test": "node ../../scripts/run-tests.mjs --test-concurrency=4",
