@@ -1,6 +1,6 @@
 {
   "name": "@vibecook/mille-win32-arm64-msvc",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "description": "Prebuilt native binary for @vibecook/mille on win32-arm64-msvc.",
   "license": "MIT",
   "repository": {
