@@ -1,5 +1,12 @@
 # mille changelog
 
+## [0.3.6](https://github.com/vibecook-dev/mille/compare/v0.3.5...v0.3.6) (2026-11-12)
+
+
+### Bug Fixes
+
+* **release:** no build-machine paths in the published addons, and the notices they owe ([#46](https://github.com/vibecook-dev/mille/issues/46)) ([f6d28dc](https://github.com/vibecook-dev/mille/commit/f6d28dc1b2171a6336ccf9a88aa00618ca526137))
+
 ## [0.3.5](https://github.com/vibecook-dev/mille/compare/v0.3.4...v0.3.5) (2026-11-06)
 
 
