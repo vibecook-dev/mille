@@ -119,10 +119,20 @@ jobs:
         if: ${{ !matrix.settings.docker }}
         run: pnpm install --frozen-lockfile=false
 
+      # No published addon may name the machine that built it (scripts/release-paths.mjs has the
+      # why: 0.3.5's darwin-arm64 addon carried the runner's home 284 times). The remap reaches
+      # napi's cargo through RUSTFLAGS, and the check reads the addon this step just wrote, before
+      # it is uploaded, so a path that slips through fails this target instead of shipping.
       - name: Build (host)
         if: ${{ !matrix.settings.docker }}
         shell: bash
-        run: ${{ matrix.settings.build }}
+        run: |
+          set -euo pipefail
+          RUSTFLAGS="$(node scripts/release-paths.mjs rustflags)"
+          export RUSTFLAGS
+          echo "RUSTFLAGS=${RUSTFLAGS}"
+          ${{ matrix.settings.build }}
+          node scripts/release-paths.mjs check packages/mille/mille.*.node
 
       - name: Build (docker)
         if: ${{ matrix.settings.docker }}
@@ -156,7 +166,13 @@ jobs:
             npm install -g pnpm@10.33.0 --force
             pnpm config set confirmModulesPurge false
             pnpm install --frozen-lockfile=false
+            # The same remap and check as the host build, computed in here: the container's
+            # checkout (/build), CARGO_HOME and RUSTUP_HOME are not the runner's.
+            RUSTFLAGS="$(node scripts/release-paths.mjs rustflags)"
+            export RUSTFLAGS
+            echo "RUSTFLAGS=${RUSTFLAGS}"
             ${{ matrix.settings.build }}
+            node scripts/release-paths.mjs check packages/mille/mille.*.node
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
