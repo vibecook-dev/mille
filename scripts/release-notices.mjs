@@ -24,9 +24,9 @@
 // What it reads: Cargo.lock and the crate manifests, through cargo-about, for crates/mille-binding
 // with its default features (the `drive` feature on, `git` off). That is exactly what
 // `pnpm build:napi` builds for the release. It never reads the built addons. Build- and
-// dev-dependencies are excluded (about.toml), and so are mille's own path crates, which
-// cargo-about skips by default. They are mille's code, under the LICENSE every package already
-// carries.
+// dev-dependencies are excluded (about.toml). mille's own crates are not: mille-binding,
+// mille-core and mille-drive are listed under MIT with the rest, the same licence as the LICENSE
+// every package already carries.
 //
 // Failing closed: `--fail` makes cargo-about exit non-zero on any crate whose licence it cannot
 // determine, and a file that is missing, carries another package's or version's header, or lists
@@ -70,7 +70,8 @@ function header(pkg, triple) {
     '',
     `${pkg.main} is built for ${triple}`,
     'from crates/mille-binding with its default features, and links the Rust',
-    'crates listed below. Each licence is given once, with every crate it covers.',
+    'crates listed below.',
+    'Each distinct licence text is given once, with every crate it covers.',
     "mille's own code is MIT; see LICENSE.",
   ];
 }
