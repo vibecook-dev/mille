@@ -9,7 +9,8 @@
   },
   "main": "mille.linux-x64-gnu.node",
   "files": [
-    "mille.*.node"
+    "mille.*.node",
+    "THIRD_PARTY_NOTICES.txt"
   ],
   "os": [
     "linux"

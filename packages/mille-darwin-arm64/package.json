@@ -9,7 +9,8 @@
   },
   "main": "mille.darwin-arm64.node",
   "files": [
-    "mille.*.node"
+    "mille.*.node",
+    "THIRD_PARTY_NOTICES.txt"
   ],
   "os": [
     "darwin"

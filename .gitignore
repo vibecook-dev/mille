@@ -30,6 +30,10 @@ packages/mille/index.d.ts
 # napi-rs artifacts dir (output of `napi build` before distribution)
 artifacts/
 
+# Written into each platform package by scripts/release-notices.mjs at release time, from that
+# platform's crate graph. Build output, like the .node beside it.
+packages/mille-*/THIRD_PARTY_NOTICES.txt
+
 # macOS
 .DS_Store
 .AppleDouble

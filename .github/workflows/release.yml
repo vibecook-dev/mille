@@ -119,10 +119,20 @@ jobs:
         if: ${{ !matrix.settings.docker }}
         run: pnpm install --frozen-lockfile=false
 
+      # No published addon may name the machine that built it (scripts/release-paths.mjs has the
+      # why: 0.3.5's darwin-arm64 addon carried the runner's home 284 times). The remap reaches
+      # napi's cargo through RUSTFLAGS, and the check reads the addon this step just wrote, before
+      # it is uploaded, so a path that slips through fails this target instead of shipping.
       - name: Build (host)
         if: ${{ !matrix.settings.docker }}
         shell: bash
-        run: ${{ matrix.settings.build }}
+        run: |
+          set -euo pipefail
+          RUSTFLAGS="$(node scripts/release-paths.mjs rustflags)"
+          export RUSTFLAGS
+          echo "RUSTFLAGS=${RUSTFLAGS}"
+          ${{ matrix.settings.build }}
+          node scripts/release-paths.mjs check packages/mille/mille.*.node
 
       - name: Build (docker)
         if: ${{ matrix.settings.docker }}
@@ -156,7 +166,13 @@ jobs:
             npm install -g pnpm@10.33.0 --force
             pnpm config set confirmModulesPurge false
             pnpm install --frozen-lockfile=false
+            # The same remap and check as the host build, computed in here: the container's
+            # checkout (/build), CARGO_HOME and RUSTUP_HOME are not the runner's.
+            RUSTFLAGS="$(node scripts/release-paths.mjs rustflags)"
+            export RUSTFLAGS
+            echo "RUSTFLAGS=${RUSTFLAGS}"
             ${{ matrix.settings.build }}
+            node scripts/release-paths.mjs check packages/mille/mille.*.node
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -169,11 +185,70 @@ jobs:
           retention-days: 7
 
   # ------------------------------------------------------------------
+  # Third-party notices, in a job with no publish rights.
+  # ------------------------------------------------------------------
+  # Each platform package ships the notices of the crates its addon links
+  # (scripts/release-notices.mjs). Writing them takes a Rust toolchain and a fetched binary, and
+  # needs nothing but the repository: the crate graph comes from Cargo.lock, never from the built
+  # addons. So they are written here, where the token reads this repository and nothing else,
+  # rather than in `publish`, whose `id-token: write` npm's trusted publishing exchanges for a
+  # publish credential. Eight text files cross to `publish` as an artifact. This runs on every
+  # dispatch, publishing or not, so a rehearsal proves the notices as well as the builds.
+  notices:
+    name: Third-party notices
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.1
+
+      # cargo-about is pinned by version and by the sha256 of the exact tarball, and the hash is
+      # checked before the tarball is unpacked: a tool that writes part of what we publish is not
+      # fetched on trust. To move it, take a release at least two weeks old and copy the hash from
+      # its own `.sha256` asset.
+      - name: Install cargo-about
+        shell: bash
+        env:
+          CARGO_ABOUT_VERSION: 0.9.3
+          CARGO_ABOUT_SHA256: 3ad1e94ea1e63d69d1961f4fb15ccbbe9575d906111f96d2cb4dce6df48f71b4
+        run: |
+          set -euo pipefail
+          name="cargo-about-${CARGO_ABOUT_VERSION}-x86_64-unknown-linux-musl"
+          dir="${RUNNER_TEMP}/cargo-about"
+          mkdir -p "$dir"
+          curl -fsSL --retry 3 -o "$dir/$name.tar.gz" \
+            "https://github.com/EmbarkStudios/cargo-about/releases/download/${CARGO_ABOUT_VERSION}/${name}.tar.gz"
+          echo "${CARGO_ABOUT_SHA256}  $dir/$name.tar.gz" | sha256sum --check --strict -
+          tar -xzf "$dir/$name.tar.gz" -C "$dir"
+          echo "$dir/$name" >> "$GITHUB_PATH"
+
+      - name: Write each platform package's third-party notices
+        run: node scripts/release-notices.mjs
+
+      - name: Upload third-party notices
+        uses: actions/upload-artifact@v4
+        with:
+          name: third-party-notices
+          path: packages/mille-*/THIRD_PARTY_NOTICES.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  # ------------------------------------------------------------------
   # Collect artifacts + publish via npm Trusted Publishing (OIDC).
   # ------------------------------------------------------------------
   publish:
     name: Publish to npm
-    needs: build
+    needs: [build, notices]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -231,6 +306,18 @@ jobs:
             exit 1
           fi
           ls -la packages/mille-*/mille.*.node
+
+      # The notices come from the `notices` job, which wrote them with no publish rights. They
+      # land beside each addon and are checked before anything is stamped or published: the
+      # header names this package and version, and the crate list is there.
+      - name: Download third-party notices
+        uses: actions/download-artifact@v4
+        with:
+          name: third-party-notices
+          path: packages
+
+      - name: Verify third-party notices
+        run: node scripts/release-notices.mjs --verify
 
       - name: Stamp optionalDependencies versions
         run: pnpm exec napi pre-publish -t npm --no-gh-release
