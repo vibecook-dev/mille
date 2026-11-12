@@ -9,7 +9,8 @@
   },
   "main": "mille.win32-arm64-msvc.node",
   "files": [
-    "mille.*.node"
+    "mille.*.node",
+    "THIRD_PARTY_NOTICES.txt"
   ],
   "os": [
     "win32"
