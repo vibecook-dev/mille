@@ -1,144 +1,191 @@
-# mille
+<p align="center">
+  <a href="https://vibecook-dev.github.io/mille/">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset=".github/readme/hero-dark.svg">
+      <img src=".github/readme/hero-light.svg" alt="mille: the file tree for the editor you're building" width="100%">
+    </picture>
+  </a>
+</p>
 
-**Native file-explorer primitives for Electron IDEs.**
+<p align="center">
+  <b>A file explorer for your Electron app.</b><br>
+  A Rust engine walks, watches and searches the folder.<br>
+  React draws only the rows on screen.
+</p>
 
-Rust walks, watches, and searches the tree. TypeScript freezes viewport snapshots. React renders hundreds of thousands of rows without breaking a sweat.
+<p align="center">
+  <a href="https://vibecook-dev.github.io/mille/"><b>Website</b></a>&nbsp;&nbsp;·&nbsp;
+  <a href="https://vibecook-dev.github.io/mille/api.html">API</a>&nbsp;&nbsp;·&nbsp;
+  <a href="apps/playground/EMBEDDING_UI.md">Embedding guide</a>&nbsp;&nbsp;·&nbsp;
+  <a href="https://www.npmjs.com/package/@vibecook/mille">npm</a>&nbsp;&nbsp;·&nbsp;
+  <a href="CHANGELOG.md">Changelog</a>
+</p>
 
-**Docs:** [vibecook-dev.github.io/mille](https://vibecook-dev.github.io/mille/) · [API reference](https://vibecook-dev.github.io/mille/api.html) · [npm](https://www.npmjs.com/package/@vibecook/mille)
+<p align="center">
+  <a href="https://github.com/vibecook-dev/mille/actions/workflows/ci.yml"><picture><source media="(prefers-color-scheme: dark)" srcset="https://img.shields.io/github/actions/workflow/status/vibecook-dev/mille/ci.yml?branch=main&label=ci&style=flat-square&labelColor=262624&color=fafaf7"><img src="https://img.shields.io/github/actions/workflow/status/vibecook-dev/mille/ci.yml?branch=main&label=ci&style=flat-square&labelColor=6a6a64&color=0a0a0a" alt="CI"></picture></a>
+  <a href="https://www.npmjs.com/package/@vibecook/mille"><picture><source media="(prefers-color-scheme: dark)" srcset="https://img.shields.io/npm/v/%40vibecook%2Fmille?label=mille&style=flat-square&labelColor=262624&color=fafaf7"><img src="https://img.shields.io/npm/v/%40vibecook%2Fmille?label=mille&style=flat-square&labelColor=6a6a64&color=0a0a0a" alt="@vibecook/mille on npm"></picture></a>
+  <a href="https://www.npmjs.com/package/@vibecook/mille-ui"><picture><source media="(prefers-color-scheme: dark)" srcset="https://img.shields.io/npm/v/%40vibecook%2Fmille-ui?label=mille-ui&style=flat-square&labelColor=262624&color=fafaf7"><img src="https://img.shields.io/npm/v/%40vibecook%2Fmille-ui?label=mille-ui&style=flat-square&labelColor=6a6a64&color=0a0a0a" alt="@vibecook/mille-ui on npm"></picture></a>
+  <a href="LICENSE"><picture><source media="(prefers-color-scheme: dark)" srcset="https://img.shields.io/badge/license-MIT-fafaf7?style=flat-square&labelColor=262624"><img src="https://img.shields.io/badge/license-MIT-0a0a0a?style=flat-square&labelColor=6a6a64" alt="MIT licence"></picture></a>
+</p>
 
-[![npm](https://img.shields.io/npm/v/%40vibecook%2Fmille?style=flat-square&color=7c9cff&label=%40vibecook%2Fmille)](https://www.npmjs.com/package/@vibecook/mille)
-[![npm ui](https://img.shields.io/npm/v/%40vibecook%2Fmille-ui?style=flat-square&color=4ad4b5&label=%40vibecook%2Fmille-ui)](https://www.npmjs.com/package/@vibecook/mille-ui)
-[![CI](https://img.shields.io/github/actions/workflow/status/vibecook-dev/mille/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/vibecook-dev/mille/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](./LICENSE)
+<br>
 
----
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/readme/explorer-dark.png">
+    <img src=".github/readme/explorer-light.png" alt="mille's FileTree beside a file preview: folders open four levels deep, with git status letters on a modified, an added and an untracked file" width="100%">
+  </picture>
+</p>
 
-## Packages
+<p align="center"><sub><code>FileTree</code> in its VibeField theme, on a copy of this repository with a few uncommitted changes. A screenshot, not a mock.</sub></p>
 
-| Package                                                                  | What it is                                                                                         |
-| ------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------- |
-| [`@vibecook/mille`](https://www.npmjs.com/package/@vibecook/mille)       | File-explorer **engine** — Rust core via NAPI, host/renderer split, snapshots, search, decorations |
-| [`@vibecook/mille-ui`](https://www.npmjs.com/package/@vibecook/mille-ui) | React **FileTree** — virtualized ARIA tree, icons, Git badges, commands, DnD                       |
-
-Platform binaries ship as optional deps (`@vibecook/mille-darwin-arm64`, …) and resolve automatically on install.
-
-### Engine highlights
-
-- Parallel walk + gitignore (symlink-aware for pnpm-style `node_modules`)
-- Live watch with rename pairing and volatile-dir throttling
-- Viewport-virtualized mirror with frozen snapshots for React
-- Fuzzy filename search (`nucleo`)
-- Decoration pipeline (Git, lint, agent-rules) including port / UtilityProcess fan-out
-- Crash-resume via atomic snapshot
-
-### UI highlights
-
-- WAI-ARIA 1.2 tree, keyboard model, multi-select, rename / create
-- Soft-duotone, monoline default, and Material icon themes
-- Imperative `FileTreeRef` (`revealPath`, `scrollToRow`, …)
-- Headless entry under a 13&nbsp;KB gzip budget
-
-## Quickstart
+## Embed it
 
 ```bash
-pnpm add @vibecook/mille @vibecook/mille-ui
-# or: npm install @vibecook/mille @vibecook/mille-ui
+npm install @vibecook/mille @vibecook/mille-ui @tanstack/react-virtual
 ```
 
 ```ts
-import { FileExplorer } from '@vibecook/mille';
+// Utility process: the engine
+import { createFileExplorerHost } from '@vibecook/mille/host';
+
+const host = await createFileExplorerHost({
+  roots: ['/path/to/project'],
+  initialWalk: 'roots-only',
+});
+process.parentPort.on('message', ({ ports }) => host.attachPort(wrapMessagePortMain(ports[0])));
+```
+
+```tsx
+// Renderer: connect over the port, and draw
+import { connectFileExplorer } from '@vibecook/mille/port';
 import { FileTree } from '@vibecook/mille-ui';
 import { duotoneIconTheme } from '@vibecook/mille-ui/icons/duotone';
 import '@vibecook/mille-ui/tokens.css';
 
-const fx = new FileExplorer({ roots: ['/path/to/workspace'] });
-await fx.populateFromRoots();
+const fx = await connectFileExplorer(port);
 
-export function Sidebar() {
-  return (
-    <FileTree
-      fx={fx}
-      ariaLabel="Files"
-      rowHeight={22}
-      iconTheme={duotoneIconTheme}
-    />
-  );
-}
+<FileTree fx={fx} ariaLabel="Files" iconTheme={duotoneIconTheme} />;
 ```
 
-For Electron UtilityProcess host/client wiring, packaging, and performance notes see [`packages/mille/EMBEDDING.md`](./packages/mille/EMBEDDING.md).
+`wrapMessagePortMain` is a short adapter for Electron's port, and the main process and preload only pass the port along. The [embedding guide](apps/playground/EMBEDDING_UI.md) has all four files. Needs React 19 and Node 20 or later; CI runs it in Electron 41.
 
-## Documentation
+## How a change reaches the screen
 
-|                       |                                                                                              |
-| --------------------- | -------------------------------------------------------------------------------------------- |
-| **Site**              | https://vibecook-dev.github.io/mille/                                                        |
-| **API**               | https://vibecook-dev.github.io/mille/api.html                                                |
-| **Icons**             | https://vibecook-dev.github.io/mille/icons-preview.html                                      |
-| Embedding             | [`packages/mille/EMBEDDING.md`](./packages/mille/EMBEDDING.md)                               |
-| Types                 | [`packages/mille/api.d.ts`](./packages/mille/api.d.ts)                                       |
-| Changelog             | [`CHANGELOG.md`](./CHANGELOG.md)                                                             |
-| IDE parity assessment | [`planning/IDE_EXPLORER_PARITY_ASSESSMENT.md`](./planning/IDE_EXPLORER_PARITY_ASSESSMENT.md) |
-| IDE parity plan       | [`planning/IDE_EXPLORER_PARITY_PLAN.md`](./planning/IDE_EXPLORER_PARITY_PLAN.md)             |
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/readme/path-dark.svg">
+    <img src=".github/readme/path-light.svg" alt="The path of a change: watcher, store and host in a utility process; a MessagePort; then a mirror and the FileTree in the renderer. Electron main only hands over the port, and rows off screen are sent as ids only." width="100%">
+  </picture>
+</p>
+
+The engine runs in its own process. Your window holds a small frozen mirror, and only the rows in view cross the port as full records.
+
+## What you get
+
+<table>
+  <tr>
+    <td width="33%" valign="top">
+      <picture><source media="(prefers-color-scheme: dark)" srcset=".github/readme/tile-walk-dark.svg"><img src=".github/readme/tile-walk-light.svg" alt="" width="100%"></picture>
+      <b>Parallel walk</b><br>
+      Reads the tree on several threads, and applies <code>.gitignore</code> before it descends.
+    </td>
+    <td width="33%" valign="top">
+      <picture><source media="(prefers-color-scheme: dark)" srcset=".github/readme/tile-watch-dark.svg"><img src=".github/readme/tile-watch-light.svg" alt="" width="100%"></picture>
+      <b>Live watch</b><br>
+      Changes on disk arrive as small deltas, and a rename is paired into one move.
+    </td>
+    <td width="33%" valign="top">
+      <picture><source media="(prefers-color-scheme: dark)" srcset=".github/readme/tile-search-dark.svg"><img src=".github/readme/tile-search-light.svg" alt="" width="100%"></picture>
+      <b>Fuzzy search</b><br>
+      File-name search with <code>nucleo</code>, run in the engine over the whole tree.
+    </td>
+  </tr>
+  <tr>
+    <td width="33%" valign="top">
+      <picture><source media="(prefers-color-scheme: dark)" srcset=".github/readme/tile-rows-dark.svg"><img src=".github/readme/tile-rows-light.svg" alt="" width="100%"></picture>
+      <b>Virtualized rows</b><br>
+      CI runs a 500,000-row tree and fails if more than 100 rows reach the DOM.
+    </td>
+    <td width="33%" valign="top">
+      <picture><source media="(prefers-color-scheme: dark)" srcset=".github/readme/tile-decorations-dark.svg"><img src=".github/readme/tile-decorations-light.svg" alt="" width="100%"></picture>
+      <b>Decorations</b><br>
+      Git status letters, plus diagnostics, test results and editor state from your own providers.
+    </td>
+    <td width="33%" valign="top">
+      <picture><source media="(prefers-color-scheme: dark)" srcset=".github/readme/tile-themes-dark.svg"><img src=".github/readme/tile-themes-light.svg" alt="" width="100%"></picture>
+      <b>Themes</b><br>
+      Five icon themes and two tree themes. Any VS Code file icon theme loads too.
+    </td>
+  </tr>
+</table>
+
+Also: multi-root workspaces, compact folders, file nesting, drag and drop, inline rename, undo for create, rename, move and delete, and a WAI-ARIA tree that CI audits with axe. A Rust panic reaches you as a JavaScript error you can catch, not as a dead editor.
+
+## Over a tailnet
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/readme/remote-dark.svg">
+    <img src=".github/readme/remote-light.svg" alt="A remote workspace: one device has the files and sends the rows in view, then changes, to another device, which draws the same tree. It uses the same protocol as the MessagePort, over a tailnet on truffle." width="100%">
+  </picture>
+</p>
+
+`@vibecook/mille-truffle` serves a folder to another device on your tailnet, over [truffle](https://github.com/vibecook-dev/truffle). The other device runs the same mirror and the same `FileTree`. It is experimental: see its [README](packages/mille-truffle/README.md) and the [mesh demo](apps/mesh-demo).
+
+## Packages
+
+| Need                            | Use                                   |
+| ------------------------------- | ------------------------------------- |
+| A file tree in React            | `@vibecook/mille-ui`                  |
+| The engine                      | `@vibecook/mille`                     |
+| Your own tree UI on the engine  | `@vibecook/mille-ui/headless`         |
+| A workspace on another device   | `@vibecook/mille-truffle`             |
+| A client over WebSocket         | `@vibecook/mille/remote` with `/node` |
+| A virtual file system           | `@vibecook/mille/provider`            |
+| A synced store of file versions | `@vibecook/mille/drive`               |
+
+Prebuilt for macOS, Windows and Linux, on x64 and arm64, with glibc and musl builds for Linux. npm installs the one that matches.
 
 ## Status
 
-**v0.3.0** is on npm. A native panic now surfaces as a catchable JS error instead of aborting the host process — the shipped binary previously took your editor down with it. Plus soft-delete/undo with real file identity on every platform, IDE workflow integration (Phase 5), and the `@vibecook/mille/provider` filesystem boundary. Earlier v0.2: soft-duotone icons, roots-in-deltas, lazy list-on-expand, decorations over the port, shell Git client, Material icons, `FileTreeRef`.
+- **0.x.** The API can still change between releases.
+- **Git** badges come from the `git` on your `PATH`. The native git engine in `crates/mille-git` is not in the published binaries yet.
+- **Symlinked folders** are not walked into by default. `followSymlinks: true` walks them.
+- **Remote workspaces** (`mille-truffle`) are experimental.
 
-## Supported platforms
+<details>
+<summary><b>Development</b></summary>
 
-| Platform          | Package                            |
-| ----------------- | ---------------------------------- |
-| macOS arm64       | `@vibecook/mille-darwin-arm64`     |
-| macOS x64         | `@vibecook/mille-darwin-x64`       |
-| Windows x64       | `@vibecook/mille-win32-x64-msvc`   |
-| Windows arm64     | `@vibecook/mille-win32-arm64-msvc` |
-| Linux x64 glibc   | `@vibecook/mille-linux-x64-gnu`    |
-| Linux arm64 glibc | `@vibecook/mille-linux-arm64-gnu`  |
-| Linux x64 musl    | `@vibecook/mille-linux-x64-musl`   |
-| Linux arm64 musl  | `@vibecook/mille-linux-arm64-musl` |
-
-## Repo layout
-
-```
-crates/mille-core/        Pure-Rust engine (no NAPI)
-crates/mille-binding/     napi-rs bindings (cdylib)
-crates/mille-bench/       Criterion benches
-packages/mille/           TS client + React adapter + EMBEDDING.md
-packages/mille-ui/        React FileTree companion
-packages/mille-{triple}/  Per-platform .node binaries
-docs/                     GitHub Pages site (index, API, icons)
-apps/playground/          Electron playground
-```
-
-## Development
+<br>
 
 ```bash
 pnpm install
-cargo test --workspace --exclude mille-binding
 pnpm --filter @vibecook/mille run build:napi:debug
 pnpm --filter @vibecook/mille run build:ts
-pnpm -r --if-present test
+pnpm --filter @vibecook/mille-ui run build
+pnpm --filter playground dev          # the reference app
+
+cargo test --workspace --exclude mille-binding
+pnpm -r --if-present test             # tests import dist/, so build first
+pnpm bench:watch                      # the watcher benchmark, in Electron
 ```
 
-### Watcher benchmark
+Needs Node 20 or later, pnpm 10, and Rust 1.97.1, which `rust-toolchain.toml` pins. The benchmark is described in [WATCH_BENCH.md](apps/playground/WATCH_BENCH.md). Releases are cut by release-please and published to npm with trusted publishing.
 
-Run the observable Electron/UtilityProcess/MessagePort benchmark against an isolated temporary workspace:
+</details>
 
-```bash
-pnpm bench:watch
-# larger run with a tighter debounce
-pnpm bench:watch -- --operations 1200 --debounce 25
-```
+<br>
 
-The playground displays live mirror and paint-ready latency while an external worker performs create, modify, append, rename, copy, and recursive subtree operations. See [the watcher benchmark guide](./apps/playground/WATCH_BENCH.md) for methodology, options, and JSON reports. Native Criterion benchmarks remain available through `pnpm bench:core`.
+<p align="center">
+  <a href="https://github.com/jamesyong-42">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset=".github/readme/james-yong-dark.svg">
+      <img src=".github/readme/james-yong-light.svg" alt="James Yong" height="14">
+    </picture>
+  </a>
+</p>
 
-### Release
-
-1. Bump versions on publishable packages.
-2. Tag and push: `git tag vX.Y.Z && git push origin vX.Y.Z`
-3. [Release workflow](./.github/workflows/release.yml) builds all 8 NAPI targets and publishes via **npm Trusted Publishing (OIDC)** — no long-lived token.
-
-## License
-
-MIT
+<p align="center">
+  <sub><a href="LICENSE">MIT</a> © 2026 James Yong. mille is a <a href="https://github.com/vibecook-dev">vibecook</a> project.</sub>
+</p>
