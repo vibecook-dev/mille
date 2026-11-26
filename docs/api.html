@@ -1,1438 +1,494 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>API Reference — mille</title>
-  <meta name="description" content="Public API reference for @vibecook/mille and @vibecook/mille-ui. Types, FileExplorer methods, host/client split, and React tree props." />
-  <meta name="theme-color" content="#07080c" />
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Source+Sans+3:ital,wght@0,400;0,500;0,600;0,700;1,400&family=Syne:wght@600;700;800&display=swap" rel="stylesheet" />
-  <style>
-    :root {
-      --void: #07080c;
-      --ink: #0e1016;
-      --panel: #151822;
-      --panel-2: #1a1e2a;
-      --edge: #252a38;
-      --edge-soft: rgba(255, 255, 255, 0.06);
-      --mist: #9aa3b5;
-      --paper: #eef0f6;
-      --paper-dim: #c5cad6;
-      --signal: #7c9cff;
-      --signal-dim: rgba(124, 156, 255, 0.14);
-      --signal-glow: rgba(124, 156, 255, 0.35);
-      --live: #4ad4b5;
-      --live-dim: rgba(74, 212, 181, 0.12);
-      --brass: #c4a574;
-      --brass-dim: rgba(196, 165, 116, 0.14);
-      --git-m: #e3b341;
-      --git-a: #3fb950;
-      --git-d: #f85149;
-      --font-display: "Syne", system-ui, sans-serif;
-      --font-body: "Source Sans 3", system-ui, sans-serif;
-      --font-mono: "IBM Plex Mono", ui-monospace, monospace;
-      --radius: 12px;
-      --radius-sm: 8px;
-      --max: 1180px;
-      --nav-h: 64px;
-      --sidebar-w: 240px;
-      --ease: cubic-bezier(0.22, 1, 0.36, 1);
-    }
-
-    *, *::before, *::after { box-sizing: border-box; }
-    html { scroll-behavior: smooth; scroll-padding-top: calc(var(--nav-h) + 1rem); }
-    @media (prefers-reduced-motion: reduce) {
-      html { scroll-behavior: auto; }
-      *, *::before, *::after {
-        animation-duration: 0.01ms !important;
-        animation-iteration-count: 1 !important;
-        transition-duration: 0.01ms !important;
-      }
-    }
-
-    body {
-      margin: 0;
-      background: var(--void);
-      color: var(--paper);
-      font-family: var(--font-body);
-      font-size: 16.5px;
-      line-height: 1.6;
-      -webkit-font-smoothing: antialiased;
-    }
-
-    a { color: var(--signal); text-decoration: none; }
-    a:hover { text-decoration: underline; text-underline-offset: 3px; }
-    :focus-visible {
-      outline: 2px solid var(--signal);
-      outline-offset: 3px;
-    }
-    code, .mono {
-      font-family: var(--font-mono);
-      font-size: 0.86em;
-    }
-    code:not(pre code) {
-      color: var(--signal);
-      background: var(--signal-dim);
-      padding: 0.12em 0.4em;
-      border-radius: 4px;
-    }
-
-    body::before {
-      content: "";
-      position: fixed;
-      inset: 0;
-      pointer-events: none;
-      z-index: 0;
-      background:
-        radial-gradient(ellipse 70% 40% at 10% -5%, rgba(124, 156, 255, 0.08), transparent 50%),
-        linear-gradient(to right, rgba(124, 156, 255, 0.025) 1px, transparent 1px);
-      background-size: 100% 100%, 48px 100%;
-      mask-image: linear-gradient(to bottom, black, transparent 70%);
-    }
-
-    /* Nav */
-    .nav {
-      position: sticky;
-      top: 0;
-      z-index: 50;
-      height: var(--nav-h);
-      display: flex;
-      align-items: center;
-      backdrop-filter: blur(16px) saturate(1.2);
-      background: rgba(7, 8, 12, 0.78);
-      border-bottom: 1px solid var(--edge-soft);
-    }
-    .nav-inner {
-      width: min(100% - 2.5rem, var(--max));
-      margin-inline: auto;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 1.5rem;
-    }
-    .brand {
-      display: inline-flex;
-      align-items: center;
-      gap: 0.7rem;
-      color: var(--paper);
-      text-decoration: none;
-      font-family: var(--font-display);
-      font-weight: 700;
-      font-size: 1.15rem;
-      letter-spacing: -0.02em;
-    }
-    .brand:hover { text-decoration: none; color: var(--paper); }
-    .brand-mark {
-      width: 28px;
-      height: 28px;
-      border-radius: 7px;
-      background: linear-gradient(145deg, var(--signal) 0%, #4a6fe0 50%, var(--live) 140%);
-      display: grid;
-      place-items: center;
-      box-shadow: 0 0 0 1px rgba(255,255,255,0.12), 0 8px 24px var(--signal-glow);
-    }
-    .brand-mark svg { width: 16px; height: 16px; }
-    .nav-links {
-      display: flex;
-      align-items: center;
-      gap: 0.25rem;
-      list-style: none;
-      margin: 0;
-      padding: 0;
-    }
-    .nav-links a {
-      color: var(--mist);
-      font-size: 0.92rem;
-      font-weight: 500;
-      padding: 0.45rem 0.75rem;
-      border-radius: 6px;
-      text-decoration: none;
-    }
-    .nav-links a:hover {
-      color: var(--paper);
-      background: rgba(255,255,255,0.04);
-      text-decoration: none;
-    }
-    .nav-links a[aria-current="page"] {
-      color: var(--paper);
-      background: rgba(255,255,255,0.06);
-    }
-    .nav-cta {
-      display: inline-flex;
-      padding: 0.5rem 0.9rem !important;
-      background: var(--signal-dim) !important;
-      color: var(--signal) !important;
-      border: 1px solid rgba(124, 156, 255, 0.25);
-      font-weight: 600 !important;
-    }
-    .nav-cta:hover {
-      background: rgba(124, 156, 255, 0.22) !important;
-      color: var(--paper) !important;
-    }
-    .nav-toggle {
-      display: none;
-      background: transparent;
-      border: 1px solid var(--edge);
-      color: var(--paper);
-      border-radius: 8px;
-      padding: 0.45rem 0.65rem;
-      font-family: var(--font-body);
-      font-size: 0.85rem;
-      cursor: pointer;
-    }
-
-    /* Layout shell */
-    .shell {
-      position: relative;
-      z-index: 1;
-      width: min(100% - 2.5rem, var(--max));
-      margin: 0 auto;
-      display: grid;
-      grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
-      gap: 2.5rem;
-      padding: 2rem 0 5rem;
-      align-items: start;
-    }
-
-    /* Sidebar */
-    .toc {
-      position: sticky;
-      top: calc(var(--nav-h) + 1rem);
-      max-height: calc(100vh - var(--nav-h) - 2rem);
-      overflow: auto;
-      padding-right: 0.5rem;
-      scrollbar-width: thin;
-      scrollbar-color: var(--edge) transparent;
-    }
-    .toc-search {
-      width: 100%;
-      margin-bottom: 1rem;
-      padding: 0.55rem 0.75rem;
-      border-radius: 8px;
-      border: 1px solid var(--edge);
-      background: var(--ink);
-      color: var(--paper);
-      font-family: var(--font-body);
-      font-size: 0.88rem;
-    }
-    .toc-search::placeholder { color: var(--mist); }
-    .toc-search:focus {
-      outline: none;
-      border-color: rgba(124, 156, 255, 0.45);
-      box-shadow: 0 0 0 3px var(--signal-dim);
-    }
-    .toc-group {
-      margin-bottom: 1.15rem;
-    }
-    .toc-group h2 {
-      font-family: var(--font-mono);
-      font-size: 0.65rem;
-      font-weight: 500;
-      letter-spacing: 0.1em;
-      text-transform: uppercase;
-      color: var(--brass);
-      margin: 0 0 0.45rem;
-      padding: 0 0.35rem;
-    }
-    .toc-group ul {
-      list-style: none;
-      margin: 0;
-      padding: 0;
-    }
-    .toc-group a {
-      display: block;
-      padding: 0.3rem 0.5rem;
-      border-radius: 6px;
-      color: var(--mist);
-      font-size: 0.84rem;
-      text-decoration: none;
-      border-left: 2px solid transparent;
-      line-height: 1.35;
-    }
-    .toc-group a:hover {
-      color: var(--paper);
-      background: rgba(255,255,255,0.04);
-      text-decoration: none;
-    }
-    .toc-group a.is-active {
-      color: var(--paper);
-      background: var(--signal-dim);
-      border-left-color: var(--signal);
-    }
-    .toc-group a.is-hidden { display: none; }
-
-    /* Content */
-    .content { min-width: 0; }
-    .page-hero {
-      margin-bottom: 2.5rem;
-      padding-bottom: 2rem;
-      border-bottom: 1px solid var(--edge-soft);
-    }
-    .page-hero .eyebrow {
-      font-family: var(--font-mono);
-      font-size: 0.72rem;
-      letter-spacing: 0.1em;
-      text-transform: uppercase;
-      color: var(--live);
-      margin: 0 0 0.75rem;
-    }
-    .page-hero h1 {
-      font-family: var(--font-display);
-      font-weight: 800;
-      font-size: clamp(2rem, 3.5vw, 2.75rem);
-      letter-spacing: -0.03em;
-      line-height: 1.1;
-      margin: 0 0 0.85rem;
-    }
-    .page-hero p {
-      margin: 0;
-      color: var(--paper-dim);
-      font-size: 1.08rem;
-      max-width: 52ch;
-    }
-    .pill-row {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 0.5rem;
-      margin-top: 1.25rem;
-    }
-    .pill {
-      font-family: var(--font-mono);
-      font-size: 0.72rem;
-      color: var(--paper-dim);
-      background: var(--ink);
-      border: 1px solid var(--edge);
-      padding: 0.3rem 0.6rem;
-      border-radius: 999px;
-    }
-    .pill strong { color: var(--signal); font-weight: 500; }
-
-    .api-section {
-      margin-bottom: 3.25rem;
-      scroll-margin-top: calc(var(--nav-h) + 1rem);
-    }
-    .api-section > h2 {
-      font-family: var(--font-display);
-      font-size: 1.45rem;
-      font-weight: 700;
-      letter-spacing: -0.025em;
-      margin: 0 0 0.5rem;
-      padding-top: 0.25rem;
-    }
-    .api-section > .lede {
-      margin: 0 0 1.35rem;
-      color: var(--mist);
-      max-width: 60ch;
-    }
-
-    .entry {
-      background: var(--ink);
-      border: 1px solid var(--edge);
-      border-radius: var(--radius-sm);
-      margin-bottom: 0.75rem;
-      overflow: hidden;
-      scroll-margin-top: calc(var(--nav-h) + 1rem);
-    }
-    .entry.is-filtered-out { display: none; }
-    .entry-head {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: baseline;
-      gap: 0.5rem 0.85rem;
-      padding: 0.9rem 1.1rem;
-      border-bottom: 1px solid var(--edge-soft);
-      background: rgba(0,0,0,0.18);
-    }
-    .entry-name {
-      font-family: var(--font-mono);
-      font-size: 0.92rem;
-      font-weight: 500;
-      color: var(--paper);
-    }
-    .entry-kind {
-      font-family: var(--font-mono);
-      font-size: 0.65rem;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
-      padding: 0.2rem 0.45rem;
-      border-radius: 4px;
-      color: var(--brass);
-      background: var(--brass-dim);
-      border: 1px solid rgba(196,165,116,0.18);
-    }
-    .entry-kind.class { color: var(--signal); background: var(--signal-dim); border-color: rgba(124,156,255,0.2); }
-    .entry-kind.fn { color: var(--live); background: var(--live-dim); border-color: rgba(74,212,181,0.2); }
-    .entry-kind.type { color: #a78bfa; background: rgba(167,139,250,0.12); border-color: rgba(167,139,250,0.2); }
-    .entry-kind.enum { color: var(--git-m); background: rgba(227,179,65,0.12); border-color: rgba(227,179,65,0.2); }
-    .entry-sig {
-      font-family: var(--font-mono);
-      font-size: 0.78rem;
-      color: var(--mist);
-      width: 100%;
-      overflow-x: auto;
-      white-space: nowrap;
-      padding-bottom: 0.1rem;
-    }
-    .entry-sig .p { color: var(--paper-dim); }
-    .entry-sig .t { color: #ffcb6b; }
-    .entry-sig .k { color: #c792ea; }
-    .entry-body {
-      padding: 1rem 1.1rem 1.15rem;
-    }
-    .entry-body p {
-      margin: 0 0 0.75rem;
-      color: var(--paper-dim);
-      font-size: 0.95rem;
-    }
-    .entry-body p:last-child { margin-bottom: 0; }
-
-    .props {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 0.9rem;
-      margin-top: 0.35rem;
-    }
-    .props th {
-      text-align: left;
-      font-family: var(--font-mono);
-      font-size: 0.68rem;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
-      color: var(--mist);
-      font-weight: 500;
-      padding: 0.45rem 0.6rem 0.55rem 0;
-      border-bottom: 1px solid var(--edge);
-    }
-    .props td {
-      padding: 0.65rem 0.75rem 0.65rem 0;
-      border-bottom: 1px solid var(--edge-soft);
-      vertical-align: top;
-      color: var(--paper-dim);
-    }
-    .props tr:last-child td { border-bottom: none; }
-    .props td:first-child {
-      font-family: var(--font-mono);
-      font-size: 0.82rem;
-      color: var(--paper);
-      white-space: nowrap;
-      padding-right: 1rem;
-    }
-    .props td:nth-child(2) {
-      font-family: var(--font-mono);
-      font-size: 0.78rem;
-      color: #ffcb6b;
-      white-space: nowrap;
-      padding-right: 1rem;
-    }
-    .opt {
-      font-size: 0.7rem;
-      color: var(--mist);
-      font-family: var(--font-mono);
-      margin-left: 0.25rem;
-    }
-
-    .method-list {
-      display: flex;
-      flex-direction: column;
-      gap: 0.5rem;
-    }
-    .method {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr);
-      gap: 0.25rem;
-      padding: 0.75rem 0.85rem;
-      border-radius: 8px;
-      background: rgba(0,0,0,0.2);
-      border: 1px solid var(--edge-soft);
-    }
-    .method-sig {
-      font-family: var(--font-mono);
-      font-size: 0.8rem;
-      color: var(--paper);
-      overflow-x: auto;
-    }
-    .method-sig .name { color: #82aaff; }
-    .method-sig .ret { color: #ffcb6b; }
-    .method p {
-      margin: 0;
-      font-size: 0.88rem;
-      color: var(--mist);
-    }
-
-    .callout {
-      padding: 1rem 1.15rem;
-      border-radius: var(--radius-sm);
-      border: 1px solid rgba(124,156,255,0.22);
-      background: var(--signal-dim);
-      color: var(--paper-dim);
-      font-size: 0.92rem;
-      margin-bottom: 1.25rem;
-    }
-    .callout strong { color: var(--paper); }
-
-    .code-block {
-      background: rgba(0,0,0,0.35);
-      border: 1px solid var(--edge-soft);
-      border-radius: 8px;
-      padding: 1rem 1.1rem;
-      overflow-x: auto;
-      font-family: var(--font-mono);
-      font-size: 0.8rem;
-      line-height: 1.7;
-      color: var(--paper-dim);
-      margin: 0.75rem 0 0;
-    }
-    .code-block .kw { color: #c792ea; }
-    .code-block .fn { color: #82aaff; }
-    .code-block .str { color: #c3e88d; }
-    .code-block .cm { color: #5c677a; font-style: italic; }
-    .code-block .ty { color: #ffcb6b; }
-
-    .exports-grid {
-      display: grid;
-      grid-template-columns: repeat(2, 1fr);
-      gap: 0.65rem;
-    }
-    .export-card {
-      padding: 0.9rem 1rem;
-      border: 1px solid var(--edge);
-      border-radius: 8px;
-      background: var(--ink);
-    }
-    .export-card code {
-      display: block;
-      margin-bottom: 0.35rem;
-      font-size: 0.8rem;
-    }
-    .export-card span {
-      font-size: 0.85rem;
-      color: var(--mist);
-    }
-
-    footer {
-      position: relative;
-      z-index: 1;
-      border-top: 1px solid var(--edge-soft);
-      padding: 2rem 0 2.5rem;
-    }
-    .footer-inner {
-      width: min(100% - 2.5rem, var(--max));
-      margin: 0 auto;
-      display: flex;
-      flex-wrap: wrap;
-      justify-content: space-between;
-      gap: 1rem;
-      font-size: 0.88rem;
-      color: var(--mist);
-    }
-    .footer-inner a { color: var(--mist); }
-    .footer-inner a:hover { color: var(--paper); }
-
-    .toc-mobile {
-      display: none;
-      margin-bottom: 1.5rem;
-    }
-
-    @media (max-width: 900px) {
-      .shell {
-        grid-template-columns: 1fr;
-        width: min(100% - 1.5rem, var(--max));
-        gap: 0;
-      }
-      .toc {
-        display: none;
-        position: fixed;
-        top: var(--nav-h);
-        left: 0;
-        right: 0;
-        bottom: 0;
-        max-height: none;
-        z-index: 40;
-        background: rgba(7, 8, 12, 0.97);
-        padding: 1.25rem 1.5rem 2rem;
-        overflow: auto;
-      }
-      .toc.is-open { display: block; }
-      .toc-mobile {
-        display: flex;
-        gap: 0.75rem;
-        align-items: center;
-      }
-      .toc-mobile button {
-        font-family: var(--font-body);
-        font-size: 0.88rem;
-        font-weight: 600;
-        color: var(--signal);
-        background: var(--signal-dim);
-        border: 1px solid rgba(124,156,255,0.25);
-        border-radius: 8px;
-        padding: 0.5rem 0.85rem;
-        cursor: pointer;
-      }
-      .exports-grid { grid-template-columns: 1fr; }
-      .props { display: block; }
-      .props thead { display: none; }
-      .props tr {
-        display: block;
-        padding: 0.75rem 0;
-        border-bottom: 1px solid var(--edge-soft);
-      }
-      .props td {
-        display: block;
-        padding: 0.15rem 0;
-        border: none;
-        white-space: normal !important;
-      }
-      .props td:first-child { color: var(--paper); }
-      .props td:nth-child(2)::before {
-        content: "Type: ";
-        color: var(--mist);
-        font-family: var(--font-body);
-      }
-      .nav-links { display: none; }
-      .nav-links.is-open {
-        display: flex;
-        flex-direction: column;
-        position: absolute;
-        top: var(--nav-h);
-        left: 0;
-        right: 0;
-        background: rgba(10, 11, 16, 0.97);
-        border-bottom: 1px solid var(--edge);
-        padding: 0.75rem 1.25rem 1rem;
-        align-items: stretch;
-      }
-      .nav-toggle { display: inline-flex; }
-      .nav-inner { position: relative; width: min(100% - 1.5rem, var(--max)); }
-    }
-  </style>
-</head>
-<body>
-  <header class="nav">
-    <div class="nav-inner">
-      <a class="brand" href="index.html" aria-label="mille home">
-        <span class="brand-mark" aria-hidden="true">
-          <svg viewBox="0 0 16 16" fill="none">
-            <path d="M3 3.5h4.5v4H3v-4zm5.5 0H13v2H8.5v-2zm0 3.5H13V13H8.5V7zm-5.5 5h4.5v2H3v-2z" fill="#0a0c14" opacity="0.9"/>
-          </svg>
-        </span>
-        mille
-      </a>
-      <button class="nav-toggle" type="button" aria-expanded="false" id="nav-toggle">Menu</button>
-      <ul class="nav-links" id="nav-menu">
-        <li><a href="index.html">Home</a></li>
-        <li><a href="index.html#quickstart">Quickstart</a></li>
-        <li><a href="api.html" aria-current="page">API</a></li>
-        <li><a class="nav-cta" href="https://github.com/vibecook-dev/mille" target="_blank" rel="noopener">GitHub</a></li>
-      </ul>
-    </div>
-  </header>
-
-  <div class="shell">
-    <aside class="toc" id="toc" aria-label="API navigation">
-      <label class="visually-hidden" for="api-search" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)">Search API</label>
-      <input class="toc-search" id="api-search" type="search" placeholder="Filter API…" autocomplete="off" />
-
-      <div class="toc-group">
-        <h2>Overview</h2>
-        <ul>
-          <li><a href="#principles">Design principles</a></li>
-          <li><a href="#entries">Module entries</a></li>
-        </ul>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>mille API reference</title>
+    <meta name="description" content="The public surface of @vibecook/mille and @vibecook/mille-ui: the explorer, the host and port client, decorations, search, and the React FileTree." />
+    <link rel="canonical" href="https://vibecook-dev.github.io/mille/api.html" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="mille API reference" />
+    <meta property="og:description" content="The public surface of @vibecook/mille and @vibecook/mille-ui: the explorer, the host and port client, decorations, search, and the React FileTree." />
+    <meta property="og:url" content="https://vibecook-dev.github.io/mille/api.html" />
+    <meta property="og:image" content="https://vibecook-dev.github.io/mille/assets/og.png" />
+    <meta property="og:image:width" content="1280" />
+    <meta property="og:image:height" content="640" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="theme-color" content="#fafaf7" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#0a0a0a" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="assets/favicon.svg" type="image/svg+xml" />
+    <link rel="preload" href="assets/fonts/Jost-Variable.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="stylesheet" href="assets/site.css" />
+    <script>
+      try {
+        const t = localStorage.getItem('vibecook-theme');
+        if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+      } catch {}
+    </script>
+    <script src="assets/site.js" defer></script>
+  </head>
+  <body>
+    <a class="skip" href="#main">Skip to the content</a>
+    <div class="guides" aria-hidden="true"></div>
+    <header class="bar">
+      <div class="sheet">
+        <a class="lockup" href="./" aria-label="mille home"><svg viewBox="70.57 75 120.63 107.34" aria-hidden="true"><path d="M128.651 75C131.634 75.6963 177.883 133.951 183.236 141.676L182.39 143.16C174.875 146.964 142.347 143.352 131.518 143.016C111.446 142.892 91.469 144.227 71.3885 143.567C80.4137 131.043 91.0678 118.833 101.109 107.046C109.988 96.6225 119.374 84.9839 128.651 75Z"/><path d="M167.846 154.381C185.143 154.085 191.201 172.394 175.234 180.899C156.801 182.342 152.991 159.248 167.846 154.381Z"/><path d="M79.8215 156.238C91.3465 155.191 98.2357 162.371 95.0299 174.588C94.0348 178.379 89.9894 179.932 86.5509 181.46C84.6362 181.589 81.6823 181.454 79.8997 180.847C76.6053 179.752 73.8849 177.388 72.3402 174.28C70.7738 171.143 70.5714 167.499 71.781 164.208C73.4846 159.473 75.7031 158.27 79.8215 156.238Z"/><path d="M125.393 154.309C141.945 154.48 145.686 171.751 130.892 179.889C111.89 178.768 110.897 163.247 125.393 154.309Z"/></svg><span>mille</span></a>
+        <nav aria-label="Site">
+          <a href="./">Guide</a>
+          <a href="api.html" aria-current="page">API</a>
+          <a class="ext" href="https://github.com/vibecook-dev/mille">GitHub</a>
+          <button class="theme" type="button" aria-label="Switch theme"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M20 12A8 8 0 1 1 4 12A8 8 0 1 1 20 12Z"/><path d="M12 4A8 8 0 0 0 12 20Z" fill="currentColor" stroke="none"/></svg></button>
+        </nav>
       </div>
-      <div class="toc-group">
-        <h2>Core types</h2>
-        <ul>
-          <li><a href="#EntryId">EntryId</a></li>
-          <li><a href="#Uri">Uri</a></li>
-          <li><a href="#EntryKind">EntryKind</a></li>
-          <li><a href="#Entry">Entry</a></li>
-          <li><a href="#Capability">Capability</a></li>
-          <li><a href="#FileSystemError">FileSystemError</a></li>
-        </ul>
-      </div>
-      <div class="toc-group">
-        <h2>Explorer</h2>
-        <ul>
-          <li><a href="#ExplorerOptions">ExplorerOptions</a></li>
-          <li><a href="#FileExplorer">FileExplorer</a></li>
-          <li><a href="#MirrorSnapshot">MirrorSnapshot</a></li>
-          <li><a href="#VisibleRow">VisibleRow</a></li>
-          <li><a href="#ChangeNotice">ChangeNotice</a></li>
-        </ul>
-      </div>
-      <div class="toc-group">
-        <h2>Host / client</h2>
-        <ul>
-          <li><a href="#createFileExplorerHost">createFileExplorerHost</a></li>
-          <li><a href="#connectFileExplorer">connectFileExplorer</a></li>
-          <li><a href="#FileExplorerHost">FileExplorerHost</a></li>
-          <li><a href="#ClientOptions">ClientOptions</a></li>
-        </ul>
-      </div>
-      <div class="toc-group">
-        <h2>Decorations &amp; search</h2>
-        <ul>
-          <li><a href="#Decoration">Decoration</a></li>
-          <li><a href="#DecorationProvider">DecorationProvider</a></li>
-          <li><a href="#search">search</a></li>
-        </ul>
-      </div>
-      <div class="toc-group">
-        <h2>UI</h2>
-        <ul>
-          <li><a href="#FileTree">FileTree</a></li>
-          <li><a href="#FileTreeRef">FileTreeRef</a></li>
-          <li><a href="#ui-entries">UI entry points</a></li>
-        </ul>
-      </div>
-    </aside>
+    </header>
+    <main id="main">
+      <div class="sheet">
+        <header class="ref-head">
+          <p class="kicker">@vibecook/mille · @vibecook/mille-ui</p>
+          <h1>API reference</h1>
+          <p class="lede">The types and factories you build against. Types ship as generated declarations in each package; this page is the guide to them.</p>
+          <div class="cmd"><code>npm install @vibecook/mille @vibecook/mille-ui @tanstack/react-virtual</code></div>
+        </header>
+        <div class="rule"></div>
+        <div class="ref">
+          <nav class="toc" aria-label="On this page">
+            <details open>
+            <summary>On this page</summary>
+            <input type="search" placeholder="Filter this page" aria-label="Filter this page" />
+            <h2>Overview</h2>
+            <a href="#principles">Design principles</a>
+            <a href="#entries">Module entries</a>
+            <h2>Engine</h2>
+            <a href="#core">Core types</a>
+            <a href="#EntryId" class="sub">EntryId</a>
+            <a href="#Uri" class="sub">Uri</a>
+            <a href="#EntryKind" class="sub">EntryKind</a>
+            <a href="#Entry" class="sub">Entry</a>
+            <a href="#Capability" class="sub">Capability</a>
+            <a href="#FileSystemError" class="sub">FileSystemError</a>
+            <a href="#explorer">Explorer</a>
+            <a href="#ExplorerOptions" class="sub">ExplorerOptions</a>
+            <a href="#FileExplorer" class="sub">FileExplorer</a>
+            <a href="#MirrorSnapshot" class="sub">MirrorSnapshot</a>
+            <a href="#VisibleRow" class="sub">VisibleRow</a>
+            <a href="#ChangeNotice" class="sub">ChangeNotice</a>
+            <a href="#host-client">Host and port client</a>
+            <a href="#createFileExplorerHost" class="sub">createFileExplorerHost</a>
+            <a href="#FileExplorerHost" class="sub">FileExplorerHost</a>
+            <a href="#connectFileExplorer" class="sub">connectFileExplorer</a>
+            <a href="#PortFileExplorer" class="sub">PortFileExplorer</a>
+            <a href="#ClientOptions" class="sub">ClientOptions</a>
+            <a href="#decorations-search">Decorations &amp; search</a>
+            <a href="#Decoration" class="sub">Decoration</a>
+            <a href="#DecorationProvider" class="sub">DecorationProvider</a>
+            <a href="#search" class="sub">search</a>
+            <h2>UI</h2>
+            <a href="#ui">The React tree</a>
+            <a href="#FileTree" class="sub">FileTree</a>
+            <a href="#FileTreeRef" class="sub">FileTreeRef</a>
+            <a href="#ui-entries" class="sub">UI entry points</a>
+            </details>
+          </nav>
+          <div class="prose">
+<section id="principles">
+<h2>Design principles <a class="anchor" href="#principles" aria-label="Link to Design principles">#</a></h2>
+<p class="summary">These constraints shape every public type. Read them once; they explain the rest of the API.</p>
+<div class="scroll"><table>
+<thead><tr><th>Principle</th><th>What it means for you</th></tr></thead>
+<tbody>
+<tr><td>Tree in Rust</td><td>Canonical structure, watch, walk, and search live natively. JS owns expansion, selection, scroll.</td></tr>
+<tr><td>Snapshot reads</td><td>All sync reads go through an immutable <code>MirrorSnapshot</code>, safe during React render. The port client hands back the same snapshot object until the next change.</td></tr>
+<tr><td>Flat over nested</td><td>Rows and entries cross NAPI as flat records. Virtualizers never walk a nested object tree.</td></tr>
+<tr><td>Stable EntryId</td><td>Session-scoped ids stay stable across renames/moves. Capped at <code>2^53-1</code> for JS safety.</td></tr>
+<tr><td>Typed errors</td><td>Expected FS failures throw <code>FileSystemError</code> with POSIX-like codes — use try/catch, not Result unions.</td></tr>
+<tr><td>Version channels</td><td><code>treeVersion</code> and <code>decorationVersion</code> bump independently so SCM churn does not thrash row caches.</td></tr>
+</tbody>
+</table></div>
+</section>
 
-    <div class="content">
-      <div class="toc-mobile">
-        <button type="button" id="toc-open">Contents</button>
-        <span style="color:var(--mist);font-size:0.88rem">@vibecook/mille · v0.2.1</span>
-      </div>
+<section id="entries">
+<h2>Module entries <a class="anchor" href="#entries" aria-label="Link to Module entries">#</a></h2>
+<p class="summary">Import only what you need. Host code never belongs in the renderer bundle.</p>
+<dl class="defs">
+<dt><code>@vibecook/mille</code></dt>
+<dd><code>FileExplorer</code>, errors, decorations, connect helpers. Loads the native module, so Node side only.</dd>
+<dt><code>@vibecook/mille/host</code></dt>
+<dd><code>createFileExplorerHost</code>. For the utility process.</dd>
+<dt><code>@vibecook/mille/port</code></dt>
+<dd><code>connectFileExplorer</code>, <code>connectFileExplorerChannel</code>, <code>PortFileExplorer</code>. For the renderer.</dd>
+<dt><code>@vibecook/mille/client</code></dt>
+<dd><code>FileExplorer</code> and <code>MirrorSnapshot</code> on their own. Loads the native module.</dd>
+<dt><code>@vibecook/mille/react</code></dt>
+<dd><code>useFileExplorerSnapshot</code></dd>
+<dt><code>@vibecook/mille/remote</code>, <code>/node</code></dt>
+<dd>A client over WebSocket.</dd>
+<dt><code>@vibecook/mille/provider</code></dt>
+<dd>A virtual file system, and the <code>Capability</code> and <code>ProviderEntryKind</code> constants.</dd>
+<dt><code>@vibecook/mille/drive</code></dt>
+<dd>A synced store of file versions.</dd>
+<dt><code>@vibecook/mille-ui</code></dt>
+<dd>The styled <code>FileTree</code> and its hooks.</dd>
+<dt><code>@vibecook/mille-ui/headless</code></dt>
+<dd>Hooks and logic only, no components. 15 KB gzip budget.</dd>
+<dt><code>@vibecook/mille-ui/git</code></dt>
+<dd>Git decoration provider, safe in the browser.</dd>
+<dt><code>@vibecook/mille-ui/git/node</code></dt>
+<dd><code>createShellGitClient</code>. Node or utility process only.</dd>
+</dl>
+</section>
 
-      <header class="page-hero">
-        <p class="eyebrow">API reference · v0.2.1</p>
-        <h1>Public surface</h1>
-        <p>
-          The types and factories you integrate against. Authoritative declarations live in
-          <code>packages/mille/api.d.ts</code>. This page is the curated, navigable guide.
-        </p>
-        <div class="pill-row">
-          <span class="pill"><strong>Engine</strong> @vibecook/mille</span>
-          <span class="pill"><strong>UI</strong> @vibecook/mille-ui</span>
-          <span class="pill"><strong>Node</strong> ≥ 20</span>
-          <span class="pill"><strong>React</strong> 19 for UI</span>
-        </div>
-      </header>
+<section id="core">
+<h2>Core types <a class="anchor" href="#core" aria-label="Link to Core types">#</a></h2>
+<p class="summary">Shared identifiers and records used across engine and UI.</p>
+<h3 id="EntryId"><code>EntryId</code> <span class="kind">type</span> <a class="anchor" href="#EntryId" aria-label="Link to EntryId type">#</a></h3>
+<p class="sig">type EntryId = number</p>
+<p>Monotonic id assigned in Rust. Stable across renames and moves within a session. Reassigned on process boot. Safe as a React key, Map key, or JSON value.</p>
+<h3 id="Uri"><code>Uri</code> <span class="kind">interface</span> <a class="anchor" href="#Uri" aria-label="Link to Uri interface">#</a></h3>
+<p>Scheme-based resource locator. Mirrors VS Code’s Uri shape. Local mode typically accepts absolute path strings as a convenience; hosts may pass full Uris.</p>
+<div class="scroll"><table>
+<thead><tr><th>Field</th><th>Type</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>scheme</td><td>string</td><td><code>file</code> | <code>memfs</code> | <code>ssh</code> | …</td></tr>
+<tr><td>authority?</td><td>string</td><td>Remote host, etc.</td></tr>
+<tr><td>path</td><td>string</td><td>Always POSIX-style</td></tr>
+<tr><td>query?</td><td>string</td><td></td></tr>
+<tr><td>fragment?</td><td>string</td><td></td></tr>
+</tbody>
+</table></div>
+<h3 id="EntryKind"><code>EntryKind</code> <span class="kind">numbers</span> <a class="anchor" href="#EntryKind" aria-label="Link to EntryKind numbers">#</a></h3>
+<p>The values of <code>Entry.kind</code>, which is typed <code>number</code>. The constants are exported as <code>ProviderEntryKind</code> from <code>@vibecook/mille/provider</code>.</p>
+<div class="scroll"><table>
+<thead><tr><th>Member</th><th>Value</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>File</td><td>0</td><td></td></tr>
+<tr><td>Directory</td><td>1</td><td></td></tr>
+<tr><td>Symlink</td><td>2</td><td></td></tr>
+<tr><td>Unknown</td><td>3</td><td></td></tr>
+<tr><td>Unavailable</td><td>4</td><td>A configured workspace root that is missing or cannot be read</td></tr>
+</tbody>
+</table></div>
+<h3 id="Entry"><code>Entry</code> <span class="kind">interface</span> <a class="anchor" href="#Entry" aria-label="Link to Entry interface">#</a></h3>
+<p>One row in the flat-array model.</p>
+<div class="scroll"><table>
+<thead><tr><th>Field</th><th>Type</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>id</td><td>EntryId</td><td></td></tr>
+<tr><td>parentId</td><td>EntryId | null</td><td><code>null</code> only for roots</td></tr>
+<tr><td>name</td><td>string</td><td>Basename</td></tr>
+<tr><td>kind</td><td>number</td><td>One of the <code>EntryKind</code> values</td></tr>
+<tr><td>size</td><td>number</td><td>Bytes; 0 for directories</td></tr>
+<tr><td>mtimeMs</td><td>number</td><td>Unix ms</td></tr>
+<tr><td>ctimeMs</td><td>number</td><td>Unix ms</td></tr>
+<tr><td>symlinkTargetIsDir?</td><td>boolean</td><td>For UI caret rendering</td></tr>
+<tr><td>pathSegments?</td><td>string[]</td><td>Set when compact-folders collapses a chain</td></tr>
+<tr><td>isIgnored</td><td>boolean</td><td>Matched by ignore rules</td></tr>
+<tr><td>isReadonly</td><td>boolean</td><td></td></tr>
+<tr><td>isHidden</td><td>boolean</td><td>Dotfile or platform-hidden</td></tr>
+</tbody>
+</table></div>
+<h3 id="Capability"><code>Capability</code> <span class="kind">const object</span> <a class="anchor" href="#Capability" aria-label="Link to Capability const object">#</a></h3>
+<p>The bitmask a provider advertises. Import it from <code>@vibecook/mille/provider</code>. Local mode reports <code>ReadWrite | CaseSensitive | Trash | Watch</code> (43).</p>
+<div class="scroll"><table>
+<thead><tr><th>Flag</th><th>Value</th></tr></thead>
+<tbody>
+<tr><td>None</td><td>0</td></tr>
+<tr><td>ReadWrite</td><td>1 &lt;&lt; 0</td></tr>
+<tr><td>CaseSensitive</td><td>1 &lt;&lt; 1</td></tr>
+<tr><td>Readonly</td><td>1 &lt;&lt; 2</td></tr>
+<tr><td>Trash</td><td>1 &lt;&lt; 3</td></tr>
+<tr><td>AtomicWrite</td><td>1 &lt;&lt; 4</td></tr>
+<tr><td>Watch</td><td>1 &lt;&lt; 5</td></tr>
+<tr><td>Stream</td><td>1 &lt;&lt; 6</td></tr>
+<tr><td>Clone</td><td>1 &lt;&lt; 7</td></tr>
+<tr><td>Realpath</td><td>1 &lt;&lt; 8</td></tr>
+<tr><td>FileLock</td><td>1 &lt;&lt; 9</td></tr>
+</tbody>
+</table></div>
+<h3 id="FileSystemError"><code>FileSystemError</code> <span class="kind">class</span> <a class="anchor" href="#FileSystemError" aria-label="Link to FileSystemError class">#</a></h3>
+<p class="sig">class FileSystemError extends Error</p>
+<p>Expected filesystem failures. Check with <code>isFileSystemError(e)</code>.</p>
+<div class="scroll"><table>
+<thead><tr><th>Member</th><th>Type</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>code</td><td>ErrorCode</td><td>EACCES, ENOENT, EEXIST, EISDIR, ENOTDIR, ELOOP, ENOSPC, EROFS, EBUSY, EINVAL, ECANCELED, EFBIG (a payload over the remote transport’s per-request limit), EUNSUPPORTED, EUNKNOWN, ETIMEDOUT (a native read stalled), EDATALESS (cloud-evicted folder, not downloaded)</td></tr>
+<tr><td>path?</td><td>string</td><td>Path involved in the failure</td></tr>
+</tbody>
+</table></div>
+<div class="code"><header><span>ts</span></header><pre tabindex="0"><code><span class="k">try</span> {
+  <span class="k">await</span> fx.rename(id, <span class="s">'new-name'</span>);
+} <span class="k">catch</span> (e) {
+  <span class="k">if</span> (isFileSystemError(e) &amp;&amp; e.code === <span class="s">'EEXIST'</span>) {
+    <span class="c">// handle collision</span>
+  } <span class="k">else</span> <span class="k">throw</span> e;
+}</code></pre></div>
+</section>
 
-      <!-- Principles -->
-      <section class="api-section" id="principles">
-        <h2>Design principles</h2>
-        <p class="lede">These constraints shape every public type. Read them once; they explain the rest of the API.</p>
-        <div class="entry" data-search="principles design tree rust view state snapshot">
-          <div class="entry-body">
-            <table class="props">
-              <thead><tr><th>Principle</th><th></th><th>What it means for you</th></tr></thead>
-              <tbody>
-                <tr>
-                  <td>Tree in Rust</td>
-                  <td></td>
-                  <td>Canonical structure, watch, walk, and search live natively. JS owns expansion, selection, scroll.</td>
-                </tr>
-                <tr>
-                  <td>Snapshot reads</td>
-                  <td></td>
-                  <td>All sync reads go through an immutable <code>MirrorSnapshot</code>. Safe during React render; identity-stable until the next change.</td>
-                </tr>
-                <tr>
-                  <td>Flat over nested</td>
-                  <td></td>
-                  <td>Rows and entries cross NAPI as flat records. Virtualizers never walk a nested object tree.</td>
-                </tr>
-                <tr>
-                  <td>Stable EntryId</td>
-                  <td></td>
-                  <td>Session-scoped ids stay stable across renames/moves. Capped at <code>2^53-1</code> for JS safety.</td>
-                </tr>
-                <tr>
-                  <td>Typed errors</td>
-                  <td></td>
-                  <td>Expected FS failures throw <code>FileSystemError</code> with POSIX-like codes — use try/catch, not Result unions.</td>
-                </tr>
-                <tr>
-                  <td>Version channels</td>
-                  <td></td>
-                  <td><code>treeVersion</code> and <code>decorationVersion</code> bump independently so SCM churn does not thrash row caches.</td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-        </div>
-      </section>
-
-      <!-- Module entries -->
-      <section class="api-section" id="entries">
-        <h2>Module entries</h2>
-        <p class="lede">Import only what you need. Host code never belongs in the renderer bundle.</p>
-        <div class="exports-grid">
-          <div class="export-card" data-search="import mille index">
-            <code>@vibecook/mille</code>
-            <span>FileExplorer, errors, decorations, connect helpers</span>
-          </div>
-          <div class="export-card" data-search="import host utility">
-            <code>@vibecook/mille/host</code>
-            <span>createFileExplorerHost — UtilityProcess only</span>
-          </div>
-          <div class="export-card" data-search="import client port">
-            <code>@vibecook/mille/client</code>
-            <span>connectFileExplorer, PortFileExplorer</span>
-          </div>
-          <div class="export-card" data-search="import react hook">
-            <code>@vibecook/mille/react</code>
-            <span>useFileExplorerSnapshot</span>
-          </div>
-          <div class="export-card" data-search="import ui filetree">
-            <code>@vibecook/mille-ui</code>
-            <span>Styled FileTree + hooks</span>
-          </div>
-          <div class="export-card" data-search="import headless">
-            <code>@vibecook/mille-ui/headless</code>
-            <span>Structure only · ~12.5 KB gzip</span>
-          </div>
-          <div class="export-card" data-search="import git">
-            <code>@vibecook/mille-ui/git</code>
-            <span>Git decoration provider (browser-safe)</span>
-          </div>
-          <div class="export-card" data-search="import git node shell">
-            <code>@vibecook/mille-ui/git/node</code>
-            <span>createShellGitClient — Node/utility only</span>
-          </div>
-        </div>
-      </section>
-
-      <!-- Core types -->
-      <section class="api-section" id="core">
-        <h2>Core types</h2>
-        <p class="lede">Shared identifiers and records used across engine and UI.</p>
-
-        <article class="entry" id="EntryId" data-search="EntryId number id">
-          <div class="entry-head">
-            <span class="entry-name">EntryId</span>
-            <span class="entry-kind type">type</span>
-            <div class="entry-sig"><span class="k">type</span> <span class="p">EntryId</span> = <span class="t">number</span></div>
-          </div>
-          <div class="entry-body">
-            <p>Monotonic id assigned in Rust. Stable across renames and moves within a session. Reassigned on process boot. Safe as a React key, Map key, or JSON value.</p>
-          </div>
-        </article>
-
-        <article class="entry" id="Uri" data-search="Uri scheme path authority">
-          <div class="entry-head">
-            <span class="entry-name">Uri</span>
-            <span class="entry-kind">interface</span>
-          </div>
-          <div class="entry-body">
-            <p>Scheme-based resource locator. Mirrors VS Code’s Uri shape. Local mode typically accepts absolute path strings as a convenience; hosts may pass full Uris.</p>
-            <table class="props">
-              <thead><tr><th>Field</th><th>Type</th><th>Notes</th></tr></thead>
-              <tbody>
-                <tr><td>scheme</td><td>string</td><td><code>file</code> | <code>memfs</code> | <code>ssh</code> | …</td></tr>
-                <tr><td>authority<span class="opt">?</span></td><td>string</td><td>Remote host, etc.</td></tr>
-                <tr><td>path</td><td>string</td><td>Always POSIX-style</td></tr>
-                <tr><td>query<span class="opt">?</span></td><td>string</td><td></td></tr>
-                <tr><td>fragment<span class="opt">?</span></td><td>string</td><td></td></tr>
-              </tbody>
-            </table>
-          </div>
-        </article>
-
-        <article class="entry" id="EntryKind" data-search="EntryKind File Directory Symlink enum">
-          <div class="entry-head">
-            <span class="entry-name">EntryKind</span>
-            <span class="entry-kind enum">enum</span>
-          </div>
-          <div class="entry-body">
-            <table class="props">
-              <thead><tr><th>Member</th><th>Value</th><th></th></tr></thead>
-              <tbody>
-                <tr><td>File</td><td>0</td><td></td></tr>
-                <tr><td>Directory</td><td>1</td><td></td></tr>
-                <tr><td>Symlink</td><td>2</td><td></td></tr>
-                <tr><td>Unknown</td><td>3</td><td></td></tr>
-              </tbody>
-            </table>
-          </div>
-        </article>
-
-        <article class="entry" id="Entry" data-search="Entry record name parentId size mtime">
-          <div class="entry-head">
-            <span class="entry-name">Entry</span>
-            <span class="entry-kind">interface</span>
-            <div class="entry-sig">One row in the flat-array model</div>
-          </div>
-          <div class="entry-body">
-            <table class="props">
-              <thead><tr><th>Field</th><th>Type</th><th>Notes</th></tr></thead>
-              <tbody>
-                <tr><td>id</td><td>EntryId</td><td></td></tr>
-                <tr><td>parentId</td><td>EntryId | null</td><td><code>null</code> only for roots</td></tr>
-                <tr><td>name</td><td>string</td><td>Basename</td></tr>
-                <tr><td>kind</td><td>EntryKind</td><td>Numeric enum</td></tr>
-                <tr><td>size</td><td>number</td><td>Bytes; 0 for directories</td></tr>
-                <tr><td>mtimeMs</td><td>number</td><td>Unix ms</td></tr>
-                <tr><td>ctimeMs</td><td>number</td><td>Unix ms</td></tr>
-                <tr><td>symlinkTargetIsDir<span class="opt">?</span></td><td>boolean</td><td>For UI caret rendering</td></tr>
-                <tr><td>pathSegments<span class="opt">?</span></td><td>string[]</td><td>Set when compact-folders collapses a chain</td></tr>
-                <tr><td>isIgnored</td><td>boolean</td><td>Matched by ignore rules</td></tr>
-                <tr><td>isReadonly</td><td>boolean</td><td></td></tr>
-                <tr><td>isHidden</td><td>boolean</td><td>Dotfile or platform-hidden</td></tr>
-              </tbody>
-            </table>
-          </div>
-        </article>
-
-        <article class="entry" id="Capability" data-search="Capability bitmask ReadWrite Watch Stream">
-          <div class="entry-head">
-            <span class="entry-name">Capability</span>
-            <span class="entry-kind enum">const enum</span>
-          </div>
-          <div class="entry-body">
-            <p>Bitmask providers advertise. Local mode currently reports ReadWrite | CaseSensitive | Watch.</p>
-            <table class="props">
-              <thead><tr><th>Flag</th><th>Value</th><th></th></tr></thead>
-              <tbody>
-                <tr><td>ReadWrite</td><td>1 &lt;&lt; 0</td><td></td></tr>
-                <tr><td>CaseSensitive</td><td>1 &lt;&lt; 1</td><td></td></tr>
-                <tr><td>Readonly</td><td>1 &lt;&lt; 2</td><td></td></tr>
-                <tr><td>Trash</td><td>1 &lt;&lt; 3</td><td></td></tr>
-                <tr><td>AtomicWrite</td><td>1 &lt;&lt; 4</td><td></td></tr>
-                <tr><td>Watch</td><td>1 &lt;&lt; 5</td><td></td></tr>
-                <tr><td>Stream</td><td>1 &lt;&lt; 6</td><td></td></tr>
-                <tr><td>Clone</td><td>1 &lt;&lt; 7</td><td></td></tr>
-                <tr><td>Realpath</td><td>1 &lt;&lt; 8</td><td></td></tr>
-                <tr><td>FileLock</td><td>1 &lt;&lt; 9</td><td></td></tr>
-              </tbody>
-            </table>
-          </div>
-        </article>
-
-        <article class="entry" id="FileSystemError" data-search="FileSystemError ErrorCode EACCES ENOENT isFileSystemError">
-          <div class="entry-head">
-            <span class="entry-name">FileSystemError</span>
-            <span class="entry-kind class">class</span>
-            <div class="entry-sig"><span class="k">class</span> FileSystemError <span class="k">extends</span> <span class="t">Error</span></div>
-          </div>
-          <div class="entry-body">
-            <p>Expected filesystem failures. Check with <code>isFileSystemError(e)</code>.</p>
-            <table class="props">
-              <thead><tr><th>Member</th><th>Type</th><th>Notes</th></tr></thead>
-              <tbody>
-                <tr><td>code</td><td>ErrorCode</td><td>EACCES, ENOENT, EEXIST, EISDIR, ENOTDIR, ELOOP, ENOSPC, EROFS, EBUSY, EINVAL, ECANCELED, EUNSUPPORTED, EUNKNOWN, ETIMEDOUT (a native read stalled), EDATALESS (cloud-evicted folder, not downloaded)</td></tr>
-                <tr><td>path<span class="opt">?</span></td><td>string</td><td>Path involved in the failure</td></tr>
-              </tbody>
-            </table>
-            <pre class="code-block"><span class="kw">try</span> {
-  <span class="kw">await</span> fx.<span class="fn">rename</span>(id, <span class="str">'new-name'</span>);
-} <span class="kw">catch</span> (e) {
-  <span class="kw">if</span> (<span class="fn">isFileSystemError</span>(e) &amp;&amp; e.code === <span class="str">'EEXIST'</span>) {
-    <span class="cm">// handle collision</span>
-  } <span class="kw">else</span> <span class="kw">throw</span> e;
-}</pre>
-          </div>
-        </article>
-      </section>
-
-      <!-- Explorer -->
-      <section class="api-section" id="explorer">
-        <h2>Explorer</h2>
-        <p class="lede">Construct, populate, snapshot, mutate. Construction never walks the filesystem.</p>
-
-        <article class="entry" id="ExplorerOptions" data-search="ExplorerOptions roots respectIgnore followSymlinks initialWalk">
-          <div class="entry-head">
-            <span class="entry-name">ExplorerOptions</span>
-            <span class="entry-kind">interface</span>
-          </div>
-          <div class="entry-body">
-            <table class="props">
-              <thead><tr><th>Field</th><th>Type</th><th>Default / notes</th></tr></thead>
-              <tbody>
-                <tr><td>roots</td><td>readonly (Uri | string)[]</td><td>Required. Absolute paths or Uris.</td></tr>
-                <tr><td>respectIgnore<span class="opt">?</span></td><td>boolean</td><td><code>true</code> — parse .gitignore / .ignore / .rgignore</td></tr>
-                <tr><td>followSymlinks<span class="opt">?</span></td><td>boolean | 'smart'</td><td><code>'smart'</code> — canonicalize, dedupe, block cycles</td></tr>
-                <tr><td>walkerConcurrency<span class="opt">?</span></td><td>number</td><td>num_cpus</td></tr>
-                <tr><td>watchDebounceMs<span class="opt">?</span></td><td>number</td><td><code>75</code></td></tr>
-                <tr><td>compactFolders<span class="opt">?</span></td><td>boolean</td><td><code>true</code></td></tr>
-                <tr><td>excludeGlobs<span class="opt">?</span></td><td>string[]</td><td>Extra excludes layered on ignore</td></tr>
-                <tr><td>snapshotPath<span class="opt">?</span></td><td>string</td><td>Crash-resume snapshot file</td></tr>
-                <tr><td>maxCachedEntries<span class="opt">?</span></td><td>number</td><td><code>500_000</code></td></tr>
-                <tr><td>readTimeoutMs<span class="opt">?</span></td><td>number</td><td><code>2000</code> — a native read with no progress this long answers <code>ETIMEDOUT</code> for its folder; the kernel call finishes in the background</td></tr>
-                <tr><td>maxStuckReads<span class="opt">?</span></td><td>number</td><td><code>16</code> — reads allowed past the deadline; beyond it new reads answer <code>ETIMEDOUT</code> at once</td></tr>
-                <tr><td>materializeDataless<span class="opt">?</span></td><td>boolean</td><td><code>false</code> — macOS: list cloud-evicted folders by downloading them; off, they answer <code>EDATALESS</code></td></tr>
-                <tr><td>initialWalk<span class="opt">?</span></td><td>'full' | 'roots-only' | 'none'</td><td>Host walk policy. <code>'roots-only'</code> for huge repos. Default <code>'full'</code> (host does not auto-walk; caller populates).</td></tr>
-              </tbody>
-            </table>
-          </div>
-        </article>
-
-        <article class="entry" id="FileExplorer" data-search="FileExplorer getSnapshot populate setExpanded mutate dispose on">
-          <div class="entry-head">
-            <span class="entry-name">FileExplorer</span>
-            <span class="entry-kind class">class</span>
-            <div class="entry-sig"><span class="k">new</span> FileExplorer(options: <span class="t">ExplorerOptions</span>)</div>
-          </div>
-          <div class="entry-body">
-            <div class="callout">
-              <strong>Read path:</strong> <code>getSnapshot()</code> → sync queries on the snapshot.<br />
-              <strong>Write path:</strong> methods on the explorer (create, rename, …).<br />
-              <strong>Subscribe:</strong> <code>on('change', …)</code> with <code>useSyncExternalStore</code>.
-            </div>
-            <div class="method-list">
-              <div class="method">
-                <div class="method-sig"><span class="name">getSnapshot</span>(): <span class="ret">MirrorSnapshot</span></div>
-                <p>Current immutable snapshot. Identity-stable until the next change event.</p>
-              </div>
-              <div class="method">
-                <div class="method-sig"><span class="name">populateFromRoots</span>(): <span class="ret">Promise&lt;number&gt;</span></div>
-                <p>Parallel walk of configured roots. Returns total entry count. Call once after construction for full load.</p>
-              </div>
-              <div class="method">
-                <div class="method-sig"><span class="name">setExpanded</span>(diff: { add?: EntryId[]; remove?: EntryId[] }): <span class="ret">void</span></div>
-                <p>Update session expansion. Host may trigger shallow walks for newly expanded folders (lazy list-on-expand).</p>
-              </div>
-              <div class="method">
-                <div class="method-sig"><span class="name">setViewport</span>(opts: { offset; limit; overscan? }): <span class="ret">void</span></div>
-                <p>Declare the visible window so the host can prioritize mirror rows.</p>
-              </div>
-              <div class="method">
-                <div class="method-sig"><span class="name">list</span>(parentId, options?): <span class="ret">Promise&lt;ListPage&gt;</span></div>
-                <p>Async paginated children. Prefer snapshot for already-loaded data.</p>
-              </div>
-              <div class="method">
-                <div class="method-sig"><span class="name">prefetch</span>(id, options?): <span class="ret">Promise&lt;void&gt;</span></div>
-                <p>Warm children without adding to the expansion set.</p>
-              </div>
-              <div class="method">
-                <div class="method-sig"><span class="name">create</span> / <span class="name">rename</span> / <span class="name">move</span> / <span class="name">delete</span> / <span class="name">copy</span></div>
-                <p>Structural mutations. Reject with FileSystemError on expected failures.</p>
-              </div>
-              <div class="method">
-                <div class="method-sig"><span class="name">readFile</span> / <span class="name">readText</span> / <span class="name">writeFile</span> / <span class="name">readFileStream</span></div>
-                <p>I/O by EntryId. Stream is AsyncIterable&lt;Uint8Array&gt;.</p>
-              </div>
-              <div class="method">
-                <div class="method-sig"><span class="name">search</span>(query, options?): <span class="ret">Promise&lt;SearchHit[]&gt;</span></div>
-                <p>Fuzzy filename search over the in-memory tree (nucleo).</p>
-              </div>
-              <div class="method">
-                <div class="method-sig"><span class="name">on</span>(event, listener): <span class="ret">Disposable</span></div>
-                <p>Events: <code>change</code>, <code>change:tree</code>, <code>change:decorations</code>, <code>event</code>, <code>batch</code>, <code>warning</code>, <code>error</code>, <code>ready</code>.</p>
-              </div>
-              <div class="method">
-                <div class="method-sig"><span class="name">registerDecorationProvider</span>(provider): <span class="ret">Disposable</span></div>
-                <p>SCM / lint / problems overlay. Reads via <code>snapshot.getDecorations(id)</code>.</p>
-              </div>
-              <div class="method">
-                <div class="method-sig"><span class="name">writeSnapshot</span>(path): <span class="ret">Promise&lt;void&gt;</span></div>
-                <p>Persist crash-resume snapshot.</p>
-              </div>
-              <div class="method">
-                <div class="method-sig"><span class="name">dispose</span>(): <span class="ret">Promise&lt;void&gt;</span></div>
-                <p>Stop watcher threads, release native resources. Idempotent.</p>
-              </div>
-            </div>
-          </div>
-        </article>
-
-        <article class="entry" id="MirrorSnapshot" data-search="MirrorSnapshot visibleRows roots getById treeVersion">
-          <div class="entry-head">
-            <span class="entry-name">MirrorSnapshot</span>
-            <span class="entry-kind">interface</span>
-          </div>
-          <div class="entry-body">
-            <p>Immutable view at a specific tree-version + decoration-version. Never mutate. Diff with <code>===</code>.</p>
-            <div class="method-list">
-              <div class="method">
-                <div class="method-sig">readonly <span class="name">treeVersion</span>: <span class="ret">number</span></div>
-                <p>Structural version.</p>
-              </div>
-              <div class="method">
-                <div class="method-sig">readonly <span class="name">decorationVersion</span>: <span class="ret">number</span></div>
-                <p>Decoration channel version.</p>
-              </div>
-              <div class="method">
-                <div class="method-sig"><span class="name">roots</span>(): <span class="ret">readonly Entry[]</span></div>
-                <p>Workspace roots in display order.</p>
-              </div>
-              <div class="method">
-                <div class="method-sig"><span class="name">visibleRows</span>(options): <span class="ret">readonly VisibleRow[]</span></div>
-                <p>Flat slice for virtualizers: expanded set + offset/limit. Cache-miss rows may set <code>pending: true</code>.</p>
-              </div>
-              <div class="method">
-                <div class="method-sig"><span class="name">visibleRowCount</span>(expanded, includeIgnored?): <span class="ret">VisibleRowCount</span></div>
-                <p><code>known</code> count plus <code>pendingExpansions</code> for incomplete folders.</p>
-              </div>
-              <div class="method">
-                <div class="method-sig"><span class="name">getById</span> / <span class="name">directChildCount</span> / <span class="name">hasChildren</span> / <span class="name">getDecorations</span></div>
-                <p>Point queries for rows and overlays.</p>
-              </div>
-            </div>
-            <pre class="code-block"><span class="kw">const</span> rows = snap.<span class="fn">visibleRows</span>({
+<section id="explorer">
+<h2>Explorer <a class="anchor" href="#explorer" aria-label="Link to Explorer">#</a></h2>
+<p class="summary">Construct, populate, snapshot, mutate. Construction never walks the filesystem.</p>
+<h3 id="ExplorerOptions"><code>ExplorerOptions</code> <span class="kind">interface</span> <a class="anchor" href="#ExplorerOptions" aria-label="Link to ExplorerOptions interface">#</a></h3>
+<div class="scroll"><table>
+<thead><tr><th>Field</th><th>Type</th><th>Default / notes</th></tr></thead>
+<tbody>
+<tr><td>roots</td><td>readonly (Uri | string)[]</td><td>Required. Absolute paths or Uris.</td></tr>
+<tr><td>respectIgnore?</td><td>boolean</td><td><code>true</code> — parse .gitignore / .ignore / .rgignore</td></tr>
+<tr><td>followSymlinks?</td><td>boolean | 'smart'</td><td>Default <code>'smart'</code>, which today does not walk into symlinked folders (the same as <code>false</code>). <code>true</code> walks them.</td></tr>
+<tr><td>walkerConcurrency?</td><td>number</td><td>num_cpus</td></tr>
+<tr><td>watchDebounceMs?</td><td>number</td><td><code>75</code></td></tr>
+<tr><td>compactFolders?</td><td>boolean</td><td><code>true</code></td></tr>
+<tr><td>excludeGlobs?</td><td>string[]</td><td>Extra excludes layered on ignore</td></tr>
+<tr><td>snapshotPath?</td><td>string</td><td>Reserved. Crash-resume is not wired to JavaScript yet.</td></tr>
+<tr><td>maxCachedEntries?</td><td>number</td><td>Accepted, not enforced yet.</td></tr>
+<tr><td>readTimeoutMs?</td><td>number</td><td><code>2000</code> — a native read with no progress this long answers <code>ETIMEDOUT</code> for its folder; the kernel call finishes in the background</td></tr>
+<tr><td>maxStuckReads?</td><td>number</td><td><code>16</code> — reads allowed past the deadline; beyond it new reads answer <code>ETIMEDOUT</code> at once</td></tr>
+<tr><td>materializeDataless?</td><td>boolean</td><td><code>false</code> — macOS: list cloud-evicted folders by downloading them; off, they answer <code>EDATALESS</code></td></tr>
+<tr><td>initialWalk?</td><td>'full' | 'roots-only' | 'none'</td><td>Host walk policy. <code>'roots-only'</code> for huge repos. Default <code>'full'</code> (host does not auto-walk; caller populates).</td></tr>
+</tbody>
+</table></div>
+<h3 id="FileExplorer"><code>FileExplorer</code> <span class="kind">class</span> <a class="anchor" href="#FileExplorer" aria-label="Link to FileExplorer class">#</a></h3>
+<p class="sig">new FileExplorer(options: ExplorerOptions)</p>
+<div class="note">
+<p><strong>Read path:</strong> <code>getSnapshot()</code> → sync queries on the snapshot.<br> <strong>Write path:</strong> methods on the explorer (create, rename, …).<br> <strong>Subscribe:</strong> <code>on('change', …)</code>.</p>
+</div>
+<div class="warn">
+<p><code>FileExplorer</code> runs where the native module loads: the utility process (through <code>createFileExplorerHost</code>) or plain Node. It cannot be constructed in an Electron renderer. A window uses a <a href="#PortFileExplorer"><code>PortFileExplorer</code></a>.</p>
+</div>
+<dl class="defs">
+<dt><code>getSnapshot(): MirrorSnapshot</code></dt>
+<dd>The current immutable snapshot. This class returns a new wrapper on every call, so compare <code>treeVersion</code> and <code>decorationVersion</code>, not the object.</dd>
+<dt><code>populateFromRoots(): Promise&lt;number&gt;</code></dt>
+<dd>Parallel walk of configured roots. Returns total entry count. Call once after construction for full load.</dd>
+<dt><code>setExpanded(diff: { add?: EntryId[]; remove?: EntryId[] }): void</code></dt>
+<dd>A no-op on this class, kept so both classes have the same shape. On a <code>PortFileExplorer</code> it updates the session’s expansion, and the host may walk newly expanded folders.</dd>
+<dt><code>setViewport(opts: { offset; limit; overscan? }): void</code></dt>
+<dd>Also a no-op on this class. On a <code>PortFileExplorer</code> it declares the visible window, so the host can send those rows first.</dd>
+<dt><code>list(parentId, options?): Promise&lt;ListPage&gt;</code></dt>
+<dd>Async paginated children. Prefer snapshot for already-loaded data.</dd>
+<dt><code>prefetch(id, options?): Promise&lt;void&gt;</code></dt>
+<dd>Warm children without adding to the expansion set.</dd>
+<dt><code>create / rename / move / delete / copy</code></dt>
+<dd>Structural mutations. Reject with FileSystemError on expected failures.</dd>
+<dt><code>readFile / readText / writeFile / readFileStream</code></dt>
+<dd>I/O by EntryId. Stream is AsyncIterable&lt;Uint8Array&gt;.</dd>
+<dt><code>search(query, options?): readonly SearchHit[]</code></dt>
+<dd>Fuzzy filename search over the in-memory tree (nucleo). Synchronous on this class; see <a href="#search">search</a>.</dd>
+<dt><code>on(event, listener): Disposable</code></dt>
+<dd>Events: <code>change</code>, <code>change:tree</code>, <code>change:decorations</code>, <code>event</code>, <code>batch</code>, <code>warning</code>, <code>error</code>. (<code>ready</code> is reserved and never fires.)</dd>
+<dt><code>registerDecorationProvider(provider): Disposable</code></dt>
+<dd>SCM / lint / problems overlay. Reads via <code>snapshot.getDecorations(id)</code>.</dd>
+<dt><code>dispose(): Promise&lt;void&gt;</code></dt>
+<dd>Stop watcher threads, release native resources. Idempotent.</dd>
+</dl>
+<h3 id="MirrorSnapshot"><code>MirrorSnapshot</code> <span class="kind">class</span> <a class="anchor" href="#MirrorSnapshot" aria-label="Link to MirrorSnapshot class">#</a></h3>
+<p>An immutable view at one tree version and one decoration version. Never mutate it. A <code>PortFileExplorer</code> returns the same object until the next change, so <code>===</code> tells you whether anything moved.</p>
+<dl class="defs">
+<dt><code>readonly treeVersion: number</code></dt>
+<dd>Structural version.</dd>
+<dt><code>readonly decorationVersion: number</code></dt>
+<dd>Decoration channel version.</dd>
+<dt><code>roots(): readonly Entry[]</code></dt>
+<dd>Workspace roots in display order.</dd>
+<dt><code>visibleRows(options): readonly VisibleRow[]</code></dt>
+<dd>Flat slice for virtualizers: expanded set + offset/limit. Cache-miss rows may set <code>pending: true</code>.</dd>
+<dt><code>visibleRowCount(expanded, includeIgnored?): VisibleRowCount</code></dt>
+<dd><code>known</code> count plus <code>pendingExpansions</code> for incomplete folders.</dd>
+<dt><code>getById / directChildCount / hasChildren / getDecorations</code></dt>
+<dd>Point queries for rows and overlays.</dd>
+</dl>
+<div class="code"><header><span>ts</span></header><pre tabindex="0"><code><span class="k">const</span> rows = snap.visibleRows({
   expanded,
   offset: 0,
   limit: 100,
-  includeIgnored: <span class="kw">false</span>,
-});</pre>
-          </div>
-        </article>
+  includeIgnored: <span class="k">false</span>,
+});</code></pre></div>
+<h3 id="VisibleRow"><code>VisibleRow</code> <span class="kind">interface</span> <a class="anchor" href="#VisibleRow" aria-label="Link to VisibleRow interface">#</a></h3>
+<p class="sig">extends Entry</p>
+<div class="scroll"><table>
+<thead><tr><th>Field</th><th>Type</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>depth</td><td>number</td><td>0 = root level</td></tr>
+<tr><td>hasChildren</td><td>boolean</td><td>Caret affordance</td></tr>
+<tr><td>isExpanded</td><td>boolean</td><td>From the query’s expansion set</td></tr>
+<tr><td>pending?</td><td>true</td><td>Placeholder while children load</td></tr>
+</tbody>
+</table></div>
+<h3 id="ChangeNotice"><code>ChangeNotice</code> <span class="kind">interface</span> <a class="anchor" href="#ChangeNotice" aria-label="Link to ChangeNotice interface">#</a></h3>
+<p>What a tree-driven <code>'change'</code> or <code>'change:tree'</code> listener receives on a <code>FileExplorer</code>. A decoration bump delivers the changed ids as <code>readonly EntryId[]</code>. A <code>PortFileExplorer</code>’s <code>'change'</code> listener receives no argument: read <code>getSnapshot()</code> again. It is a pull model: the version bumps, and you re-read only the rows you need.</p>
+<div class="scroll"><table>
+<thead><tr><th>Field</th><th>Type</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>treeVersion</td><td>number</td><td></td></tr>
+<tr><td>decorationVersion</td><td>number</td><td></td></tr>
+<tr><td>treeChanged</td><td>boolean</td><td>The tree moved</td></tr>
+<tr><td>decorationsChanged</td><td>boolean</td><td>Decorations moved</td></tr>
+<tr><td>changedIds</td><td>EntryId[]</td><td>Entries that may have changed</td></tr>
+<tr><td>childSetChanged</td><td>EntryId[]</td><td>Parents whose children changed</td></tr>
+<tr><td>decorationChangedIds</td><td>EntryId[]</td><td>Decoration-only updates</td></tr>
+<tr><td>coarseSubtrees</td><td>EntryId[]</td><td>Watcher overflow regions</td></tr>
+</tbody>
+</table></div>
+</section>
 
-        <article class="entry" id="VisibleRow" data-search="VisibleRow depth hasChildren isExpanded pending">
-          <div class="entry-head">
-            <span class="entry-name">VisibleRow</span>
-            <span class="entry-kind">interface</span>
-            <div class="entry-sig"><span class="k">extends</span> <span class="t">Entry</span></div>
-          </div>
-          <div class="entry-body">
-            <table class="props">
-              <thead><tr><th>Field</th><th>Type</th><th>Notes</th></tr></thead>
-              <tbody>
-                <tr><td>depth</td><td>number</td><td>0 = root level</td></tr>
-                <tr><td>hasChildren</td><td>boolean</td><td>Caret affordance</td></tr>
-                <tr><td>isExpanded</td><td>boolean</td><td>From the query’s expansion set</td></tr>
-                <tr><td>pending<span class="opt">?</span></td><td>true</td><td>Placeholder while children load</td></tr>
-              </tbody>
-            </table>
-          </div>
-        </article>
+<section id="host-client">
+<h2>Host and port client <a class="anchor" href="#host-client" aria-label="Link to Host and port client">#</a></h2>
+<p class="summary">How it runs in Electron: the engine in a utility process, and each window on a <code>PortFileExplorer</code>.</p>
+<h3 id="createFileExplorerHost"><code>createFileExplorerHost</code> <span class="kind">function</span> <a class="anchor" href="#createFileExplorerHost" aria-label="Link to createFileExplorerHost function">#</a></h3>
+<p class="sig">function createFileExplorerHost(options: ExplorerOptions): Promise&lt;FileExplorerHost&gt;</p>
+<p>The utility-process factory. It loads the native module and owns the entry store, the walker and the watcher. Import it from <code>@vibecook/mille/host</code>.</p>
+<h3 id="FileExplorerHost"><code>FileExplorerHost</code> <span class="kind">interface</span> <a class="anchor" href="#FileExplorerHost" aria-label="Link to FileExplorerHost interface">#</a></h3>
+<dl class="defs">
+<dt><code>attachPort(port: MessagePortLike): Disposable</code></dt>
+<dd>Each port is an independent session (expansion, viewport and known ids). Electron’s <code>MessagePortMain</code> needs a short adapter first; the <a href="https://github.com/vibecook-dev/mille/blob/main/apps/playground/EMBEDDING_UI.md">embedding guide</a> has it.</dd>
+<dt><code>readonly sessionCount: number</code></dt>
+<dd>Attached client sessions.</dd>
+<dt><code>readonly local: FileExplorer</code></dt>
+<dd>In-process access for host-side SCM/indexers. Prefer <code>host.registerDecorationProvider</code> when badges must fan out to port clients.</dd>
+<dt><code>registerDecorationProvider(provider): Disposable</code></dt>
+<dd>Host-level decorations store shared by every session.</dd>
+<dt><code>dispose(): Promise&lt;void&gt;</code></dt>
+<dd>Tear down host and native resources.</dd>
+</dl>
+<h3 id="connectFileExplorer"><code>connectFileExplorer</code> <span class="kind">function</span> <a class="anchor" href="#connectFileExplorer" aria-label="Link to connectFileExplorer function">#</a></h3>
+<p class="sig">function connectFileExplorer(port: MessagePortLike, options?: ClientOptions): Promise&lt;PortFileExplorer&gt;</p>
+<p>The renderer-side factory. Import it from <code>@vibecook/mille/port</code>. Reads come from a local mirror of the rows in view; writes round-trip to the host over the wire protocol (v1 frames).</p>
+<h3 id="PortFileExplorer"><code>PortFileExplorer</code> <span class="kind">class</span> <a class="anchor" href="#PortFileExplorer" aria-label="Link to PortFileExplorer class">#</a></h3>
+<p>What a window holds. It mirrors most of <code>FileExplorer</code>, with these differences:</p>
+<ul>
+<li><code>list</code>, <code>prefetch</code>, <code>populateFromRoots</code> and <code>readFileStream</code> are host-side only.</li>
+<li><code>canUndo</code>, <code>peekUndo</code>, <code>lastMutation</code> and <code>cancelOperation</code> are async, and <code>capabilities()</code> is an async method.</li>
+<li><code>on</code> supports <code>change</code> and <code>warning</code> only. Use <code>onConnection()</code> for the connection’s state, and <code>ready()</code> to wait for the first rows.</li>
+<li><code>search</code> is async and resolves hits that also carry their <code>path</code>.</li>
+</ul>
+<h3 id="ClientOptions"><code>ClientOptions</code> <span class="kind">interface</span> <a class="anchor" href="#ClientOptions" aria-label="Link to ClientOptions interface">#</a></h3>
+<div class="scroll"><table>
+<thead><tr><th>Field</th><th>Type</th><th>Default</th></tr></thead>
+<tbody>
+<tr><td>prefetchRows?</td><td>number</td><td><code>100</code>. Tune it to your virtualizer’s overscan.</td></tr>
+<tr><td>mirrorCap?</td><td>number</td><td><code>4096</code>. Cold expansions are evicted least recently used first.</td></tr>
+</tbody>
+</table></div>
+</section>
 
-        <article class="entry" id="ChangeNotice" data-search="ChangeNotice change event treeVersion decorationChangedIds">
-          <div class="entry-head">
-            <span class="entry-name">ChangeNotice</span>
-            <span class="entry-kind">interface</span>
-          </div>
-          <div class="entry-body">
-            <p>Payload for <code>on('change' | 'change:tree' | 'change:decorations')</code>. Pull model: bump version, re-read only the rows you need.</p>
-            <table class="props">
-              <thead><tr><th>Field</th><th>Type</th><th>Notes</th></tr></thead>
-              <tbody>
-                <tr><td>treeVersion</td><td>number</td><td></td></tr>
-                <tr><td>decorationVersion</td><td>number</td><td></td></tr>
-                <tr><td>changed</td><td>{ tree; decorations }</td><td>Which dimensions moved</td></tr>
-                <tr><td>changedIds</td><td>EntryId[]</td><td>Entries that may have changed</td></tr>
-                <tr><td>childSetChanged</td><td>EntryId[]</td><td>Parents whose children changed</td></tr>
-                <tr><td>decorationChangedIds</td><td>EntryId[]</td><td>Decoration-only updates</td></tr>
-                <tr><td>coarseSubtrees</td><td>EntryId[]</td><td>Watcher overflow regions</td></tr>
-              </tbody>
-            </table>
-          </div>
-        </article>
-      </section>
+<section id="decorations-search">
+<h2>Decorations &amp; search <a class="anchor" href="#decorations-search" aria-label="Link to Decorations &amp;amp; search">#</a></h2>
+<p class="summary">Overlays and filename ranking without poisoning the tree version channel.</p>
+<h3 id="Decoration"><code>Decoration</code> <span class="kind">interface</span> <a class="anchor" href="#Decoration" aria-label="Link to Decoration interface">#</a></h3>
+<div class="scroll"><table>
+<thead><tr><th>Field</th><th>Type</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>letter?</td><td>string</td><td>A status glyph for the row, e.g. <code>M</code>, <code>A</code>, <code>D</code></td></tr>
+<tr><td>badge?</td><td>string</td><td>A short count pill, e.g. <code>3</code>, <code>!</code></td></tr>
+<tr><td>color?</td><td>string</td><td>Theme token</td></tr>
+<tr><td>tooltip?</td><td>string</td><td></td></tr>
+<tr><td>propagate?</td><td>boolean</td><td>Roll up to ancestor folders</td></tr>
+</tbody>
+</table></div>
+<h3 id="DecorationProvider"><code>DecorationProvider</code> <span class="kind">interface</span> <a class="anchor" href="#DecorationProvider" aria-label="Link to DecorationProvider interface">#</a></h3>
+<div class="scroll"><table>
+<thead><tr><th>Member</th><th>Type</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>id</td><td>string</td><td>Stable provider key</td></tr>
+<tr><td>onDidChange</td><td>(listener) ⇒ Disposable</td><td>Emit when specific EntryIds change</td></tr>
+<tr><td>provide</td><td>({ id }) ⇒ Decoration | null | Promise</td><td>The overlay for one entry. Only <code>id</code> is guaranteed; look the entry up on the snapshot.</td></tr>
+</tbody>
+</table></div>
+<h3 id="search"><code>search</code> <span class="kind">method</span> <a class="anchor" href="#search" aria-label="Link to search method">#</a></h3>
+<p class="sig">FileExplorer      search(query: string, options?: SearchOptions): readonly SearchHit[]
+PortFileExplorer  search(query: string, options?: SearchOptions): Promise&lt;PortSearchResults&gt;</p>
+<p>A fuzzy match over file names and paths in the in-memory entry list. Over a port each hit also carries its <code>path</code>, the result has <code>clipped</code> and <code>treeVersion</code>, and the options accept a <code>signal</code>. Searching file contents is out of scope for this package.</p>
+<div class="scroll"><table>
+<thead><tr><th>SearchOptions</th><th>Type</th><th>Default</th></tr></thead>
+<tbody>
+<tr><td>limit?</td><td>number</td><td>Over a port: <code>100</code>, at most <code>1000</code>. On a <code>FileExplorer</code>: no limit unless you set one.</td></tr>
+<tr><td>includeIgnored?</td><td>boolean</td><td></td></tr>
+<tr><td>kinds?</td><td>number[]</td><td><code>EntryKind</code> values</td></tr>
+<tr><td>caseSensitive?</td><td>boolean</td><td></td></tr>
+</tbody>
+</table></div>
+<p><code>SearchHit</code>: <code>{ entry, score, matchedIndices }</code> — indices into the name for highlighting.</p>
+</section>
 
-      <!-- Host / client -->
-      <section class="api-section" id="host-client">
-        <h2>Host / client split</h2>
-        <p class="lede">Recommended Electron deployment. Both sides satisfy the FileExplorer shape so renderers stay agnostic.</p>
+<section id="ui">
+<h2>The React tree: @vibecook/mille-ui <a class="anchor" href="#ui" aria-label="Link to The React tree: @vibecook/mille-ui">#</a></h2>
+<p class="summary">The engine owns structure; this package draws it. Its peers are React 19 and <code>@tanstack/react-virtual</code>. The Radix peers are optional, for the styled entry.</p>
+<h3 id="FileTree"><code>FileTree</code> <span class="kind">component</span> <a class="anchor" href="#FileTree" aria-label="Link to FileTree component">#</a></h3>
+<p class="sig">&lt;FileTree fx={…} ariaLabel="Files" /&gt;</p>
+<p>Virtualized ARIA tree. Pass <code>fx</code> for standalone use (self-wraps provider), or nest inside <code>FileTreeProvider</code> for shared command registry / multi-tree setups.</p>
+<div class="scroll"><table>
+<thead><tr><th>Prop</th><th>Type</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>fx?</td><td>FileTreeEngine</td><td>A <code>PortFileExplorer</code> from <code>connectFileExplorer</code></td></tr>
+<tr><td>ariaLabel</td><td>string</td><td>Required for accessibility</td></tr>
+<tr><td>rowHeight?</td><td>number</td><td>Default: the theme’s <code>--mille-row-height</code> (22 with <code>tokens.css</code>, 26 with the minimal and vibefield themes)</td></tr>
+<tr><td>overscan?</td><td>number</td><td>Default <code>20</code></td></tr>
+<tr><td>iconTheme?</td><td>IconTheme</td><td>VS Code File Icon Theme compatible. Prefer <code>duotoneIconTheme</code>, <code>defaultIconTheme</code>, or <code>loadMaterialIconTheme()</code></td></tr>
+<tr><td>emptyState?</td><td>ReactNode</td><td></td></tr>
+<tr><td>loadingState?</td><td>ReactNode</td><td></td></tr>
+<tr><td>ref?</td><td>FileTreeRef</td><td>Imperative handle</td></tr>
+</tbody>
+</table></div>
+<div class="code"><header><span>tsx</span></header><pre tabindex="0"><code><span class="k">import</span> { FileTree } <span class="k">from</span> <span class="s">'@vibecook/mille-ui'</span>;
+<span class="k">import</span> { duotoneIconTheme } <span class="k">from</span> <span class="s">'@vibecook/mille-ui/icons/duotone'</span>;
+<span class="k">import</span> <span class="s">'@vibecook/mille-ui/tokens.css'</span>;
 
-        <article class="entry" id="createFileExplorerHost" data-search="createFileExplorerHost host utility process">
-          <div class="entry-head">
-            <span class="entry-name">createFileExplorerHost</span>
-            <span class="entry-kind fn">function</span>
-            <div class="entry-sig"><span class="k">function</span> createFileExplorerHost(options: <span class="t">ExplorerOptions</span>): <span class="t">Promise&lt;FileExplorerHost&gt;</span></div>
-          </div>
-          <div class="entry-body">
-            <p>UtilityProcess-side factory. Loads the native module, owns the EntryStore, walker, and watcher. Import from <code>@vibecook/mille/host</code>.</p>
-          </div>
-        </article>
+&lt;FileTree fx={fx} ariaLabel=<span class="s">"Files"</span> rowHeight={22} iconTheme={duotoneIconTheme} /&gt;;</code></pre></div>
+<h3 id="FileTreeRef"><code>FileTreeRef</code> <span class="kind">interface</span> <a class="anchor" href="#FileTreeRef" aria-label="Link to FileTreeRef interface">#</a></h3>
+<p>Imperative handle via <code>forwardRef</code> / <code>useFileTreeRef</code>.</p>
+<dl class="defs">
+<dt><code>revealPath / revealId</code></dt>
+<dd>Expand ancestors and scroll the target into view.</dd>
+<dt><code>scrollToRow</code></dt>
+<dd>Scroll to a visible row index.</dd>
+<dt><code>clearSelection / clearFilter / clearClipboard</code></dt>
+<dd>Reset interaction state.</dd>
+<dt><code>focusFilter</code></dt>
+<dd>Move focus to the filter input.</dd>
+</dl>
+<h3 id="ui-entries"><code>UI entry points</code> <span class="kind">modules</span> <a class="anchor" href="#ui-entries" aria-label="Link to UI entry points modules">#</a></h3>
+<div class="scroll"><table>
+<thead><tr><th>Import</th><th>Contents</th></tr></thead>
+<tbody>
+<tr><td>@vibecook/mille-ui</td><td>Styled FileTree, hooks, decorations UI</td></tr>
+<tr><td>…/headless</td><td>Hooks, provider and context, command registry primitives, prop types and the <code>milleClassNames</code> catalog. No components.</td></tr>
+<tr><td>…/commands</td><td>Command registry + defaults (expand, rename, delete…)</td></tr>
+<tr><td>…/git</td><td>registerGitDecorations (host-wired client)</td></tr>
+<tr><td>…/git/node</td><td>createShellGitClient. spawns git status</td></tr>
+<tr><td>…/agent-rules</td><td>.cursor/rules, CLAUDE.md, .kiro badges</td></tr>
+<tr><td>…/icons</td><td>The icon subsystem: <code>FileIcon</code>, <code>createIconResolver</code>, <code>loadIconTheme</code>, plus the default, duotone and minimal themes</td></tr>
+<tr><td>…/icons/default</td><td>Monoline folder + file icons</td></tr>
+<tr><td>…/icons/duotone</td><td>Soft-duotone set. <code>FileTree</code> itself falls back to <code>defaultIconTheme</code>.</td></tr>
+<tr><td>…/icons/minimal, …/icons/vibefield</td><td>Two more icon sets</td></tr>
+<tr><td>…/theme/minimal.css, …/theme/vibefield.css</td><td>Tree themes, used in place of the default tokens</td></tr>
+<tr><td>…/icons/material</td><td>Material Icon Theme bundle</td></tr>
+<tr><td>…/testing</td><td>createFakeEngine for unit tests</td></tr>
+<tr><td>…/tokens.css</td><td>CSS variables for the styled tree</td></tr>
+</tbody>
+</table></div>
+</section>
 
-        <article class="entry" id="FileExplorerHost" data-search="FileExplorerHost attachPort sessionCount local">
-          <div class="entry-head">
-            <span class="entry-name">FileExplorerHost</span>
-            <span class="entry-kind">interface</span>
+            <p class="empty">Nothing on this page matches. Clear the filter to see every section.</p>
           </div>
-          <div class="entry-body">
-            <div class="method-list">
-              <div class="method">
-                <div class="method-sig"><span class="name">attachPort</span>(port: MessagePortLike): <span class="ret">Disposable</span></div>
-                <p>Each port is an independent session (expansion + viewport + knownIds).</p>
-              </div>
-              <div class="method">
-                <div class="method-sig">readonly <span class="name">sessionCount</span>: <span class="ret">number</span></div>
-                <p>Attached client sessions.</p>
-              </div>
-              <div class="method">
-                <div class="method-sig">readonly <span class="name">local</span>: <span class="ret">FileExplorer</span></div>
-                <p>In-process access for host-side SCM/indexers. Prefer <code>host.registerDecorationProvider</code> when badges must fan out to port clients.</p>
-              </div>
-              <div class="method">
-                <div class="method-sig"><span class="name">registerDecorationProvider</span>(provider): <span class="ret">Disposable</span></div>
-                <p>Host-level decorations store shared by every session.</p>
-              </div>
-              <div class="method">
-                <div class="method-sig"><span class="name">dispose</span>(): <span class="ret">Promise&lt;void&gt;</span></div>
-                <p>Tear down host and native resources.</p>
-              </div>
-            </div>
-          </div>
-        </article>
-
-        <article class="entry" id="connectFileExplorer" data-search="connectFileExplorer PortFileExplorer renderer MessagePort">
-          <div class="entry-head">
-            <span class="entry-name">connectFileExplorer</span>
-            <span class="entry-kind fn">function</span>
-            <div class="entry-sig"><span class="k">function</span> connectFileExplorer(port: <span class="t">MessagePortLike</span>, options?: <span class="t">ClientOptions</span>): <span class="t">Promise&lt;FileExplorer&gt;</span></div>
-          </div>
-          <div class="entry-body">
-            <p>Renderer-side factory. Reads from a local ViewportMirror; writes round-trip to the host over the wire protocol (v1 frames).</p>
-          </div>
-        </article>
-
-        <article class="entry" id="ClientOptions" data-search="ClientOptions prefetchRows mirrorCap">
-          <div class="entry-head">
-            <span class="entry-name">ClientOptions</span>
-            <span class="entry-kind">interface</span>
-          </div>
-          <div class="entry-body">
-            <table class="props">
-              <thead><tr><th>Field</th><th>Type</th><th>Default</th></tr></thead>
-              <tbody>
-                <tr><td>prefetchRows<span class="opt">?</span></td><td>number</td><td><code>200</code> — tune to virtualizer overscan</td></tr>
-                <tr><td>mirrorCap<span class="opt">?</span></td><td>number</td><td><code>20_000</code> — LRU eviction of cold expansions</td></tr>
-              </tbody>
-            </table>
-          </div>
-        </article>
-      </section>
-
-      <!-- Decorations & search -->
-      <section class="api-section" id="decorations-search">
-        <h2>Decorations &amp; search</h2>
-        <p class="lede">Overlays and filename ranking without poisoning the tree version channel.</p>
-
-        <article class="entry" id="Decoration" data-search="Decoration badge color tooltip propagate">
-          <div class="entry-head">
-            <span class="entry-name">Decoration</span>
-            <span class="entry-kind">interface</span>
-          </div>
-          <div class="entry-body">
-            <table class="props">
-              <thead><tr><th>Field</th><th>Type</th><th>Notes</th></tr></thead>
-              <tbody>
-                <tr><td>badge<span class="opt">?</span></td><td>string</td><td>1–2 chars, e.g. <code>M</code>, <code>!</code></td></tr>
-                <tr><td>color<span class="opt">?</span></td><td>string</td><td>Theme token</td></tr>
-                <tr><td>tooltip<span class="opt">?</span></td><td>string</td><td></td></tr>
-                <tr><td>propagate<span class="opt">?</span></td><td>boolean</td><td>Roll up to ancestor folders</td></tr>
-              </tbody>
-            </table>
-          </div>
-        </article>
-
-        <article class="entry" id="DecorationProvider" data-search="DecorationProvider provide onDidChange">
-          <div class="entry-head">
-            <span class="entry-name">DecorationProvider</span>
-            <span class="entry-kind">interface</span>
-          </div>
-          <div class="entry-body">
-            <table class="props">
-              <thead><tr><th>Member</th><th>Type</th><th>Notes</th></tr></thead>
-              <tbody>
-                <tr><td>id</td><td>string</td><td>Stable provider key</td></tr>
-                <tr><td>onDidChange</td><td>(listener) ⇒ Disposable</td><td>Emit when specific EntryIds change</td></tr>
-                <tr><td>provide</td><td>(entry) ⇒ Decoration | null | Promise</td><td>Per-entry overlay</td></tr>
-              </tbody>
-            </table>
-          </div>
-        </article>
-
-        <article class="entry" id="search" data-search="search SearchHit SearchOptions nucleo fuzzy">
-          <div class="entry-head">
-            <span class="entry-name">search</span>
-            <span class="entry-kind fn">method</span>
-            <div class="entry-sig">fx.search(query: <span class="t">string</span>, options?: <span class="t">SearchOptions</span>): <span class="t">Promise&lt;SearchHit[]&gt;</span></div>
-          </div>
-          <div class="entry-body">
-            <p>Fuzzy match over filenames/paths in the in-memory entry list. Content search is intentionally out of scope for this package.</p>
-            <table class="props">
-              <thead><tr><th>SearchOptions</th><th>Type</th><th>Default</th></tr></thead>
-              <tbody>
-                <tr><td>limit<span class="opt">?</span></td><td>number</td><td><code>100</code></td></tr>
-                <tr><td>includeIgnored<span class="opt">?</span></td><td>boolean</td><td></td></tr>
-                <tr><td>kinds<span class="opt">?</span></td><td>EntryKind[]</td><td></td></tr>
-                <tr><td>caseSensitive<span class="opt">?</span></td><td>boolean</td><td></td></tr>
-              </tbody>
-            </table>
-            <p style="margin-top:0.75rem"><code>SearchHit</code>: <code>{ entry, score, matchedIndices }</code> — indices into the name for highlighting.</p>
-          </div>
-        </article>
-      </section>
-
-      <!-- UI -->
-      <section class="api-section" id="ui">
-        <h2>UI — @vibecook/mille-ui</h2>
-        <p class="lede">The engine owns structure; this package renders it. Peer: React 19, @tanstack/react-virtual. Radix peers optional for the styled entry.</p>
-
-        <article class="entry" id="FileTree" data-search="FileTree props fx ariaLabel rowHeight iconTheme">
-          <div class="entry-head">
-            <span class="entry-name">FileTree</span>
-            <span class="entry-kind class">component</span>
-            <div class="entry-sig">&lt;FileTree fx={…} ariaLabel="Files" /&gt;</div>
-          </div>
-          <div class="entry-body">
-            <p>Virtualized ARIA tree. Pass <code>fx</code> for standalone use (self-wraps provider), or nest inside <code>FileTreeProvider</code> for shared command registry / multi-tree setups.</p>
-            <table class="props">
-              <thead><tr><th>Prop</th><th>Type</th><th>Notes</th></tr></thead>
-              <tbody>
-                <tr><td>fx<span class="opt">?</span></td><td>FileTreeEngine</td><td>Explorer or port client</td></tr>
-                <tr><td>ariaLabel</td><td>string</td><td>Required for accessibility</td></tr>
-                <tr><td>rowHeight<span class="opt">?</span></td><td>number</td><td>Default <code>22</code></td></tr>
-                <tr><td>overscan<span class="opt">?</span></td><td>number</td><td>Default <code>20</code></td></tr>
-                <tr><td>iconTheme<span class="opt">?</span></td><td>IconTheme</td><td>VS Code File Icon Theme compatible. Prefer <code>duotoneIconTheme</code>, <code>defaultIconTheme</code>, or <code>loadMaterialIconTheme()</code></td></tr>
-                <tr><td>emptyState<span class="opt">?</span></td><td>ReactNode</td><td></td></tr>
-                <tr><td>loadingState<span class="opt">?</span></td><td>ReactNode</td><td></td></tr>
-                <tr><td>ref<span class="opt">?</span></td><td>FileTreeRef</td><td>Imperative handle (v0.2)</td></tr>
-              </tbody>
-            </table>
-            <pre class="code-block"><span class="kw">import</span> { <span class="fn">FileTree</span> } <span class="kw">from</span> <span class="str">'@vibecook/mille-ui'</span>;
-<span class="kw">import</span> { <span class="fn">duotoneIconTheme</span> } <span class="kw">from</span> <span class="str">'@vibecook/mille-ui/icons/duotone'</span>;
-<span class="kw">import</span> <span class="str">'@vibecook/mille-ui/tokens.css'</span>;
-
-&lt;<span class="ty">FileTree</span> fx={fx} ariaLabel=<span class="str">"Files"</span> rowHeight={22} iconTheme={duotoneIconTheme} /&gt;;</pre>
-          </div>
-        </article>
-
-        <article class="entry" id="FileTreeRef" data-search="FileTreeRef revealPath revealId scrollToRow clearSelection">
-          <div class="entry-head">
-            <span class="entry-name">FileTreeRef</span>
-            <span class="entry-kind">interface</span>
-          </div>
-          <div class="entry-body">
-            <p>Imperative handle via <code>forwardRef</code> / <code>useFileTreeRef</code>.</p>
-            <div class="method-list">
-              <div class="method">
-                <div class="method-sig"><span class="name">revealPath</span> / <span class="name">revealId</span></div>
-                <p>Expand ancestors and scroll the target into view.</p>
-              </div>
-              <div class="method">
-                <div class="method-sig"><span class="name">scrollToRow</span></div>
-                <p>Scroll to a visible row index.</p>
-              </div>
-              <div class="method">
-                <div class="method-sig"><span class="name">clearSelection</span> / <span class="name">clearFilter</span> / <span class="name">clearClipboard</span></div>
-                <p>Reset interaction state.</p>
-              </div>
-              <div class="method">
-                <div class="method-sig"><span class="name">focusFilter</span></div>
-                <p>Move focus to the filter input.</p>
-              </div>
-            </div>
-          </div>
-        </article>
-
-        <article class="entry" id="ui-entries" data-search="headless git agent-rules icons testing commands">
-          <div class="entry-head">
-            <span class="entry-name">UI entry points</span>
-            <span class="entry-kind">modules</span>
-          </div>
-          <div class="entry-body">
-            <table class="props">
-              <thead><tr><th>Import</th><th></th><th>Contents</th></tr></thead>
-              <tbody>
-                <tr><td>@vibecook/mille-ui</td><td></td><td>Styled FileTree, hooks, decorations UI</td></tr>
-                <tr><td>…/headless</td><td></td><td>Structural components + class catalog</td></tr>
-                <tr><td>…/commands</td><td></td><td>Command registry + defaults (expand, rename, delete…)</td></tr>
-                <tr><td>…/git</td><td></td><td>registerGitDecorations (host-wired client)</td></tr>
-                <tr><td>…/git/node</td><td></td><td>createShellGitClient — spawns git status</td></tr>
-                <tr><td>…/agent-rules</td><td></td><td>.cursor/rules, CLAUDE.md, .kiro badges</td></tr>
-                <tr><td>…/icons</td><td></td><td>Re-exports default + duotone themes</td></tr>
-                <tr><td>…/icons/default</td><td></td><td>Monoline folder + file icons</td></tr>
-                <tr><td>…/icons/duotone</td><td></td><td>Soft-duotone set (product default)</td></tr>
-                <tr><td>…/icons/material</td><td></td><td>Material Icon Theme bundle</td></tr>
-                <tr><td>…/testing</td><td></td><td>createFakeEngine for unit tests</td></tr>
-                <tr><td>…/tokens.css</td><td></td><td>CSS variables for the styled tree</td></tr>
-              </tbody>
-            </table>
-          </div>
-        </article>
-      </section>
-
-      <div class="callout" style="margin-top:2rem">
-        <strong>Need the full wire protocol or packaging notes?</strong>
-        See <a href="https://github.com/vibecook-dev/mille/blob/main/packages/mille/EMBEDDING.md" target="_blank" rel="noopener">EMBEDDING.md</a>
-        for UtilityProcess diagrams, electron-builder packaging, and performance tuning.
-        Source of truth for types: <a href="https://github.com/vibecook-dev/mille/blob/main/packages/mille/api.d.ts" target="_blank" rel="noopener">api.d.ts</a>.
+        </div>
       </div>
-    </div>
-  </div>
-
-  <footer>
-    <div class="footer-inner">
-      <span>mille API · v0.2.1 · MIT</span>
-      <span>
-        <a href="index.html">Home</a>
-        ·
-        <a href="https://github.com/vibecook-dev/mille" target="_blank" rel="noopener">GitHub</a>
-      </span>
-    </div>
-  </footer>
-
-  <script>
-    // Mobile nav
-    const navToggle = document.getElementById('nav-toggle');
-    const navMenu = document.getElementById('nav-menu');
-    navToggle?.addEventListener('click', () => {
-      const open = navMenu.classList.toggle('is-open');
-      navToggle.setAttribute('aria-expanded', String(open));
-    });
-
-    // Mobile TOC
-    const toc = document.getElementById('toc');
-    const tocOpen = document.getElementById('toc-open');
-    tocOpen?.addEventListener('click', () => {
-      toc.classList.toggle('is-open');
-    });
-    toc?.querySelectorAll('a').forEach((a) => {
-      a.addEventListener('click', () => toc.classList.remove('is-open'));
-    });
-
-    // Filter
-    const search = document.getElementById('api-search');
-    const entries = document.querySelectorAll('.entry, .export-card');
-    const tocLinks = document.querySelectorAll('.toc-group a');
-
-    function normalize(s) {
-      return (s || '').toLowerCase();
-    }
-
-    search?.addEventListener('input', () => {
-      const q = normalize(search.value.trim());
-      entries.forEach((el) => {
-        const hay = normalize(el.getAttribute('data-search') + ' ' + el.textContent);
-        const show = !q || hay.includes(q);
-        el.classList.toggle('is-filtered-out', !show);
-        if (el.classList.contains('export-card')) {
-          el.style.display = show ? '' : 'none';
-        }
-      });
-      tocLinks.forEach((a) => {
-        const id = a.getAttribute('href')?.slice(1);
-        if (!id) return;
-        const target = document.getElementById(id);
-        if (!target) return;
-        // show link if section or any child entry matches
-        let match = !q;
-        if (q) {
-          if (normalize(target.textContent).includes(q) || normalize(a.textContent).includes(q)) match = true;
-          target.querySelectorAll('.entry').forEach((e) => {
-            if (!e.classList.contains('is-filtered-out')) match = true;
-          });
-        }
-        a.classList.toggle('is-hidden', !match);
-      });
-    });
-
-    // Active TOC on scroll
-    const sections = [...document.querySelectorAll('.entry[id], .api-section[id]')];
-    const linkById = new Map(
-      [...tocLinks].map((a) => [a.getAttribute('href')?.slice(1), a])
-    );
-
-    const io = new IntersectionObserver(
-      (items) => {
-        items.forEach((item) => {
-          if (!item.isIntersecting) return;
-          const id = item.target.id;
-          linkById.forEach((link) => link.classList.remove('is-active'));
-          const active = linkById.get(id);
-          if (active) active.classList.add('is-active');
-        });
-      },
-      { rootMargin: '-20% 0px -70% 0px', threshold: 0 }
-    );
-    sections.forEach((s) => io.observe(s));
-  </script>
-</body>
+    </main>
+    <footer class="sheet">
+      <div class="rule"></div>
+      <div class="foot">
+        <h2>From the same kitchen</h2>
+        <ul class="family">
+          <li><a href="https://vibecook-dev.github.io/truffle/"><svg viewBox="78 81.6 97.3 92.4" aria-hidden="true"><path d="M98.7047 139.617C106.418 139.221 112.734 142.28 115.58 149.86C117.317 154.6 117.123 159.84 115.043 164.441C112.429 170.124 109.319 171.949 103.904 173.973C78.6944 173.479 77.9612 146.947 98.7047 139.617Z"/><path d="M150.179 139.544C157.989 139.03 165.208 141.278 169.298 148.47C171.499 152.293 172.023 156.854 170.749 161.073C169.041 166.544 165.457 169.115 160.681 171.462C156.545 172.556 152.986 173.024 148.906 171.363C144.771 169.682 141.551 166.314 140.057 162.115C136.569 152.556 140.327 142.88 150.179 139.544Z"/><path d="M153.255 82.222C156.898 81.932 159.93 81.6024 163.312 83.5272C171.276 88.0557 175.255 100.719 170.344 108.734C167.683 113.078 164.427 114.014 159.814 115.174C136.98 115.254 132.989 91.3912 153.255 82.222Z"/><path d="M100.043 82.3538C108.871 81.6419 116.625 88.1679 117.433 96.9877C118.24 105.808 111.801 113.632 102.991 114.542C97.2021 115.135 91.5383 112.577 88.1625 107.838C84.7874 103.098 84.2203 96.9086 86.679 91.6351C89.137 86.3617 94.241 82.8153 100.043 82.3538Z"/></svg><b>truffle</b><span>Your devices, talking to each other directly.</span></a></li>
+          <li><a href="https://vibecook-dev.github.io/ghosttea/"><svg viewBox="58.38 83 143.05 89.17" aria-hidden="true"><path d="M171.248 132.926C177.368 132.314 188.177 132.91 193.706 136.051C201.428 140.438 195.492 150.182 191.834 155.314C184.652 165.39 175.461 168.599 163.661 170.443C152.434 171.701 127.066 171.966 138.553 153.451C146.292 140.978 157.66 136.293 171.248 132.926Z"/><path d="M79.2576 134.961C88.7607 134.158 97.3116 136.73 104.744 142.678C121.595 156.162 129.11 170.343 100.815 172.174C85.6558 171.268 70.2767 165.523 62.1029 151.863C60.5804 149.319 58.3782 145.378 59.1648 142.448C63.407 138.277 73.4771 136.182 79.2576 134.961Z"/><path d="M127.372 83C140.064 88.2326 149.556 122.874 141.698 134.595C138.354 139.583 133.449 144.51 128.724 148.158C118.647 147.63 113.299 133.04 112.116 124.546C110.012 109.454 118.522 94.4875 127.372 83Z"/></svg><b>ghosttea</b><span>The Ghostty terminal experience, inside your app.</span></a></li>
+          <li><a href="./" aria-current="true"><svg viewBox="70.57 75 120.63 107.34" aria-hidden="true"><path d="M128.651 75C131.634 75.6963 177.883 133.951 183.236 141.676L182.39 143.16C174.875 146.964 142.347 143.352 131.518 143.016C111.446 142.892 91.469 144.227 71.3885 143.567C80.4137 131.043 91.0678 118.833 101.109 107.046C109.988 96.6225 119.374 84.9839 128.651 75Z"/><path d="M167.846 154.381C185.143 154.085 191.201 172.394 175.234 180.899C156.801 182.342 152.991 159.248 167.846 154.381Z"/><path d="M79.8215 156.238C91.3465 155.191 98.2357 162.371 95.0299 174.588C94.0348 178.379 89.9894 179.932 86.5509 181.46C84.6362 181.589 81.6823 181.454 79.8997 180.847C76.6053 179.752 73.8849 177.388 72.3402 174.28C70.7738 171.143 70.5714 167.499 71.781 164.208C73.4846 159.473 75.7031 158.27 79.8215 156.238Z"/><path d="M125.393 154.309C141.945 154.48 145.686 171.751 130.892 179.889C111.89 178.768 110.897 163.247 125.393 154.309Z"/></svg><b>mille</b><span>The file tree for the editor you are building.</span></a></li>
+        </ul>
+        <dl class="block">
+          <div><dt>part</dt><dd class="title">mille</dd></div>
+          <div><dt>version</dt><dd><a href="https://www.npmjs.com/package/@vibecook/mille" data-npm="@vibecook/mille">latest</a></dd></div>
+          <div><dt>licence</dt><dd><a href="https://github.com/vibecook-dev/mille/blob/main/LICENSE">MIT</a></dd></div>
+          <div><dt>drawn by</dt><dd><a href="https://github.com/jamesyong-42"><svg class="jy" viewBox="0 0 14107.04 1105.36" role="img" aria-label="James Yong"><path d="M0 555.36a531 531 0 1 1 1062 0a531 531 0 1 1 -1062 0ZM1122 1065.36L2285 1065.36L1703.5 3.36ZM2463 1055.36L3463 1055.36L3463 55.36L2463 55.36ZM5063 55.36L5063 776.79L5062.64 791.51L5061.56 806.19L5059.75 820.8L5057.24 835.31L5054.01 849.68L5050.08 863.87L5045.46 877.85L5040.16 891.59L5034.2 905.05L5027.58 918.2L5020.32 931.02L5012.44 943.46L5003.96 955.5L4994.9 967.1L4985.29 978.25L4975.13 988.92L4964.47 999.07L4953.32 1008.69L4941.71 1017.75L4929.67 1026.23L4917.23 1034.1L4904.42 1041.36L4891.27 1047.98L4877.81 1053.95L4864.07 1059.25L4850.09 1063.87L4835.89 1067.8L4821.53 1071.02L4807.02 1073.54L4792.41 1075.34L4777.72 1076.42L4763 1076.79L4748.28 1076.42L4733.59 1075.34L4718.98 1073.54L4704.47 1071.02L4690.11 1067.8L4675.91 1063.87L4661.93 1059.25L4648.19 1053.95L4634.73 1047.98L4621.58 1041.36L4608.77 1034.1L4596.33 1026.23L4584.29 1017.75L4572.68 1008.69L4561.53 999.07L4550.87 988.92L4540.71 978.25L4531.1 967.1L4522.04 955.5L4513.56 943.46L4505.68 931.02L4498.42 918.2L4491.8 905.05L4485.84 891.59L4480.54 877.85L4475.92 863.87L4471.99 849.68L4468.76 835.31L4466.25 820.8L4464.44 806.19L4463.36 791.51L4463 776.79L4636.29 776.79L4636.44 783.89L4636.9 790.97L4637.66 798.02L4638.72 805.02L4640.08 811.95L4641.74 818.79L4643.69 825.54L4645.93 832.17L4648.45 838.66L4651.25 845L4654.31 851.18L4657.64 857.18L4661.22 862.99L4665.05 868.59L4669.11 873.97L4673.4 879.11L4677.9 884.01L4682.61 888.65L4687.52 893.02L4692.6 897.11L4697.86 900.91L4703.27 904.41L4708.82 907.61L4714.51 910.48L4720.31 913.04L4726.22 915.27L4732.21 917.16L4738.28 918.72L4744.41 919.93L4750.58 920.8L4756.78 921.33L4763 921.5L4769.22 921.33L4775.42 920.8L4781.59 919.93L4787.72 918.72L4793.79 917.16L4799.78 915.27L4805.69 913.04L4811.49 910.48L4817.18 907.61L4822.73 904.41L4828.14 900.91L4833.4 897.11L4838.48 893.02L4843.39 888.65L4848.1 884.01L4852.6 879.11L4856.89 873.97L4860.95 868.59L4864.78 862.99L4868.36 857.18L4871.69 851.18L4874.75 845L4877.55 838.66L4880.07 832.17L4882.31 825.54L4884.26 818.79L4885.92 811.95L4887.28 805.02L4888.34 798.02L4889.1 790.97L4889.56 783.89L4889.71 776.79L4889.71 55.36ZM5473.07 798.21H6001.64L5969.5 656.07H5505.21ZM5734.5 338.21 5893.78 709.29 5897 751.07 6032.71 1055.36H6223.78L5734.5 0L5245.21 1055.36H5436.28L5574.86 742.14L5577.36 705ZM6597.87 446.43 6902.51 962.5 7207.15 446.43 7275.72 1055.36H7450.72L7313.22 5.36L6902.51 683.57L6491.8 5.36L6354.3 1055.36H6529.3ZM7790.35 1055.36H8294.63V907.14H7790.35ZM7790.35 203.57H8294.63V55.36H7790.35ZM7790.35 592.86H8266.06V446.43H7790.35ZM7685.71 55.36V1055.36H7851.78V55.36ZM8559.37 733.21 8433.65 821.07Q8466.87 889.29 8522.76 948.04Q8578.65 1006.79 8653.65 1041.79Q8728.65 1076.79 8816.51 1076.79Q8880.8 1076.79 8940.26 1056.43Q8999.72 1036.07 9046.87 997.86Q9094.01 959.64 9121.33 904.11Q9148.65 848.57 9148.65 778.57Q9148.65 712.5 9126.15 663.57Q9103.65 614.64 9066.87 578.75Q9030.08 542.86 8985.08 518.39Q8940.08 493.93 8895.08 477.86Q8815.08 450 8764.9 422.86Q8714.72 395.71 8691.33 364.64Q8667.94 333.57 8667.94 295Q8667.94 252.5 8700.97 220.18Q8734.01 187.86 8803.3 187.86Q8854.01 187.86 8891.69 207.5Q8929.37 227.14 8957.76 259.11Q8986.15 291.07 9005.8 327.86L9142.22 250.71Q9117.22 198.21 9072.05 149.46Q9026.87 100.71 8961.15 69.11Q8895.44 37.5 8806.15 37.5Q8716.87 37.5 8645.8 71.25Q8574.72 105 8533.65 165.71Q8492.58 226.43 8492.58 306.79Q8492.58 377.14 8519.37 426.43Q8546.15 475.71 8587.76 509.46Q8629.37 543.21 8675.26 564.82Q8721.15 586.43 8757.94 599.64Q8821.15 622.5 8869.19 645.89Q8917.22 669.29 8944.19 702.86Q8971.15 736.43 8971.15 791.79Q8971.15 851.43 8928.3 888.39Q8885.44 925.36 8816.15 925.36Q8760.08 925.36 8713.83 901.43Q8667.58 877.5 8629.9 834.11Q8592.22 790.71 8559.37 733.21ZM10360.17 55.36 10126.96 483.21 9894.82 55.36H9701.96L10041.96 635.36V1055.36H10213.39V633.57L10553.03 55.36ZM10861.69 555.36Q10861.69 452.14 10905.44 371.96Q10949.19 291.79 11025.98 245.54Q11102.76 199.29 11201.69 199.29Q11302.76 199.29 11378.84 245.54Q11454.91 291.79 11498.3 371.96Q11541.69 452.14 11541.69 555.36Q11541.69 658.21 11497.94 738.57Q11454.19 818.93 11377.94 865.18Q11301.69 911.43 11201.69 911.43Q11102.76 911.43 11025.98 865.18Q10949.19 818.93 10905.44 738.57Q10861.69 658.21 10861.69 555.36ZM10682.05 555.36Q10682.05 666.79 10720.62 762.32Q10759.19 857.86 10829.19 928.04Q10899.19 998.21 10994.37 1037.5Q11089.55 1076.79 11201.69 1076.79Q11314.91 1076.79 11409.55 1037.5Q11504.19 998.21 11574.19 928.04Q11644.19 857.86 11682.76 762.32Q11721.34 666.79 11721.34 555.36Q11721.34 442.86 11682.59 348.39Q11643.84 253.93 11573.48 184.46Q11503.12 115 11408.66 76.25Q11314.19 37.5 11201.69 37.5Q11090.98 37.5 10995.98 76.25Q10900.98 115 10830.62 184.46Q10760.26 253.93 10721.16 348.39Q10682.05 442.86 10682.05 555.36ZM12688.55 55.36V726.79L11958.2 5.36V1055.36H12124.27V383.93L12854.63 1105.36V55.36ZM13625.73 675H13931.8Q13918.95 725.71 13893.41 770Q13867.87 814.29 13829.48 848.21Q13791.09 882.14 13738.05 900.89Q13685.02 919.64 13618.59 919.64Q13520.02 919.64 13441.27 873.93Q13362.52 828.21 13316.45 746.07Q13270.37 663.93 13270.37 555.36Q13270.37 445.36 13317.16 364.82Q13363.95 284.29 13442.87 239.46Q13521.8 194.64 13618.59 194.64Q13722.16 194.64 13795.73 237.32Q13869.3 280 13911.09 351.79L14048.59 260Q14003.95 190 13940.73 140.54Q13877.52 91.07 13797.16 64.29Q13716.8 37.5 13618.59 37.5Q13505.73 37.5 13409.48 75Q13313.23 112.5 13241.98 181.61Q13170.73 250.71 13131.27 345.89Q13091.8 441.07 13091.8 555.36Q13091.8 669.64 13130.73 765.36Q13169.66 861.07 13240.2 930.89Q13310.73 1000.71 13406.45 1038.75Q13502.16 1076.79 13615.02 1076.79Q13734.66 1076.79 13827.7 1033.39Q13920.73 990 13983.95 914.29Q14047.16 838.57 14078.41 740.54Q14109.66 642.5 14106.8 532.14H13625.73Z"/></svg></a></dd></div>
+          <div><dt>sheet</dt><dd><a href="./">Guide</a> &nbsp; <a href="api.html" aria-current="page">API</a></dd></div>
+        </dl>
+        <p class="legal"><a href="https://github.com/vibecook-dev/mille/blob/main/LICENSE">MIT</a> © 2026 James Yong. mille is a <a href="https://github.com/vibecook-dev">vibecook</a> project.</p>
+      </div>
+    </footer>
+  </body>
 </html>
