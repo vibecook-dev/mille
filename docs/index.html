@@ -1,1631 +1,241 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>mille — Native file explorer for Electron IDEs</title>
-  <meta name="description" content="High-performance file explorer primitives for Electron IDEs. Rust core, NAPI binding, viewport-virtualized mirror, and a React tree that scales to 500k rows." />
-  <meta name="theme-color" content="#07080c" />
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Source+Sans+3:ital,wght@0,400;0,500;0,600;0,700;1,400&family=Syne:wght@600;700;800&display=swap" rel="stylesheet" />
-  <style>
-    /* ── Design tokens ─────────────────────────────────────────── */
-    :root {
-      --void: #07080c;
-      --ink: #0e1016;
-      --panel: #151822;
-      --panel-2: #1a1e2a;
-      --edge: #252a38;
-      --edge-soft: rgba(255, 255, 255, 0.06);
-      --mist: #9aa3b5;
-      --paper: #eef0f6;
-      --paper-dim: #c5cad6;
-      --signal: #7c9cff;
-      --signal-dim: rgba(124, 156, 255, 0.14);
-      --signal-glow: rgba(124, 156, 255, 0.35);
-      --live: #4ad4b5;
-      --live-dim: rgba(74, 212, 181, 0.12);
-      --brass: #c4a574;
-      --brass-dim: rgba(196, 165, 116, 0.14);
-      --git-m: #e3b341;
-      --git-a: #3fb950;
-      --git-d: #f85149;
-      --font-display: "Syne", system-ui, sans-serif;
-      --font-body: "Source Sans 3", system-ui, sans-serif;
-      --font-mono: "IBM Plex Mono", ui-monospace, monospace;
-      --radius: 12px;
-      --radius-sm: 8px;
-      --max: 1120px;
-      --nav-h: 64px;
-      --ease: cubic-bezier(0.22, 1, 0.36, 1);
-    }
-
-    *, *::before, *::after { box-sizing: border-box; }
-    html { scroll-behavior: smooth; }
-    @media (prefers-reduced-motion: reduce) {
-      html { scroll-behavior: auto; }
-      *, *::before, *::after {
-        animation-duration: 0.01ms !important;
-        animation-iteration-count: 1 !important;
-        transition-duration: 0.01ms !important;
-      }
-    }
-
-    body {
-      margin: 0;
-      background: var(--void);
-      color: var(--paper);
-      font-family: var(--font-body);
-      font-size: 17px;
-      line-height: 1.6;
-      -webkit-font-smoothing: antialiased;
-      text-rendering: optimizeLegibility;
-    }
-
-    a { color: var(--signal); text-decoration: none; }
-    a:hover { text-decoration: underline; text-underline-offset: 3px; }
-    :focus-visible {
-      outline: 2px solid var(--signal);
-      outline-offset: 3px;
-    }
-
-    /* Ambient grid — file-tree indent guides at page scale */
-    body::before {
-      content: "";
-      position: fixed;
-      inset: 0;
-      pointer-events: none;
-      z-index: 0;
-      background-image:
-        linear-gradient(to right, rgba(124, 156, 255, 0.03) 1px, transparent 1px),
-        radial-gradient(ellipse 80% 50% at 50% -10%, rgba(124, 156, 255, 0.12), transparent 55%),
-        radial-gradient(ellipse 40% 30% at 90% 20%, rgba(74, 212, 181, 0.06), transparent 50%);
-      background-size: 48px 100%, 100% 100%, 100% 100%;
-      mask-image: linear-gradient(to bottom, black 0%, black 40%, transparent 90%);
-    }
-
-    .wrap {
-      position: relative;
-      z-index: 1;
-      width: min(100% - 2.5rem, var(--max));
-      margin-inline: auto;
-    }
-
-    /* ── Nav ───────────────────────────────────────────────────── */
-    .nav {
-      position: sticky;
-      top: 0;
-      z-index: 50;
-      height: var(--nav-h);
-      display: flex;
-      align-items: center;
-      backdrop-filter: blur(16px) saturate(1.2);
-      background: rgba(7, 8, 12, 0.72);
-      border-bottom: 1px solid var(--edge-soft);
-    }
-    .nav-inner {
-      width: min(100% - 2.5rem, var(--max));
-      margin-inline: auto;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 1.5rem;
-    }
-    .brand {
-      display: inline-flex;
-      align-items: center;
-      gap: 0.7rem;
-      color: var(--paper);
-      text-decoration: none;
-      font-family: var(--font-display);
-      font-weight: 700;
-      font-size: 1.15rem;
-      letter-spacing: -0.02em;
-    }
-    .brand:hover { text-decoration: none; color: var(--paper); }
-    .brand-mark {
-      width: 28px;
-      height: 28px;
-      border-radius: 7px;
-      background: linear-gradient(145deg, var(--signal) 0%, #4a6fe0 50%, var(--live) 140%);
-      display: grid;
-      place-items: center;
-      box-shadow: 0 0 0 1px rgba(255,255,255,0.12), 0 8px 24px var(--signal-glow);
-    }
-    .brand-mark svg { width: 16px; height: 16px; }
-    .nav-links {
-      display: flex;
-      align-items: center;
-      gap: 0.25rem;
-      list-style: none;
-      margin: 0;
-      padding: 0;
-    }
-    .nav-links a {
-      color: var(--mist);
-      font-size: 0.92rem;
-      font-weight: 500;
-      padding: 0.45rem 0.75rem;
-      border-radius: 6px;
-      text-decoration: none;
-      transition: color 0.15s, background 0.15s;
-    }
-    .nav-links a:hover {
-      color: var(--paper);
-      background: rgba(255,255,255,0.04);
-      text-decoration: none;
-    }
-    .nav-links a[aria-current="page"] {
-      color: var(--paper);
-      background: rgba(255,255,255,0.06);
-    }
-    .nav-cta {
-      display: inline-flex;
-      align-items: center;
-      gap: 0.4rem;
-      padding: 0.5rem 0.9rem !important;
-      background: var(--signal-dim) !important;
-      color: var(--signal) !important;
-      border: 1px solid rgba(124, 156, 255, 0.25);
-      font-weight: 600 !important;
-    }
-    .nav-cta:hover {
-      background: rgba(124, 156, 255, 0.22) !important;
-      color: var(--paper) !important;
-    }
-    .nav-toggle {
-      display: none;
-      background: transparent;
-      border: 1px solid var(--edge);
-      color: var(--paper);
-      border-radius: 8px;
-      padding: 0.45rem 0.65rem;
-      font-family: var(--font-body);
-      font-size: 0.85rem;
-      cursor: pointer;
-    }
-
-    /* ── Buttons ───────────────────────────────────────────────── */
-    .btn {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      gap: 0.5rem;
-      font-family: var(--font-body);
-      font-weight: 600;
-      font-size: 0.95rem;
-      padding: 0.75rem 1.25rem;
-      border-radius: 9px;
-      border: 1px solid transparent;
-      cursor: pointer;
-      text-decoration: none;
-      transition: transform 0.15s var(--ease), background 0.15s, border-color 0.15s, box-shadow 0.15s;
-    }
-    .btn:hover { text-decoration: none; transform: translateY(-1px); }
-    .btn-primary {
-      background: linear-gradient(180deg, #8eabff 0%, var(--signal) 100%);
-      color: #0a0c14;
-      box-shadow: 0 1px 0 rgba(255,255,255,0.2) inset, 0 8px 28px var(--signal-glow);
-    }
-    .btn-primary:hover { color: #0a0c14; box-shadow: 0 1px 0 rgba(255,255,255,0.25) inset, 0 12px 36px var(--signal-glow); }
-    .btn-ghost {
-      background: transparent;
-      color: var(--paper);
-      border-color: var(--edge);
-    }
-    .btn-ghost:hover {
-      background: rgba(255,255,255,0.04);
-      border-color: rgba(255,255,255,0.14);
-      color: var(--paper);
-    }
-
-    /* ── Hero ──────────────────────────────────────────────────── */
-    .hero {
-      padding: 4.5rem 0 3.5rem;
-      display: grid;
-      grid-template-columns: 1.05fr 0.95fr;
-      gap: 3rem;
-      align-items: center;
-    }
-    .eyebrow {
-      display: inline-flex;
-      align-items: center;
-      gap: 0.55rem;
-      font-family: var(--font-mono);
-      font-size: 0.75rem;
-      font-weight: 500;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
-      color: var(--live);
-      background: var(--live-dim);
-      border: 1px solid rgba(74, 212, 181, 0.22);
-      padding: 0.35rem 0.7rem;
-      border-radius: 999px;
-      margin-bottom: 1.35rem;
-    }
-    .eyebrow .dot {
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-      background: var(--live);
-      box-shadow: 0 0 0 0 rgba(74, 212, 181, 0.5);
-      animation: pulse 2.2s var(--ease) infinite;
-    }
-    @keyframes pulse {
-      0%, 100% { box-shadow: 0 0 0 0 rgba(74, 212, 181, 0.45); }
-      50% { box-shadow: 0 0 0 6px rgba(74, 212, 181, 0); }
-    }
-    .hero h1 {
-      font-family: var(--font-display);
-      font-weight: 800;
-      font-size: clamp(2.4rem, 4.8vw, 3.65rem);
-      line-height: 1.05;
-      letter-spacing: -0.035em;
-      margin: 0 0 1.25rem;
-      color: var(--paper);
-    }
-    .hero h1 .accent {
-      background: linear-gradient(120deg, var(--signal) 10%, var(--live) 90%);
-      -webkit-background-clip: text;
-      background-clip: text;
-      color: transparent;
-    }
-    .hero-lead {
-      font-size: 1.15rem;
-      line-height: 1.65;
-      color: var(--paper-dim);
-      max-width: 36ch;
-      margin: 0 0 2rem;
-    }
-    .hero-actions {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 0.75rem;
-      margin-bottom: 2.25rem;
-    }
-    .hero-meta {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 1.5rem 2rem;
-      padding-top: 1.5rem;
-      border-top: 1px solid var(--edge-soft);
-    }
-    .meta-item {
-      display: flex;
-      flex-direction: column;
-      gap: 0.15rem;
-    }
-    .meta-item strong {
-      font-family: var(--font-display);
-      font-size: 1.05rem;
-      font-weight: 700;
-      letter-spacing: -0.02em;
-      color: var(--paper);
-    }
-    .meta-item span {
-      font-size: 0.82rem;
-      color: var(--mist);
-    }
-
-    /* ── Signature: IDE stage ──────────────────────────────────── */
-    .stage {
-      position: relative;
-      border-radius: 16px;
-      background: linear-gradient(165deg, var(--panel-2) 0%, var(--ink) 100%);
-      border: 1px solid var(--edge);
-      box-shadow:
-        0 0 0 1px rgba(255,255,255,0.03) inset,
-        0 40px 80px -20px rgba(0, 0, 0, 0.65),
-        0 0 80px -30px var(--signal-glow);
-      overflow: hidden;
-    }
-    .stage::before {
-      content: "";
-      position: absolute;
-      inset: 0;
-      background:
-        radial-gradient(ellipse 60% 40% at 20% 0%, rgba(124,156,255,0.1), transparent),
-        linear-gradient(180deg, transparent 70%, rgba(7,8,12,0.4));
-      pointer-events: none;
-    }
-    .stage-chrome {
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-      padding: 0.75rem 1rem;
-      border-bottom: 1px solid var(--edge-soft);
-      background: rgba(0,0,0,0.25);
-    }
-    .traffic {
-      display: flex;
-      gap: 6px;
-    }
-    .traffic i {
-      width: 10px;
-      height: 10px;
-      border-radius: 50%;
-      display: block;
-      opacity: 0.7;
-    }
-    .traffic i:nth-child(1) { background: #ff5f57; }
-    .traffic i:nth-child(2) { background: #febc2e; }
-    .traffic i:nth-child(3) { background: #28c840; }
-    .stage-title {
-      flex: 1;
-      text-align: center;
-      font-family: var(--font-mono);
-      font-size: 0.72rem;
-      color: var(--mist);
-      letter-spacing: 0.02em;
-    }
-    .stage-badge {
-      font-family: var(--font-mono);
-      font-size: 0.65rem;
-      color: var(--live);
-      background: var(--live-dim);
-      border: 1px solid rgba(74, 212, 181, 0.2);
-      padding: 0.15rem 0.45rem;
-      border-radius: 4px;
-    }
-    .stage-body {
-      display: grid;
-      grid-template-columns: 220px 1fr;
-      min-height: 340px;
-    }
-    .sidebar {
-      border-right: 1px solid var(--edge-soft);
-      background: rgba(0,0,0,0.18);
-      padding: 0.65rem 0;
-      font-family: var(--font-mono);
-      font-size: 0.72rem;
-      line-height: 1;
-    }
-    .side-label {
-      padding: 0.35rem 0.85rem 0.55rem;
-      font-size: 0.62rem;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      color: var(--mist);
-      opacity: 0.75;
-    }
-    .tree-row {
-      display: flex;
-      align-items: center;
-      gap: 0.35rem;
-      height: 22px;
-      padding-right: 0.65rem;
-      color: var(--paper-dim);
-      cursor: default;
-      transition: background 0.12s;
-      position: relative;
-    }
-    .tree-row:hover { background: rgba(255,255,255,0.04); }
-    .tree-row.is-selected {
-      background: rgba(124, 156, 255, 0.14);
-      color: var(--paper);
-    }
-    .tree-row.is-selected::before {
-      content: "";
-      position: absolute;
-      left: 0;
-      top: 2px;
-      bottom: 2px;
-      width: 2px;
-      border-radius: 0 2px 2px 0;
-      background: var(--signal);
-    }
-    .tree-indent {
-      display: flex;
-      height: 100%;
-      flex-shrink: 0;
-    }
-    .tree-indent span {
-      width: 12px;
-      border-right: 1px solid rgba(255,255,255,0.06);
-    }
-    .chev {
-      width: 12px;
-      height: 12px;
-      display: grid;
-      place-items: center;
-      color: var(--mist);
-      flex-shrink: 0;
-      transition: transform 0.2s var(--ease);
-    }
-    .chev.is-open { transform: rotate(90deg); color: var(--paper-dim); }
-    .chev svg { width: 8px; height: 8px; }
-    .icon-folder, .icon-file {
-      width: 14px;
-      height: 14px;
-      flex-shrink: 0;
-      border-radius: 2px;
-    }
-    .icon-folder {
-      background: linear-gradient(145deg, #6b8cff, #4a6ad4);
-      opacity: 0.9;
-      clip-path: polygon(0 20%, 40% 20%, 48% 0, 100% 0, 100% 100%, 0 100%);
-      border-radius: 1px;
-    }
-    .icon-file {
-      background: linear-gradient(180deg, #3a4050, #2a3040);
-      border: 1px solid rgba(255,255,255,0.1);
-      border-radius: 2px;
-      position: relative;
-    }
-    .icon-file.ts { border-color: rgba(124,156,255,0.4); background: linear-gradient(180deg, #2a3550, #1e2840); }
-    .icon-file.rs { border-color: rgba(222, 120, 80, 0.5); background: linear-gradient(180deg, #403028, #2a1e18); }
-    .icon-file.json { border-color: rgba(196,165,116,0.45); }
-    .row-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .row-badge {
-      font-size: 0.62rem;
-      font-weight: 500;
-      min-width: 1em;
-      text-align: center;
-    }
-    .row-badge.m { color: var(--git-m); }
-    .row-badge.a { color: var(--git-a); }
-    .row-badge.d { color: var(--git-d); }
-    .row-enter {
-      animation: rowIn 0.45s var(--ease) both;
-    }
-    @keyframes rowIn {
-      from { opacity: 0; transform: translateX(-4px); }
-      to { opacity: 1; transform: none; }
-    }
-
-    .editor-pane {
-      padding: 1.1rem 1.15rem;
-      display: flex;
-      flex-direction: column;
-      gap: 0.85rem;
-      font-family: var(--font-mono);
-      font-size: 0.72rem;
-      min-width: 0;
-    }
-    .tab-bar {
-      display: flex;
-      gap: 0.25rem;
-    }
-    .tab {
-      padding: 0.35rem 0.65rem;
-      border-radius: 6px 6px 0 0;
-      color: var(--mist);
-      background: transparent;
-      border: 1px solid transparent;
-    }
-    .tab.active {
-      color: var(--paper);
-      background: rgba(255,255,255,0.04);
-      border-color: var(--edge-soft);
-      border-bottom-color: transparent;
-    }
-    .code-block {
-      flex: 1;
-      background: rgba(0,0,0,0.28);
-      border: 1px solid var(--edge-soft);
-      border-radius: 8px;
-      padding: 0.9rem 1rem;
-      overflow: hidden;
-      line-height: 1.7;
-      color: var(--paper-dim);
-    }
-    .code-block .kw { color: #c792ea; }
-    .code-block .fn { color: #82aaff; }
-    .code-block .str { color: #c3e88d; }
-    .code-block .cm { color: #5c677a; font-style: italic; }
-    .code-block .ty { color: #ffcb6b; }
-    .code-block .op { color: var(--mist); }
-    .stat-strip {
-      display: grid;
-      grid-template-columns: repeat(3, 1fr);
-      gap: 0.5rem;
-    }
-    .stat-chip {
-      background: rgba(255,255,255,0.03);
-      border: 1px solid var(--edge-soft);
-      border-radius: 8px;
-      padding: 0.55rem 0.65rem;
-    }
-    .stat-chip b {
-      display: block;
-      font-family: var(--font-display);
-      font-size: 0.95rem;
-      font-weight: 700;
-      color: var(--paper);
-      letter-spacing: -0.02em;
-    }
-    .stat-chip span {
-      font-size: 0.62rem;
-      color: var(--mist);
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-    }
-
-    /* ── Sections ──────────────────────────────────────────────── */
-    section { padding: 4.5rem 0; }
-    .section-head {
-      max-width: 40rem;
-      margin-bottom: 2.5rem;
-    }
-    .section-kicker {
-      font-family: var(--font-mono);
-      font-size: 0.72rem;
-      font-weight: 500;
-      letter-spacing: 0.1em;
-      text-transform: uppercase;
-      color: var(--brass);
-      margin: 0 0 0.75rem;
-    }
-    .section-head h2 {
-      font-family: var(--font-display);
-      font-weight: 700;
-      font-size: clamp(1.75rem, 3vw, 2.35rem);
-      letter-spacing: -0.03em;
-      line-height: 1.15;
-      margin: 0 0 0.85rem;
-    }
-    .section-head p {
-      margin: 0;
-      color: var(--paper-dim);
-      font-size: 1.05rem;
-    }
-
-    /* ── Thesis strip ──────────────────────────────────────────── */
-    .thesis {
-      padding: 0 0 1rem;
-    }
-    .thesis-grid {
-      display: grid;
-      grid-template-columns: repeat(3, 1fr);
-      gap: 1px;
-      background: var(--edge);
-      border: 1px solid var(--edge);
-      border-radius: var(--radius);
-      overflow: hidden;
-    }
-    .thesis-card {
-      background: var(--ink);
-      padding: 1.65rem 1.5rem;
-      transition: background 0.2s;
-    }
-    .thesis-card:hover { background: var(--panel); }
-    .thesis-card .icon-line {
-      width: 36px;
-      height: 36px;
-      border-radius: 9px;
-      display: grid;
-      place-items: center;
-      margin-bottom: 1.1rem;
-      background: var(--signal-dim);
-      color: var(--signal);
-      border: 1px solid rgba(124,156,255,0.18);
-    }
-    .thesis-card .icon-line.live {
-      background: var(--live-dim);
-      color: var(--live);
-      border-color: rgba(74,212,181,0.18);
-    }
-    .thesis-card .icon-line.brass {
-      background: var(--brass-dim);
-      color: var(--brass);
-      border-color: rgba(196,165,116,0.2);
-    }
-    .thesis-card h3 {
-      font-family: var(--font-display);
-      font-size: 1.1rem;
-      font-weight: 700;
-      letter-spacing: -0.02em;
-      margin: 0 0 0.5rem;
-    }
-    .thesis-card p {
-      margin: 0;
-      font-size: 0.95rem;
-      color: var(--mist);
-      line-height: 1.55;
-    }
-
-    /* ── Architecture ──────────────────────────────────────────── */
-    .arch {
-      background: linear-gradient(180deg, transparent, rgba(21,24,34,0.5) 20%, rgba(21,24,34,0.5) 80%, transparent);
-    }
-    .layers {
-      display: flex;
-      flex-direction: column;
-      gap: 0.65rem;
-    }
-    .layer {
-      display: grid;
-      grid-template-columns: 140px 1fr auto;
-      gap: 1.25rem;
-      align-items: center;
-      padding: 1.15rem 1.35rem;
-      background: var(--ink);
-      border: 1px solid var(--edge);
-      border-radius: var(--radius-sm);
-      transition: border-color 0.2s, box-shadow 0.2s;
-    }
-    .layer:hover {
-      border-color: rgba(124, 156, 255, 0.3);
-      box-shadow: 0 0 0 1px rgba(124,156,255,0.08), 0 12px 40px -20px rgba(0,0,0,0.5);
-    }
-    .layer-tag {
-      font-family: var(--font-mono);
-      font-size: 0.7rem;
-      font-weight: 500;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-      color: var(--signal);
-      background: var(--signal-dim);
-      padding: 0.35rem 0.55rem;
-      border-radius: 5px;
-      text-align: center;
-    }
-    .layer:nth-child(2) .layer-tag { color: var(--live); background: var(--live-dim); }
-    .layer:nth-child(3) .layer-tag { color: var(--brass); background: var(--brass-dim); }
-    .layer:nth-child(4) .layer-tag { color: #a78bfa; background: rgba(167,139,250,0.12); }
-    .layer h3 {
-      font-family: var(--font-display);
-      font-size: 1.05rem;
-      font-weight: 700;
-      margin: 0 0 0.2rem;
-      letter-spacing: -0.02em;
-    }
-    .layer p {
-      margin: 0;
-      font-size: 0.92rem;
-      color: var(--mist);
-    }
-    .layer-pkg {
-      font-family: var(--font-mono);
-      font-size: 0.72rem;
-      color: var(--paper-dim);
-      white-space: nowrap;
-    }
-
-    /* ── Features ──────────────────────────────────────────────── */
-    .feature-grid {
-      display: grid;
-      grid-template-columns: repeat(2, 1fr);
-      gap: 1rem;
-    }
-    .feature {
-      padding: 1.5rem;
-      background: var(--ink);
-      border: 1px solid var(--edge);
-      border-radius: var(--radius);
-      position: relative;
-      overflow: hidden;
-    }
-    .feature::after {
-      content: "";
-      position: absolute;
-      top: 0;
-      left: 0;
-      right: 0;
-      height: 1px;
-      background: linear-gradient(90deg, transparent, rgba(124,156,255,0.35), transparent);
-      opacity: 0;
-      transition: opacity 0.25s;
-    }
-    .feature:hover::after { opacity: 1; }
-    .feature h3 {
-      font-family: var(--font-display);
-      font-size: 1.05rem;
-      font-weight: 700;
-      margin: 0 0 0.45rem;
-      letter-spacing: -0.02em;
-      display: flex;
-      align-items: center;
-      gap: 0.55rem;
-    }
-    .feature h3 .mark {
-      width: 8px;
-      height: 8px;
-      border-radius: 2px;
-      background: var(--signal);
-      box-shadow: 0 0 12px var(--signal-glow);
-      flex-shrink: 0;
-    }
-    .feature p {
-      margin: 0;
-      color: var(--mist);
-      font-size: 0.95rem;
-    }
-
-    /* ── Code / install ────────────────────────────────────────── */
-    .install-panel {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 1rem;
-    }
-    .code-card {
-      background: var(--ink);
-      border: 1px solid var(--edge);
-      border-radius: var(--radius);
-      overflow: hidden;
-    }
-    .code-card-head {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 0.7rem 1rem;
-      border-bottom: 1px solid var(--edge-soft);
-      background: rgba(0,0,0,0.2);
-    }
-    .code-card-head span {
-      font-family: var(--font-mono);
-      font-size: 0.72rem;
-      color: var(--mist);
-    }
-    .copy-btn {
-      font-family: var(--font-mono);
-      font-size: 0.68rem;
-      color: var(--signal);
-      background: transparent;
-      border: 1px solid rgba(124,156,255,0.25);
-      border-radius: 5px;
-      padding: 0.25rem 0.55rem;
-      cursor: pointer;
-      transition: background 0.15s;
-    }
-    .copy-btn:hover { background: var(--signal-dim); }
-    .code-card pre {
-      margin: 0;
-      padding: 1.15rem 1.2rem;
-      overflow-x: auto;
-      font-family: var(--font-mono);
-      font-size: 0.8rem;
-      line-height: 1.7;
-      color: var(--paper-dim);
-    }
-    .code-card pre .cm { color: #5c677a; }
-    .code-card pre .kw { color: #c792ea; }
-    .code-card pre .fn { color: #82aaff; }
-    .code-card pre .str { color: #c3e88d; }
-    .code-card pre .ty { color: #ffcb6b; }
-
-    /* ── Electron diagram ──────────────────────────────────────── */
-    .flow {
-      display: grid;
-      grid-template-columns: 1fr auto 1fr auto 1fr;
-      gap: 0.75rem;
-      align-items: stretch;
-    }
-    .flow-node {
-      background: var(--ink);
-      border: 1px solid var(--edge);
-      border-radius: var(--radius-sm);
-      padding: 1.25rem 1.1rem;
-      text-align: center;
-    }
-    .flow-node strong {
-      display: block;
-      font-family: var(--font-display);
-      font-size: 0.95rem;
-      margin-bottom: 0.35rem;
-      letter-spacing: -0.01em;
-    }
-    .flow-node span {
-      font-size: 0.82rem;
-      color: var(--mist);
-      line-height: 1.4;
-    }
-    .flow-node.host {
-      border-color: rgba(124,156,255,0.35);
-      box-shadow: 0 0 40px -15px var(--signal-glow);
-    }
-    .flow-arrow {
-      display: flex;
-      align-items: center;
-      color: var(--mist);
-      font-family: var(--font-mono);
-      font-size: 0.65rem;
-      writing-mode: horizontal-tb;
-      opacity: 0.7;
-    }
-    .flow-arrow svg { width: 28px; height: 12px; }
-
-    /* ── Platforms ─────────────────────────────────────────────── */
-    .platform-table {
-      width: 100%;
-      border-collapse: separate;
-      border-spacing: 0;
-      border: 1px solid var(--edge);
-      border-radius: var(--radius);
-      overflow: hidden;
-      font-size: 0.92rem;
-    }
-    .platform-table th,
-    .platform-table td {
-      padding: 0.85rem 1.1rem;
-      text-align: left;
-      border-bottom: 1px solid var(--edge-soft);
-    }
-    .platform-table th {
-      background: rgba(0,0,0,0.25);
-      font-family: var(--font-mono);
-      font-size: 0.72rem;
-      font-weight: 500;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
-      color: var(--mist);
-    }
-    .platform-table tr:last-child td { border-bottom: none; }
-    .platform-table td { background: var(--ink); color: var(--paper-dim); }
-    .platform-table code {
-      font-family: var(--font-mono);
-      font-size: 0.8rem;
-      color: var(--signal);
-      background: var(--signal-dim);
-      padding: 0.15rem 0.4rem;
-      border-radius: 4px;
-    }
-
-    /* ── Packages strip ────────────────────────────────────────── */
-    .pkg-row {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 1rem;
-    }
-    .pkg {
-      padding: 1.75rem;
-      border-radius: var(--radius);
-      border: 1px solid var(--edge);
-      background: linear-gradient(160deg, var(--panel) 0%, var(--ink) 100%);
-    }
-    .pkg .pkg-name {
-      font-family: var(--font-mono);
-      font-size: 0.85rem;
-      color: var(--signal);
-      margin-bottom: 0.5rem;
-    }
-    .pkg h3 {
-      font-family: var(--font-display);
-      font-size: 1.25rem;
-      margin: 0 0 0.5rem;
-      letter-spacing: -0.02em;
-    }
-    .pkg p {
-      margin: 0 0 1.1rem;
-      color: var(--mist);
-      font-size: 0.95rem;
-    }
-    .pkg ul {
-      margin: 0;
-      padding: 0;
-      list-style: none;
-      display: flex;
-      flex-direction: column;
-      gap: 0.4rem;
-    }
-    .pkg li {
-      font-size: 0.9rem;
-      color: var(--paper-dim);
-      padding-left: 1.1rem;
-      position: relative;
-    }
-    .pkg li::before {
-      content: "";
-      position: absolute;
-      left: 0;
-      top: 0.55em;
-      width: 5px;
-      height: 5px;
-      border-radius: 1px;
-      background: var(--live);
-    }
-
-    /* ── CTA ───────────────────────────────────────────────────── */
-    .cta {
-      padding: 2rem 0 5rem;
-    }
-    .cta-panel {
-      text-align: center;
-      padding: 3.5rem 2rem;
-      border-radius: 20px;
-      border: 1px solid var(--edge);
-      background:
-        radial-gradient(ellipse 70% 80% at 50% 100%, rgba(124,156,255,0.14), transparent 60%),
-        radial-gradient(ellipse 40% 50% at 80% 0%, rgba(74,212,181,0.08), transparent 50%),
-        var(--ink);
-      box-shadow: 0 30px 80px -40px rgba(0,0,0,0.8);
-    }
-    .cta-panel h2 {
-      font-family: var(--font-display);
-      font-size: clamp(1.75rem, 3vw, 2.4rem);
-      font-weight: 700;
-      letter-spacing: -0.03em;
-      margin: 0 0 0.75rem;
-    }
-    .cta-panel p {
-      margin: 0 auto 1.75rem;
-      max-width: 36ch;
-      color: var(--paper-dim);
-      font-size: 1.05rem;
-    }
-    .cta-actions {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 0.75rem;
-      justify-content: center;
-    }
-
-    /* ── Footer ────────────────────────────────────────────────── */
-    footer {
-      border-top: 1px solid var(--edge-soft);
-      padding: 2.5rem 0 3rem;
-    }
-    .footer-inner {
-      display: flex;
-      flex-wrap: wrap;
-      justify-content: space-between;
-      gap: 1.5rem;
-      align-items: flex-start;
-    }
-    .footer-brand {
-      font-family: var(--font-display);
-      font-weight: 700;
-      font-size: 1rem;
-      margin-bottom: 0.35rem;
-    }
-    .footer-copy {
-      font-size: 0.85rem;
-      color: var(--mist);
-      max-width: 32ch;
-    }
-    .footer-links {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 0.5rem 1.5rem;
-      list-style: none;
-      margin: 0;
-      padding: 0;
-    }
-    .footer-links a {
-      color: var(--mist);
-      font-size: 0.9rem;
-      text-decoration: none;
-    }
-    .footer-links a:hover { color: var(--paper); }
-
-    /* ── Responsive ────────────────────────────────────────────── */
-    @media (max-width: 960px) {
-      .hero {
-        grid-template-columns: 1fr;
-        padding-top: 3rem;
-        gap: 2.5rem;
-      }
-      .hero-lead { max-width: none; }
-      .stage-body { grid-template-columns: 1fr; }
-      .editor-pane { display: none; }
-      .thesis-grid { grid-template-columns: 1fr; }
-      .feature-grid,
-      .install-panel,
-      .pkg-row { grid-template-columns: 1fr; }
-      .flow {
-        grid-template-columns: 1fr;
-      }
-      .flow-arrow {
-        justify-content: center;
-        transform: rotate(90deg);
-        padding: 0.25rem 0;
-      }
-      .layer {
-        grid-template-columns: 1fr;
-        gap: 0.65rem;
-      }
-      .layer-pkg { white-space: normal; }
-    }
-    @media (max-width: 720px) {
-      .nav-links { display: none; }
-      .nav-links.is-open {
-        display: flex;
-        flex-direction: column;
-        position: absolute;
-        top: var(--nav-h);
-        left: 0;
-        right: 0;
-        background: rgba(10, 11, 16, 0.97);
-        border-bottom: 1px solid var(--edge);
-        padding: 0.75rem 1.25rem 1rem;
-        align-items: stretch;
-      }
-      .nav-toggle { display: inline-flex; }
-      .nav-inner { position: relative; }
-      .hero-meta { gap: 1rem 1.5rem; }
-      .wrap { width: min(100% - 1.5rem, var(--max)); }
-      .nav-inner { width: min(100% - 1.5rem, var(--max)); }
-    }
-  </style>
-</head>
-<body>
-  <header class="nav">
-    <div class="nav-inner">
-      <a class="brand" href="index.html" aria-label="mille home">
-        <span class="brand-mark" aria-hidden="true">
-          <svg viewBox="0 0 16 16" fill="none">
-            <path d="M3 3.5h4.5v4H3v-4zm5.5 0H13v2H8.5v-2zm0 3.5H13V13H8.5V7zm-5.5 5h4.5v2H3v-2z" fill="#0a0c14" opacity="0.9"/>
-          </svg>
-        </span>
-        mille
-      </a>
-      <button class="nav-toggle" type="button" aria-expanded="false" aria-controls="nav-menu" id="nav-toggle">Menu</button>
-      <ul class="nav-links" id="nav-menu">
-        <li><a href="#features">Features</a></li>
-        <li><a href="#architecture">Architecture</a></li>
-        <li><a href="#quickstart">Quickstart</a></li>
-        <li><a href="#electron">Electron</a></li>
-        <li><a href="api.html">API</a></li>
-        <li><a class="nav-cta" href="https://github.com/vibecook-dev/mille" target="_blank" rel="noopener">GitHub</a></li>
-      </ul>
-    </div>
-  </header>
-
-  <main>
-    <!-- Hero -->
-    <div class="wrap hero">
-      <div>
-        <div class="eyebrow"><span class="dot" aria-hidden="true"></span> v0.2.1 · Rust core · MIT</div>
-        <h1>The file tree that keeps up with <span class="accent">your IDE</span>.</h1>
-        <p class="hero-lead">
-          High-performance native primitives for Electron IDEs. A Rust engine walks, watches, and searches; a typed TypeScript client freezes viewport snapshots; React renders half a million rows without breaking a sweat.
-        </p>
-        <div class="hero-actions">
-          <a class="btn btn-primary" href="#quickstart">Get started</a>
-          <a class="btn btn-ghost" href="api.html">API reference</a>
-        </div>
-        <div class="hero-meta">
-          <div class="meta-item">
-            <strong>500k+</strong>
-            <span>rows virtualized</span>
-          </div>
-          <div class="meta-item">
-            <strong>&lt;200&nbsp;ms</strong>
-            <span>first paint, huge monorepos</span>
-          </div>
-          <div class="meta-item">
-            <strong>8</strong>
-            <span>prebuilt native targets</span>
-          </div>
-          <div class="meta-item">
-            <strong>12.5&nbsp;KB</strong>
-            <span>headless UI gzip</span>
-          </div>
-        </div>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>mille: the file tree for the editor you're building</title>
+    <meta name="description" content="A file explorer for your Electron app. A Rust engine walks, watches and searches the folder, and React draws only the rows on screen." />
+    <link rel="canonical" href="https://vibecook-dev.github.io/mille/" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="mille: the file tree for the editor you're building" />
+    <meta property="og:description" content="A file explorer for your Electron app. A Rust engine walks, watches and searches the folder, and React draws only the rows on screen." />
+    <meta property="og:url" content="https://vibecook-dev.github.io/mille/" />
+    <meta property="og:image" content="https://vibecook-dev.github.io/mille/assets/og.png" />
+    <meta property="og:image:width" content="1280" />
+    <meta property="og:image:height" content="640" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="theme-color" content="#fafaf7" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#0a0a0a" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="assets/favicon.svg" type="image/svg+xml" />
+    <link rel="preload" href="assets/fonts/Jost-Variable.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="stylesheet" href="assets/site.css" />
+    <script>
+      try {
+        const t = localStorage.getItem('vibecook-theme');
+        if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+      } catch {}
+    </script>
+    <script src="assets/site.js" defer></script>
+  </head>
+  <body>
+    <a class="skip" href="#main">Skip to the content</a>
+    <div class="guides" aria-hidden="true"></div>
+    <header class="bar">
+      <div class="sheet">
+        <a class="lockup" href="./" aria-label="mille home"><svg viewBox="70.57 75 120.63 107.34" aria-hidden="true"><path d="M128.651 75C131.634 75.6963 177.883 133.951 183.236 141.676L182.39 143.16C174.875 146.964 142.347 143.352 131.518 143.016C111.446 142.892 91.469 144.227 71.3885 143.567C80.4137 131.043 91.0678 118.833 101.109 107.046C109.988 96.6225 119.374 84.9839 128.651 75Z"/><path d="M167.846 154.381C185.143 154.085 191.201 172.394 175.234 180.899C156.801 182.342 152.991 159.248 167.846 154.381Z"/><path d="M79.8215 156.238C91.3465 155.191 98.2357 162.371 95.0299 174.588C94.0348 178.379 89.9894 179.932 86.5509 181.46C84.6362 181.589 81.6823 181.454 79.8997 180.847C76.6053 179.752 73.8849 177.388 72.3402 174.28C70.7738 171.143 70.5714 167.499 71.781 164.208C73.4846 159.473 75.7031 158.27 79.8215 156.238Z"/><path d="M125.393 154.309C141.945 154.48 145.686 171.751 130.892 179.889C111.89 178.768 110.897 163.247 125.393 154.309Z"/></svg><span>mille</span></a>
+        <nav aria-label="Site">
+          <a href="./" aria-current="page">Guide</a>
+          <a href="api.html">API</a>
+          <a class="ext" href="https://github.com/vibecook-dev/mille">GitHub</a>
+          <button class="theme" type="button" aria-label="Switch theme"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M20 12A8 8 0 1 1 4 12A8 8 0 1 1 20 12Z"/><path d="M12 4A8 8 0 0 0 12 20Z" fill="currentColor" stroke="none"/></svg></button>
+        </nav>
       </div>
-
-      <!-- Signature product stage -->
-      <div class="stage" aria-hidden="true">
-        <div class="stage-chrome">
-          <div class="traffic"><i></i><i></i><i></i></div>
-          <div class="stage-title">workspace · monorepo</div>
-          <div class="stage-badge">watching</div>
-        </div>
-        <div class="stage-body">
-          <div class="sidebar" id="live-tree">
-            <div class="side-label">Explorer</div>
-            <!-- rows injected + animated by script -->
-          </div>
-          <div class="editor-pane">
-            <div class="tab-bar">
-              <div class="tab active">host.ts</div>
-              <div class="tab">FileTree.tsx</div>
-            </div>
-            <div class="code-block">
-              <div><span class="kw">import</span> { <span class="fn">createFileExplorerHost</span> } <span class="kw">from</span> <span class="str">'@vibecook/mille/host'</span>;</div>
-              <div>&nbsp;</div>
-              <div><span class="kw">const</span> host = <span class="kw">await</span> <span class="fn">createFileExplorerHost</span>({</div>
-              <div>&nbsp;&nbsp;roots: [<span class="str">'/workspace'</span>],</div>
-              <div>&nbsp;&nbsp;initialWalk: <span class="str">'roots-only'</span>,</div>
-              <div>&nbsp;&nbsp;followSymlinks: <span class="str">'smart'</span>,</div>
-              <div>});</div>
-              <div>&nbsp;</div>
-              <div><span class="cm">// MessagePort → renderer sessions</span></div>
-              <div>host.<span class="fn">attachPort</span>(port);</div>
-            </div>
-            <div class="stat-strip">
-              <div class="stat-chip"><b id="stat-entries">—</b><span>entries</span></div>
-              <div class="stat-chip"><b>75&nbsp;ms</b><span>debounce</span></div>
-              <div class="stat-chip"><b>nucleo</b><span>fuzzy</span></div>
+    </header>
+    <main id="main">
+      <div class="sheet">
+        <section class="hero">
+          <div>
+            <p class="kicker">vibecook / file explorer</p>
+            <h1><span>The file tree</span> <span>for the editor</span> <span class="quiet">you’re building.</span></h1>
+            <p class="lede">A file explorer for your Electron app. A Rust engine walks, watches and searches the folder. React draws only the rows on screen.</p>
+            <div class="cmd"><code>npm install @vibecook/mille @vibecook/mille-ui @tanstack/react-virtual</code></div>
+            <div class="actions">
+              <a class="btn solid" href="#start">Embed it</a>
+              <a class="btn" href="api.html">Read the API</a>
             </div>
           </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Thesis -->
-    <section class="thesis">
-      <div class="wrap">
-        <div class="thesis-grid">
-          <article class="thesis-card">
-            <div class="icon-line" aria-hidden="true">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7h16M4 12h10M4 17h14"/><circle cx="20" cy="12" r="2" fill="currentColor" stroke="none"/></svg>
-            </div>
-            <h3>Tree state in Rust</h3>
-            <p>EntryStore, walker, watcher, ignore matching, and fuzzy search run natively. JS owns expansion, selection, and scroll — never the canonical tree.</p>
-          </article>
-          <article class="thesis-card">
-            <div class="icon-line live" aria-hidden="true">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M8 21h8M12 18v3"/><path d="M7 9h4M7 12h10"/></svg>
-            </div>
-            <h3>Built for Electron</h3>
-            <p>UtilityProcess host, MessagePort sessions, frozen renderer mirrors. Keep the native binary off the main thread and out of the renderer.</p>
-          </article>
-          <article class="thesis-card">
-            <div class="icon-line brass" aria-hidden="true">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 6h16v12H4z"/><path d="M8 10h8M8 14h5"/></svg>
-            </div>
-            <h3>UI that ships</h3>
-            <p>Virtualized ARIA tree, soft-duotone icons (plus Material), Git decorations, commands, DnD, and a headless entry under 13&nbsp;KB gzip — drop into any React 19 app.</p>
-          </article>
-        </div>
-      </div>
-    </section>
-
-    <!-- Features -->
-    <section id="features">
-      <div class="wrap">
-        <div class="section-head">
-          <p class="section-kicker">Capabilities</p>
-          <h2>Everything a serious explorer needs — nothing an IDE doesn’t.</h2>
-          <p>From parallel walks and crash-resume to decoration fan-out and compact folders, mille is the filesystem layer you would otherwise re-implement for every product.</p>
-        </div>
-        <div class="feature-grid">
-          <article class="feature">
-            <h3><span class="mark"></span> Parallel walk + gitignore</h3>
-            <p><code style="font-family:var(--font-mono);font-size:0.85em;color:var(--signal)">jwalk</code> + ripgrep’s ignore crate. Symlink-aware matching skips pnpm store links so monorepo walks stay O(tracked files), not O(store).</p>
-          </article>
-          <article class="feature">
-            <h3><span class="mark" style="background:var(--live)"></span> Watcher that stays calm</h3>
-            <p>notify + 75&nbsp;ms debounce, rename pairing, volatile-subtree throttling, mutation intent cache so your own edits don’t echo back as storms.</p>
-          </article>
-          <article class="feature">
-            <h3><span class="mark" style="background:var(--brass)"></span> Viewport-virtualized mirror</h3>
-            <p>Immutable <code style="font-family:var(--font-mono);font-size:0.85em;color:var(--signal)">MirrorSnapshot</code> with stable identity. React concurrent-safe. Bulk bincode path for large viewports.</p>
-          </article>
-          <article class="feature">
-            <h3><span class="mark"></span> Lazy list-on-expand</h3>
-            <p><code style="font-family:var(--font-mono);font-size:0.85em;color:var(--signal)">initialWalk: 'roots-only'</code> paints huge repos in under 200&nbsp;ms. Children stream when folders expand — no populate-before-ready workaround.</p>
-          </article>
-          <article class="feature">
-            <h3><span class="mark" style="background:var(--git-m)"></span> Decorations pipeline</h3>
-            <p>Git, lint, problems, agent-rules — separate <code style="font-family:var(--font-mono);font-size:0.85em;color:var(--signal)">decorationVersion</code> so SCM churn never thrash tree caches. Port-side fan-out to every session.</p>
-          </article>
-          <article class="feature">
-            <h3><span class="mark" style="background:#a78bfa"></span> Fuzzy filename search</h3>
-            <p>nucleo-powered ranking over the in-memory tree with match indices for highlighting. Content search reserved as a companion package.</p>
-          </article>
-          <article class="feature">
-            <h3><span class="mark" style="background:var(--live)"></span> Crash-resume</h3>
-            <p>Atomic bincode snapshots with parent fsync. Boot from disk, emit <code style="font-family:var(--font-mono);font-size:0.85em;color:var(--signal)">events_since</code> diffs, rejoin reality without a cold full walk.</p>
-          </article>
-          <article class="feature">
-            <h3><span class="mark" style="background:var(--brass)"></span> Compact folders</h3>
-            <p>Single-child chains collapse to <code style="font-family:var(--font-mono);font-size:0.85em;color:var(--signal)">src/components/ui</code> one-row paths — the IDE pattern users already expect.</p>
-          </article>
-        </div>
-      </div>
-    </section>
-
-    <!-- Architecture -->
-    <section class="arch" id="architecture">
-      <div class="wrap">
-        <div class="section-head">
-          <p class="section-kicker">Architecture</p>
-          <h2>Four layers. One contract.</h2>
-          <p>Engine logic never leaks into NAPI. View state never lives in Rust. The host/client split keeps native code where Electron expects it.</p>
-        </div>
-        <div class="layers">
-          <div class="layer">
-            <div class="layer-tag">UI</div>
+          <figure>
+            <img class="only-light" src="assets/img/figure-light.svg" width="513" height="320" alt="mille's mark, a roof over three dots, drawn as your folder above three parts: Rust walks and watches, TypeScript mirrors it in between, and React draws the rows." decoding="async" /><img aria-hidden="true" class="only-dark" src="assets/img/figure-dark.svg" width="513" height="320" alt="" decoding="async" />
+          </figure>
+        </section>
+        <div class="rule"></div>
+        <ul class="specs" aria-label="packages">
+          <li>packages</li>
+          <li>mille</li>
+          <li>mille-ui</li>
+          <li>mille-truffle</li>
+        </ul>
+        <div class="rule"></div>
+        <section class="sec">
+        <header>
+          <h2>A tree that looks like your editor.</h2>
+          <p>Folders open four levels deep, with git status letters on the files that changed.</p>
+        </header>
+        <figure class="plate shot">
+          <div class="wide"><img class="only-light" src="assets/img/explorer-light.png" width="1760" height="1156" alt="mille's FileTree beside a file preview: folders open four levels deep, with git status letters on a modified, an added and an untracked file" loading="lazy" decoding="async" /><img aria-hidden="true" class="only-dark" src="assets/img/explorer-dark.png" width="1760" height="1156" alt="" loading="lazy" decoding="async" /></div>
+          <figcaption><code>FileTree</code> in its VibeField theme, on a copy of the repository with a few uncommitted changes. A screenshot, not a mock.</figcaption>
+        </figure>
+        </section>
+        <div class="rule"></div>
+        <section class="sec">
+        <header>
+          <h2 id="start">Embed it.</h2>
+          <p>Needs React 19 and Node 20 or later. CI runs it in Electron 41.</p>
+        </header>
+        <div class="two">
+          <div class="steps">
             <div>
-              <h3>React file tree</h3>
-              <p>ARIA tree, virtualization, keyboard, rename, DnD, icons, Git badges. Styled or headless.</p>
+              <h3>Install</h3>
+              <p>The engine, the tree, and the virtualizer it draws with.</p>
+              <div class="cmd"><code>npm install @vibecook/mille @vibecook/mille-ui @tanstack/react-virtual</code></div>
             </div>
-            <div class="layer-pkg">@vibecook/mille-ui</div>
-          </div>
-          <div class="layer">
-            <div class="layer-tag">Client</div>
             <div>
-              <h3>Typed mirror + port protocol</h3>
-              <p>FileExplorer wrapper, ViewportMirror, deltas, decorations store, React snapshot hook, MessagePort client.</p>
+              <h3>Utility process</h3>
+              <p>The engine runs here, in its own process.</p>
             </div>
-            <div class="layer-pkg">@vibecook/mille</div>
-          </div>
-          <div class="layer">
-            <div class="layer-tag">Binding</div>
             <div>
-              <h3>NAPI surface</h3>
-              <p>Marshal-only cdylib. Prebuilt .node binaries for eight platform triples via optionalDependencies.</p>
+              <h3>Renderer</h3>
+              <p>Connect over the port, and draw.</p>
             </div>
-            <div class="layer-pkg">mille-binding · mille-{triple}</div>
           </div>
-          <div class="layer">
-            <div class="layer-tag">Core</div>
-            <div>
-              <h3>Pure Rust engine</h3>
-              <p>EntryStore, walker, watcher, ignore, search, resume. Unit-testable without Node. Bindable beyond NAPI later.</p>
-            </div>
-            <div class="layer-pkg">mille-core</div>
-          </div>
-        </div>
-      </div>
-    </section>
+          <div class="code"><header><div role="tablist" aria-label="Files"><button type="button" role="tab" id="code-30-t0" aria-controls="code-30-p0" aria-selected="true">host.ts</button><button type="button" role="tab" id="code-30-t1" aria-controls="code-30-p1" aria-selected="false" tabindex="-1">renderer.tsx</button></div></header><pre id="code-30-p0" role="tabpanel" aria-labelledby="code-30-t0" tabindex="0"><code><span class="k">import</span> { createFileExplorerHost } <span class="k">from</span> <span class="s">'@vibecook/mille/host'</span>;
 
-    <!-- Packages -->
-    <section id="packages">
-      <div class="wrap">
-        <div class="section-head">
-          <p class="section-kicker">Packages</p>
-          <h2>Engine and UI, designed to ship together.</h2>
-          <p>Use the engine alone for custom surfaces, or take the full tree UI and be productive in an evening.</p>
-        </div>
-        <div class="pkg-row">
-          <article class="pkg">
-            <div class="pkg-name">@vibecook/mille</div>
-            <h3>Explorer engine</h3>
-            <p>Native core + TypeScript client for Node and Electron UtilityProcess hosts.</p>
-            <ul>
-              <li>In-process FileExplorer</li>
-              <li>createFileExplorerHost / connectFileExplorer</li>
-              <li>Decorations providers</li>
-              <li>useFileExplorerSnapshot</li>
-            </ul>
-          </article>
-          <article class="pkg">
-            <div class="pkg-name">@vibecook/mille-ui</div>
-            <h3>React companion</h3>
-            <p>Drop-in FileTree with VS Code icon theme compatibility and IDE-grade interactions.</p>
-            <ul>
-              <li>WAI-ARIA 1.2 tree pattern</li>
-              <li>Git + agent-rules decorations</li>
-              <li>Soft-duotone + Material icon themes</li>
-              <li>Headless entry · testing fakes</li>
-            </ul>
-          </article>
-        </div>
-      </div>
-    </section>
-
-    <!-- Quickstart -->
-    <section id="quickstart">
-      <div class="wrap">
-        <div class="section-head">
-          <p class="section-kicker">Quickstart</p>
-          <h2>From install to first snapshot in minutes.</h2>
-          <p>Absolute roots only. Construction is cheap — call <code style="font-family:var(--font-mono);font-size:0.9em;color:var(--signal)">populateFromRoots()</code> when you want I/O.</p>
-        </div>
-        <div class="install-panel">
-          <div class="code-card">
-            <div class="code-card-head">
-              <span>install</span>
-              <button class="copy-btn" type="button" data-copy="pnpm add @vibecook/mille @vibecook/mille-ui">Copy</button>
-            </div>
-            <pre><span class="cm"># engine + UI</span>
-pnpm add @vibecook/mille @vibecook/mille-ui
-
-<span class="cm"># peers for the styled tree</span>
-pnpm add react react-dom @tanstack/react-virtual</pre>
-          </div>
-          <div class="code-card">
-            <div class="code-card-head">
-              <span>node · minimum viable</span>
-              <button class="copy-btn" type="button" data-copy="import { FileExplorer } from '@vibecook/mille';
-
-const fx = new FileExplorer({ roots: ['/path/to/workspace'] });
-await fx.populateFromRoots();
-const snap = fx.getSnapshot();
-for (const root of snap.roots()) {
-  console.log(root.id, root.name);
-}
-await fx.dispose();">Copy</button>
-            </div>
-            <pre><span class="kw">import</span> { <span class="fn">FileExplorer</span> } <span class="kw">from</span> <span class="str">'@vibecook/mille'</span>;
-
-<span class="kw">const</span> fx = <span class="kw">new</span> <span class="ty">FileExplorer</span>({
-  roots: [<span class="str">'/path/to/workspace'</span>],
+<span class="k">const</span> host = <span class="k">await</span> createFileExplorerHost({
+  roots: [<span class="s">'/path/to/project'</span>],
+  initialWalk: <span class="s">'roots-only'</span>,
 });
-<span class="kw">await</span> fx.<span class="fn">populateFromRoots</span>();
+process.parentPort.on(<span class="s">'message'</span>, ({ ports }) =&gt; host.attachPort(wrapMessagePortMain(ports[0])));</code></pre><pre id="code-30-p1" role="tabpanel" aria-labelledby="code-30-t1" hidden tabindex="0"><code><span class="k">import</span> { connectFileExplorer } <span class="k">from</span> <span class="s">'@vibecook/mille/port'</span>;
+<span class="k">import</span> { FileTree } <span class="k">from</span> <span class="s">'@vibecook/mille-ui'</span>;
+<span class="k">import</span> { duotoneIconTheme } <span class="k">from</span> <span class="s">'@vibecook/mille-ui/icons/duotone'</span>;
+<span class="k">import</span> <span class="s">'@vibecook/mille-ui/tokens.css'</span>;
 
-<span class="kw">const</span> snap = fx.<span class="fn">getSnapshot</span>();
-<span class="kw">for</span> (<span class="kw">const</span> root <span class="kw">of</span> snap.<span class="fn">roots</span>()) {
-  console.<span class="fn">log</span>(root.id, root.name);
-}
-<span class="kw">await</span> fx.<span class="fn">dispose</span>();</pre>
-          </div>
-          <div class="code-card" style="grid-column: 1 / -1">
-            <div class="code-card-head">
-              <span>react · FileTree</span>
-              <button class="copy-btn" type="button" data-copy="import { FileExplorer } from '@vibecook/mille';
-import { FileTree } from '@vibecook/mille-ui';
-import '@vibecook/mille-ui/tokens.css';
+<span class="k">const</span> fx = <span class="k">await</span> connectFileExplorer(port);
 
-const fx = new FileExplorer({ roots: ['/path/to/workspace'] });
-await fx.populateFromRoots();
-
-export function Sidebar() {
-  return <FileTree fx={fx} ariaLabel=&quot;Files&quot; rowHeight={22} />;
-}">Copy</button>
-            </div>
-            <pre><span class="kw">import</span> { <span class="fn">FileExplorer</span> } <span class="kw">from</span> <span class="str">'@vibecook/mille'</span>;
-<span class="kw">import</span> { <span class="fn">FileTree</span> } <span class="kw">from</span> <span class="str">'@vibecook/mille-ui'</span>;
-<span class="kw">import</span> <span class="str">'@vibecook/mille-ui/tokens.css'</span>;
-
-<span class="kw">const</span> fx = <span class="kw">new</span> <span class="ty">FileExplorer</span>({ roots: [<span class="str">'/path/to/workspace'</span>] });
-<span class="kw">await</span> fx.<span class="fn">populateFromRoots</span>();
-
-<span class="kw">export function</span> <span class="fn">Sidebar</span>() {
-  <span class="kw">return</span> &lt;<span class="ty">FileTree</span> fx={fx} ariaLabel=<span class="str">"Files"</span> rowHeight={22} /&gt;;
-}</pre>
-          </div>
+&lt;FileTree fx={fx} ariaLabel=<span class="s">"Files"</span> iconTheme={duotoneIconTheme} /&gt;;</code></pre></div>
         </div>
-      </div>
-    </section>
-
-    <!-- Electron -->
-    <section id="electron">
-      <div class="wrap">
-        <div class="section-head">
-          <p class="section-kicker">Electron</p>
-          <h2>Native binary stays in UtilityProcess.</h2>
-          <p>Main forks the host. Each window gets a MessagePort. The renderer never loads <code style="font-family:var(--font-mono);font-size:0.9em;color:var(--signal)">.node</code>.</p>
+        <p class="after"><code>wrapMessagePortMain</code> is a short adapter for Electron's port, and the main process and preload only pass the port along. The <a href="https://github.com/vibecook-dev/mille/blob/main/apps/playground/EMBEDDING_UI.md">embedding guide</a> has all four files.</p>
+        </section>
+        <div class="rule"></div>
+        <section class="sec">
+        <header>
+          <h2>How a change reaches the screen.</h2>
+          <p>The engine runs in its own process. Your window holds a small frozen mirror, and only the rows in view cross the port as full records.</p>
+        </header>
+        <figure class="plate">
+          <div class="wide"><img class="only-light" src="assets/img/path-light.svg" width="0" height="1000" alt="The path of a change: watcher, store and host in a utility process; a MessagePort; then a mirror and the FileTree in the renderer. Electron main only hands over the port, and rows off screen are sent as ids only." loading="lazy" decoding="async" /><img aria-hidden="true" class="only-dark" src="assets/img/path-dark.svg" width="0" height="1000" alt="" loading="lazy" decoding="async" /></div>
+          
+        </figure>
+        </section>
+        <div class="rule"></div>
+        <section class="sec">
+        <header>
+          <h2>What you get.</h2>
+          
+        </header>
+        <ul class="tiles">
+          <li>
+            <img class="only-light" src="assets/img/tile-walk-light.svg" width="0" height="320" alt="" loading="lazy" decoding="async" /><img aria-hidden="true" class="only-dark" src="assets/img/tile-walk-dark.svg" width="0" height="320" alt="" loading="lazy" decoding="async" />
+            <h3>Parallel walk</h3>
+            <p>Reads the tree on several threads, and applies <code>.gitignore</code> before it descends.</p>
+          </li>
+          <li>
+            <img class="only-light" src="assets/img/tile-watch-light.svg" width="0" height="320" alt="" loading="lazy" decoding="async" /><img aria-hidden="true" class="only-dark" src="assets/img/tile-watch-dark.svg" width="0" height="320" alt="" loading="lazy" decoding="async" />
+            <h3>Live watch</h3>
+            <p>Changes on disk arrive as small deltas, and a rename is paired into one move.</p>
+          </li>
+          <li>
+            <img class="only-light" src="assets/img/tile-search-light.svg" width="0" height="320" alt="" loading="lazy" decoding="async" /><img aria-hidden="true" class="only-dark" src="assets/img/tile-search-dark.svg" width="0" height="320" alt="" loading="lazy" decoding="async" />
+            <h3>Fuzzy search</h3>
+            <p>File-name search with <code>nucleo</code>, run in the engine over the whole tree.</p>
+          </li>
+          <li>
+            <img class="only-light" src="assets/img/tile-rows-light.svg" width="0" height="320" alt="" loading="lazy" decoding="async" /><img aria-hidden="true" class="only-dark" src="assets/img/tile-rows-dark.svg" width="0" height="320" alt="" loading="lazy" decoding="async" />
+            <h3>Virtualized rows</h3>
+            <p>CI runs a 500,000-row tree and fails if more than 100 rows reach the DOM.</p>
+          </li>
+          <li>
+            <img class="only-light" src="assets/img/tile-decorations-light.svg" width="0" height="320" alt="" loading="lazy" decoding="async" /><img aria-hidden="true" class="only-dark" src="assets/img/tile-decorations-dark.svg" width="0" height="320" alt="" loading="lazy" decoding="async" />
+            <h3>Decorations</h3>
+            <p>Git status letters, plus diagnostics, test results and editor state from your own providers.</p>
+          </li>
+          <li>
+            <img class="only-light" src="assets/img/tile-themes-light.svg" width="0" height="320" alt="" loading="lazy" decoding="async" /><img aria-hidden="true" class="only-dark" src="assets/img/tile-themes-dark.svg" width="0" height="320" alt="" loading="lazy" decoding="async" />
+            <h3>Themes</h3>
+            <p>Five icon themes and two tree themes. Any VS Code file icon theme loads too.</p>
+          </li>
+        </ul>
+        <p class="after">Also: multi-root workspaces, compact folders, file nesting, drag and drop, inline rename, undo for create, rename, move and delete, and a WAI-ARIA tree that CI audits with axe. A Rust panic reaches you as a JavaScript error you can catch, not as a dead editor.</p>
+        </section>
+        <div class="rule"></div>
+        <section class="sec">
+        <header>
+          <h2>Over a tailnet.</h2>
+          <p><code>@vibecook/mille-truffle</code> serves a folder to another device on your tailnet. The other device runs the same mirror and the same <code>FileTree</code>.</p>
+        </header>
+        <figure class="plate">
+          <div class="wide"><img class="only-light" src="assets/img/remote-light.svg" width="0" height="1000" alt="A remote workspace: one device has the files and sends the rows in view, then changes, to another device, which draws the same tree. It uses the same protocol as the MessagePort, over a tailnet on truffle." loading="lazy" decoding="async" /><img aria-hidden="true" class="only-dark" src="assets/img/remote-dark.svg" width="0" height="1000" alt="" loading="lazy" decoding="async" /></div>
+          
+        </figure>
+        <p class="after">It runs on <a href="https://vibecook-dev.github.io/truffle/">truffle</a>, and it is experimental: see its <a href="https://github.com/vibecook-dev/mille/blob/main/packages/mille-truffle/README.md">README</a> and the <a href="https://github.com/vibecook-dev/mille/tree/main/apps/mesh-demo">mesh demo</a>.</p>
+        </section>
+        <div class="rule"></div>
+        <section class="sec">
+        <header>
+          <h2>Packages.</h2>
+          <p>Prebuilt for macOS, Windows and Linux, on x64 and arm64, with glibc and musl builds for Linux. npm installs the one that matches.</p>
+        </header>
+        <div class="scroll">
+          <table>
+            <thead><tr><th scope="col">Need</th><th scope="col">Use</th></tr></thead>
+            <tbody>
+              <tr><td>A file tree in React</td><td><code>@vibecook/mille-ui</code></td></tr>
+              <tr><td>The engine</td><td><code>@vibecook/mille</code></td></tr>
+              <tr><td>Your own tree UI on the engine</td><td><code>@vibecook/mille-ui/headless</code></td></tr>
+              <tr><td>A workspace on another device</td><td><code>@vibecook/mille-truffle</code></td></tr>
+              <tr><td>A client over WebSocket</td><td><code>@vibecook/mille/remote</code> with <code>/node</code></td></tr>
+              <tr><td>A virtual file system</td><td><code>@vibecook/mille/provider</code></td></tr>
+              <tr><td>A synced store of file versions</td><td><code>@vibecook/mille/drive</code></td></tr>
+            </tbody>
+          </table>
         </div>
-        <div class="flow">
-          <div class="flow-node">
-            <strong>Main</strong>
-            <span>Forks utility, creates MessageChannel, wires ports</span>
-          </div>
-          <div class="flow-arrow" aria-hidden="true">
-            <svg viewBox="0 0 28 12" fill="none"><path d="M0 6h24M20 1l6 5-6 5" stroke="currentColor" stroke-width="1.5"/></svg>
-          </div>
-          <div class="flow-node host">
-            <strong>UtilityProcess</strong>
-            <span>createFileExplorerHost · walker · watcher · .node</span>
-          </div>
-          <div class="flow-arrow" aria-hidden="true">
-            <svg viewBox="0 0 28 12" fill="none"><path d="M0 6h24M20 1l6 5-6 5" stroke="currentColor" stroke-width="1.5"/></svg>
-          </div>
-          <div class="flow-node">
-            <strong>Renderer</strong>
-            <span>connectFileExplorer(port) · FileTree · mirror</span>
-          </div>
-        </div>
-        <p style="margin:1.75rem 0 0;color:var(--mist);font-size:0.95rem;max-width:52ch">
-          Full main / host / preload / renderer walkthrough lives in the package embedding guide.
-          See <a href="https://github.com/vibecook-dev/mille/blob/main/packages/mille/EMBEDDING.md" target="_blank" rel="noopener">EMBEDDING.md</a>
-          and the playground app under <code style="font-family:var(--font-mono);font-size:0.85em;color:var(--paper-dim)">apps/playground</code>.
-        </p>
+        </section>
+        <div class="rule"></div>
+        <section class="sec">
+        <header>
+          <h2>Status.</h2>
+          
+        </header>
+        <dl class="facts">
+          <dt>0.x</dt>
+          <dd>The API can still change between releases.</dd>
+          <dt>Git</dt>
+          <dd>Badges come from the <code>git</code> on your <code>PATH</code>. The native git engine in <code>crates/mille-git</code> is not in the published binaries yet.</dd>
+          <dt>Symlinked folders</dt>
+          <dd>Not walked into by default. <code>followSymlinks: true</code> walks them.</dd>
+          <dt>Remote workspaces</dt>
+          <dd><code>mille-truffle</code> is experimental.</dd>
+        </dl>
+        </section>
       </div>
-    </section>
-
-    <!-- Platforms -->
-    <section id="platforms">
-      <div class="wrap">
-        <div class="section-head">
-          <p class="section-kicker">Platforms</p>
-          <h2>Prebuilt natives. Install once.</h2>
-          <p>The umbrella package resolves the correct binary through optionalDependencies — no postinstall compile step for supported targets.</p>
-        </div>
-        <table class="platform-table">
-          <thead>
-            <tr>
-              <th>Platform</th>
-              <th>Package</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr><td>macOS arm64</td><td><code>@vibecook/mille-darwin-arm64</code></td></tr>
-            <tr><td>macOS x64</td><td><code>@vibecook/mille-darwin-x64</code></td></tr>
-            <tr><td>Windows x64</td><td><code>@vibecook/mille-win32-x64-msvc</code></td></tr>
-            <tr><td>Windows arm64</td><td><code>@vibecook/mille-win32-arm64-msvc</code></td></tr>
-            <tr><td>Linux x64 glibc</td><td><code>@vibecook/mille-linux-x64-gnu</code></td></tr>
-            <tr><td>Linux arm64 glibc</td><td><code>@vibecook/mille-linux-arm64-gnu</code></td></tr>
-            <tr><td>Linux x64 musl</td><td><code>@vibecook/mille-linux-x64-musl</code></td></tr>
-            <tr><td>Linux arm64 musl</td><td><code>@vibecook/mille-linux-arm64-musl</code></td></tr>
-          </tbody>
-        </table>
+    </main>
+    <footer class="sheet">
+      <div class="rule"></div>
+      <div class="foot">
+        <h2>From the same kitchen</h2>
+        <ul class="family">
+          <li><a href="https://vibecook-dev.github.io/truffle/"><svg viewBox="78 81.6 97.3 92.4" aria-hidden="true"><path d="M98.7047 139.617C106.418 139.221 112.734 142.28 115.58 149.86C117.317 154.6 117.123 159.84 115.043 164.441C112.429 170.124 109.319 171.949 103.904 173.973C78.6944 173.479 77.9612 146.947 98.7047 139.617Z"/><path d="M150.179 139.544C157.989 139.03 165.208 141.278 169.298 148.47C171.499 152.293 172.023 156.854 170.749 161.073C169.041 166.544 165.457 169.115 160.681 171.462C156.545 172.556 152.986 173.024 148.906 171.363C144.771 169.682 141.551 166.314 140.057 162.115C136.569 152.556 140.327 142.88 150.179 139.544Z"/><path d="M153.255 82.222C156.898 81.932 159.93 81.6024 163.312 83.5272C171.276 88.0557 175.255 100.719 170.344 108.734C167.683 113.078 164.427 114.014 159.814 115.174C136.98 115.254 132.989 91.3912 153.255 82.222Z"/><path d="M100.043 82.3538C108.871 81.6419 116.625 88.1679 117.433 96.9877C118.24 105.808 111.801 113.632 102.991 114.542C97.2021 115.135 91.5383 112.577 88.1625 107.838C84.7874 103.098 84.2203 96.9086 86.679 91.6351C89.137 86.3617 94.241 82.8153 100.043 82.3538Z"/></svg><b>truffle</b><span>Your devices, talking to each other directly.</span></a></li>
+          <li><a href="https://vibecook-dev.github.io/ghosttea/"><svg viewBox="58.38 83 143.05 89.17" aria-hidden="true"><path d="M171.248 132.926C177.368 132.314 188.177 132.91 193.706 136.051C201.428 140.438 195.492 150.182 191.834 155.314C184.652 165.39 175.461 168.599 163.661 170.443C152.434 171.701 127.066 171.966 138.553 153.451C146.292 140.978 157.66 136.293 171.248 132.926Z"/><path d="M79.2576 134.961C88.7607 134.158 97.3116 136.73 104.744 142.678C121.595 156.162 129.11 170.343 100.815 172.174C85.6558 171.268 70.2767 165.523 62.1029 151.863C60.5804 149.319 58.3782 145.378 59.1648 142.448C63.407 138.277 73.4771 136.182 79.2576 134.961Z"/><path d="M127.372 83C140.064 88.2326 149.556 122.874 141.698 134.595C138.354 139.583 133.449 144.51 128.724 148.158C118.647 147.63 113.299 133.04 112.116 124.546C110.012 109.454 118.522 94.4875 127.372 83Z"/></svg><b>ghosttea</b><span>The Ghostty terminal experience, inside your app.</span></a></li>
+          <li><a href="./" aria-current="true"><svg viewBox="70.57 75 120.63 107.34" aria-hidden="true"><path d="M128.651 75C131.634 75.6963 177.883 133.951 183.236 141.676L182.39 143.16C174.875 146.964 142.347 143.352 131.518 143.016C111.446 142.892 91.469 144.227 71.3885 143.567C80.4137 131.043 91.0678 118.833 101.109 107.046C109.988 96.6225 119.374 84.9839 128.651 75Z"/><path d="M167.846 154.381C185.143 154.085 191.201 172.394 175.234 180.899C156.801 182.342 152.991 159.248 167.846 154.381Z"/><path d="M79.8215 156.238C91.3465 155.191 98.2357 162.371 95.0299 174.588C94.0348 178.379 89.9894 179.932 86.5509 181.46C84.6362 181.589 81.6823 181.454 79.8997 180.847C76.6053 179.752 73.8849 177.388 72.3402 174.28C70.7738 171.143 70.5714 167.499 71.781 164.208C73.4846 159.473 75.7031 158.27 79.8215 156.238Z"/><path d="M125.393 154.309C141.945 154.48 145.686 171.751 130.892 179.889C111.89 178.768 110.897 163.247 125.393 154.309Z"/></svg><b>mille</b><span>The file tree for the editor you are building.</span></a></li>
+        </ul>
+        <dl class="block">
+          <div><dt>part</dt><dd class="title">mille</dd></div>
+          <div><dt>version</dt><dd><a href="https://www.npmjs.com/package/@vibecook/mille" data-npm="@vibecook/mille">latest</a></dd></div>
+          <div><dt>licence</dt><dd><a href="https://github.com/vibecook-dev/mille/blob/main/LICENSE">MIT</a></dd></div>
+          <div><dt>drawn by</dt><dd><a href="https://github.com/jamesyong-42"><svg class="jy" viewBox="0 0 14107.04 1105.36" role="img" aria-label="James Yong"><path d="M0 555.36a531 531 0 1 1 1062 0a531 531 0 1 1 -1062 0ZM1122 1065.36L2285 1065.36L1703.5 3.36ZM2463 1055.36L3463 1055.36L3463 55.36L2463 55.36ZM5063 55.36L5063 776.79L5062.64 791.51L5061.56 806.19L5059.75 820.8L5057.24 835.31L5054.01 849.68L5050.08 863.87L5045.46 877.85L5040.16 891.59L5034.2 905.05L5027.58 918.2L5020.32 931.02L5012.44 943.46L5003.96 955.5L4994.9 967.1L4985.29 978.25L4975.13 988.92L4964.47 999.07L4953.32 1008.69L4941.71 1017.75L4929.67 1026.23L4917.23 1034.1L4904.42 1041.36L4891.27 1047.98L4877.81 1053.95L4864.07 1059.25L4850.09 1063.87L4835.89 1067.8L4821.53 1071.02L4807.02 1073.54L4792.41 1075.34L4777.72 1076.42L4763 1076.79L4748.28 1076.42L4733.59 1075.34L4718.98 1073.54L4704.47 1071.02L4690.11 1067.8L4675.91 1063.87L4661.93 1059.25L4648.19 1053.95L4634.73 1047.98L4621.58 1041.36L4608.77 1034.1L4596.33 1026.23L4584.29 1017.75L4572.68 1008.69L4561.53 999.07L4550.87 988.92L4540.71 978.25L4531.1 967.1L4522.04 955.5L4513.56 943.46L4505.68 931.02L4498.42 918.2L4491.8 905.05L4485.84 891.59L4480.54 877.85L4475.92 863.87L4471.99 849.68L4468.76 835.31L4466.25 820.8L4464.44 806.19L4463.36 791.51L4463 776.79L4636.29 776.79L4636.44 783.89L4636.9 790.97L4637.66 798.02L4638.72 805.02L4640.08 811.95L4641.74 818.79L4643.69 825.54L4645.93 832.17L4648.45 838.66L4651.25 845L4654.31 851.18L4657.64 857.18L4661.22 862.99L4665.05 868.59L4669.11 873.97L4673.4 879.11L4677.9 884.01L4682.61 888.65L4687.52 893.02L4692.6 897.11L4697.86 900.91L4703.27 904.41L4708.82 907.61L4714.51 910.48L4720.31 913.04L4726.22 915.27L4732.21 917.16L4738.28 918.72L4744.41 919.93L4750.58 920.8L4756.78 921.33L4763 921.5L4769.22 921.33L4775.42 920.8L4781.59 919.93L4787.72 918.72L4793.79 917.16L4799.78 915.27L4805.69 913.04L4811.49 910.48L4817.18 907.61L4822.73 904.41L4828.14 900.91L4833.4 897.11L4838.48 893.02L4843.39 888.65L4848.1 884.01L4852.6 879.11L4856.89 873.97L4860.95 868.59L4864.78 862.99L4868.36 857.18L4871.69 851.18L4874.75 845L4877.55 838.66L4880.07 832.17L4882.31 825.54L4884.26 818.79L4885.92 811.95L4887.28 805.02L4888.34 798.02L4889.1 790.97L4889.56 783.89L4889.71 776.79L4889.71 55.36ZM5473.07 798.21H6001.64L5969.5 656.07H5505.21ZM5734.5 338.21 5893.78 709.29 5897 751.07 6032.71 1055.36H6223.78L5734.5 0L5245.21 1055.36H5436.28L5574.86 742.14L5577.36 705ZM6597.87 446.43 6902.51 962.5 7207.15 446.43 7275.72 1055.36H7450.72L7313.22 5.36L6902.51 683.57L6491.8 5.36L6354.3 1055.36H6529.3ZM7790.35 1055.36H8294.63V907.14H7790.35ZM7790.35 203.57H8294.63V55.36H7790.35ZM7790.35 592.86H8266.06V446.43H7790.35ZM7685.71 55.36V1055.36H7851.78V55.36ZM8559.37 733.21 8433.65 821.07Q8466.87 889.29 8522.76 948.04Q8578.65 1006.79 8653.65 1041.79Q8728.65 1076.79 8816.51 1076.79Q8880.8 1076.79 8940.26 1056.43Q8999.72 1036.07 9046.87 997.86Q9094.01 959.64 9121.33 904.11Q9148.65 848.57 9148.65 778.57Q9148.65 712.5 9126.15 663.57Q9103.65 614.64 9066.87 578.75Q9030.08 542.86 8985.08 518.39Q8940.08 493.93 8895.08 477.86Q8815.08 450 8764.9 422.86Q8714.72 395.71 8691.33 364.64Q8667.94 333.57 8667.94 295Q8667.94 252.5 8700.97 220.18Q8734.01 187.86 8803.3 187.86Q8854.01 187.86 8891.69 207.5Q8929.37 227.14 8957.76 259.11Q8986.15 291.07 9005.8 327.86L9142.22 250.71Q9117.22 198.21 9072.05 149.46Q9026.87 100.71 8961.15 69.11Q8895.44 37.5 8806.15 37.5Q8716.87 37.5 8645.8 71.25Q8574.72 105 8533.65 165.71Q8492.58 226.43 8492.58 306.79Q8492.58 377.14 8519.37 426.43Q8546.15 475.71 8587.76 509.46Q8629.37 543.21 8675.26 564.82Q8721.15 586.43 8757.94 599.64Q8821.15 622.5 8869.19 645.89Q8917.22 669.29 8944.19 702.86Q8971.15 736.43 8971.15 791.79Q8971.15 851.43 8928.3 888.39Q8885.44 925.36 8816.15 925.36Q8760.08 925.36 8713.83 901.43Q8667.58 877.5 8629.9 834.11Q8592.22 790.71 8559.37 733.21ZM10360.17 55.36 10126.96 483.21 9894.82 55.36H9701.96L10041.96 635.36V1055.36H10213.39V633.57L10553.03 55.36ZM10861.69 555.36Q10861.69 452.14 10905.44 371.96Q10949.19 291.79 11025.98 245.54Q11102.76 199.29 11201.69 199.29Q11302.76 199.29 11378.84 245.54Q11454.91 291.79 11498.3 371.96Q11541.69 452.14 11541.69 555.36Q11541.69 658.21 11497.94 738.57Q11454.19 818.93 11377.94 865.18Q11301.69 911.43 11201.69 911.43Q11102.76 911.43 11025.98 865.18Q10949.19 818.93 10905.44 738.57Q10861.69 658.21 10861.69 555.36ZM10682.05 555.36Q10682.05 666.79 10720.62 762.32Q10759.19 857.86 10829.19 928.04Q10899.19 998.21 10994.37 1037.5Q11089.55 1076.79 11201.69 1076.79Q11314.91 1076.79 11409.55 1037.5Q11504.19 998.21 11574.19 928.04Q11644.19 857.86 11682.76 762.32Q11721.34 666.79 11721.34 555.36Q11721.34 442.86 11682.59 348.39Q11643.84 253.93 11573.48 184.46Q11503.12 115 11408.66 76.25Q11314.19 37.5 11201.69 37.5Q11090.98 37.5 10995.98 76.25Q10900.98 115 10830.62 184.46Q10760.26 253.93 10721.16 348.39Q10682.05 442.86 10682.05 555.36ZM12688.55 55.36V726.79L11958.2 5.36V1055.36H12124.27V383.93L12854.63 1105.36V55.36ZM13625.73 675H13931.8Q13918.95 725.71 13893.41 770Q13867.87 814.29 13829.48 848.21Q13791.09 882.14 13738.05 900.89Q13685.02 919.64 13618.59 919.64Q13520.02 919.64 13441.27 873.93Q13362.52 828.21 13316.45 746.07Q13270.37 663.93 13270.37 555.36Q13270.37 445.36 13317.16 364.82Q13363.95 284.29 13442.87 239.46Q13521.8 194.64 13618.59 194.64Q13722.16 194.64 13795.73 237.32Q13869.3 280 13911.09 351.79L14048.59 260Q14003.95 190 13940.73 140.54Q13877.52 91.07 13797.16 64.29Q13716.8 37.5 13618.59 37.5Q13505.73 37.5 13409.48 75Q13313.23 112.5 13241.98 181.61Q13170.73 250.71 13131.27 345.89Q13091.8 441.07 13091.8 555.36Q13091.8 669.64 13130.73 765.36Q13169.66 861.07 13240.2 930.89Q13310.73 1000.71 13406.45 1038.75Q13502.16 1076.79 13615.02 1076.79Q13734.66 1076.79 13827.7 1033.39Q13920.73 990 13983.95 914.29Q14047.16 838.57 14078.41 740.54Q14109.66 642.5 14106.8 532.14H13625.73Z"/></svg></a></dd></div>
+          <div><dt>sheet</dt><dd><a href="./" aria-current="page">Guide</a> &nbsp; <a href="api.html">API</a></dd></div>
+        </dl>
+        <p class="legal"><a href="https://github.com/vibecook-dev/mille/blob/main/LICENSE">MIT</a> © 2026 James Yong. mille is a <a href="https://github.com/vibecook-dev">vibecook</a> project.</p>
       </div>
-    </section>
-
-    <!-- CTA -->
-    <div class="cta">
-      <div class="wrap">
-        <div class="cta-panel">
-          <h2>Ship an explorer that feels native.</h2>
-          <p>Open the API, clone the playground, or drop mille into your Electron shell tonight.</p>
-          <div class="cta-actions">
-            <a class="btn btn-primary" href="api.html">Browse the API</a>
-            <a class="btn btn-ghost" href="https://github.com/vibecook-dev/mille" target="_blank" rel="noopener">View on GitHub</a>
-          </div>
-        </div>
-      </div>
-    </div>
-  </main>
-
-  <footer>
-    <div class="wrap footer-inner">
-      <div>
-        <div class="footer-brand">mille</div>
-        <p class="footer-copy">High-performance native primitives for Electron IDEs. MIT licensed.</p>
-      </div>
-      <ul class="footer-links">
-        <li><a href="index.html">Home</a></li>
-        <li><a href="api.html">API</a></li>
-        <li><a href="icons-preview.html">Icons</a></li>
-        <li><a href="https://github.com/vibecook-dev/mille" target="_blank" rel="noopener">GitHub</a></li>
-        <li><a href="https://github.com/vibecook-dev/mille/blob/main/CHANGELOG.md" target="_blank" rel="noopener">Changelog</a></li>
-        <li><a href="https://www.npmjs.com/package/@vibecook/mille" target="_blank" rel="noopener">npm</a></li>
-        <li><a href="https://vibecook-dev.github.io/mille/" target="_blank" rel="noopener">Docs site</a></li>
-      </ul>
-    </div>
-  </footer>
-
-  <script>
-    // Mobile nav
-    const toggle = document.getElementById('nav-toggle');
-    const menu = document.getElementById('nav-menu');
-    toggle?.addEventListener('click', () => {
-      const open = menu.classList.toggle('is-open');
-      toggle.setAttribute('aria-expanded', String(open));
-    });
-
-    // Copy buttons
-    document.querySelectorAll('[data-copy]').forEach((btn) => {
-      btn.addEventListener('click', async () => {
-        const text = btn.getAttribute('data-copy') || '';
-        try {
-          await navigator.clipboard.writeText(text);
-          const prev = btn.textContent;
-          btn.textContent = 'Copied';
-          setTimeout(() => { btn.textContent = prev; }, 1400);
-        } catch {
-          btn.textContent = 'Select manually';
-        }
-      });
-    });
-
-    // Live file-tree stage
-    const treeData = [
-      { name: 'mille', kind: 'folder', depth: 0, open: true, badge: null },
-      { name: 'crates', kind: 'folder', depth: 1, open: true, badge: null },
-      { name: 'mille-core', kind: 'folder', depth: 2, open: true, badge: 'M' },
-      { name: 'store.rs', kind: 'file', depth: 3, ext: 'rs', badge: 'M' },
-      { name: 'walker.rs', kind: 'file', depth: 3, ext: 'rs', badge: null },
-      { name: 'watcher.rs', kind: 'file', depth: 3, ext: 'rs', badge: 'A' },
-      { name: 'mille-binding', kind: 'folder', depth: 2, open: false, badge: null },
-      { name: 'packages', kind: 'folder', depth: 1, open: true, badge: null },
-      { name: 'mille', kind: 'folder', depth: 2, open: true, badge: null },
-      { name: 'client.ts', kind: 'file', depth: 3, ext: 'ts', badge: null, selected: true },
-      { name: 'host.ts', kind: 'file', depth: 3, ext: 'ts', badge: 'M' },
-      { name: 'protocol.ts', kind: 'file', depth: 3, ext: 'ts', badge: null },
-      { name: 'mille-ui', kind: 'folder', depth: 2, open: false, badge: null },
-      { name: 'apps', kind: 'folder', depth: 1, open: false, badge: null },
-      { name: 'Cargo.toml', kind: 'file', depth: 1, ext: 'json', badge: null },
-      { name: 'package.json', kind: 'file', depth: 1, ext: 'json', badge: null },
-    ];
-
-    const chevron = `<svg viewBox="0 0 8 8" fill="currentColor"><path d="M2.2 1.2L5.8 4 2.2 6.8V1.2z"/></svg>`;
-    const host = document.getElementById('live-tree');
-    const countEl = document.getElementById('stat-entries');
-
-    function renderTree(animate) {
-      if (!host) return;
-      // keep label
-      const label = host.querySelector('.side-label');
-      host.innerHTML = '';
-      if (label) host.appendChild(label);
-      else {
-        const l = document.createElement('div');
-        l.className = 'side-label';
-        l.textContent = 'Explorer';
-        host.appendChild(l);
-      }
-
-      treeData.forEach((row, i) => {
-        // hide children of closed folders
-        let hidden = false;
-        for (let d = row.depth; d > 0; d--) {
-          // find nearest ancestor folder at depth d-1
-        }
-        // simpler: walk ancestors in treeData
-        for (let j = i - 1; j >= 0; j--) {
-          if (treeData[j].depth < row.depth) {
-            if (treeData[j].kind === 'folder' && !treeData[j].open) {
-              hidden = true;
-            }
-            break;
-          }
-        }
-        // also check all ancestors
-        let depthNeed = row.depth - 1;
-        for (let j = i - 1; j >= 0 && depthNeed >= 0; j--) {
-          if (treeData[j].depth === depthNeed && treeData[j].kind === 'folder') {
-            if (!treeData[j].open) hidden = true;
-            depthNeed--;
-          }
-        }
-        if (hidden) return;
-
-        const el = document.createElement('div');
-        el.className = 'tree-row' + (row.selected ? ' is-selected' : '') + (animate ? ' row-enter' : '');
-        if (animate) el.style.animationDelay = `${i * 28}ms`;
-
-        const indent = document.createElement('div');
-        indent.className = 'tree-indent';
-        for (let d = 0; d < row.depth; d++) {
-          indent.appendChild(document.createElement('span'));
-        }
-        el.appendChild(indent);
-
-        if (row.kind === 'folder') {
-          const c = document.createElement('span');
-          c.className = 'chev' + (row.open ? ' is-open' : '');
-          c.innerHTML = chevron;
-          el.appendChild(c);
-          const ic = document.createElement('span');
-          ic.className = 'icon-folder';
-          el.appendChild(ic);
-        } else {
-          const spacer = document.createElement('span');
-          spacer.className = 'chev';
-          spacer.style.visibility = 'hidden';
-          spacer.innerHTML = chevron;
-          el.appendChild(spacer);
-          const ic = document.createElement('span');
-          ic.className = 'icon-file' + (row.ext ? ' ' + row.ext : '');
-          el.appendChild(ic);
-        }
-
-        const name = document.createElement('span');
-        name.className = 'row-name';
-        name.textContent = row.name;
-        el.appendChild(name);
-
-        if (row.badge) {
-          const b = document.createElement('span');
-          b.className = 'row-badge ' + row.badge.toLowerCase();
-          b.textContent = row.badge;
-          el.appendChild(b);
-        }
-
-        if (row.kind === 'folder') {
-          el.style.cursor = 'pointer';
-          el.addEventListener('click', () => {
-            row.open = !row.open;
-            renderTree(false);
-          });
-        }
-
-        host.appendChild(el);
-      });
-
-      if (countEl) {
-        const visible = host.querySelectorAll('.tree-row').length;
-        countEl.textContent = String(12840 + visible * 37);
-      }
-    }
-
-    renderTree(true);
-
-    // Ambient “watcher” tick: occasionally flash a badge
-    let tick = 0;
-    setInterval(() => {
-      if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
-      tick++;
-      const targets = treeData.filter((r) => r.kind === 'file');
-      if (!targets.length) return;
-      const t = targets[tick % targets.length];
-      const prev = t.badge;
-      if (!t.badge) {
-        t.badge = tick % 2 === 0 ? 'M' : 'A';
-        renderTree(false);
-        setTimeout(() => {
-          t.badge = prev;
-          renderTree(false);
-        }, 1600);
-      }
-    }, 4200);
-  </script>
-</body>
+    </footer>
+  </body>
 </html>
