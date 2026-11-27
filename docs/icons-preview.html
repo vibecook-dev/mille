@@ -1,766 +1,145 @@
-<!DOCTYPE html>
-<html lang="en" data-theme="dark">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Icon set previews — mille</title>
-  <meta name="description" content="Side-by-side preview of candidate file/folder icon themes for @vibecook/mille-ui." />
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Inter:wght@400;500;600;700&family=Syne:wght@700;800&display=swap" rel="stylesheet" />
-  <style>
-    :root {
-      --void: #07080c;
-      --ink: #0e1016;
-      --panel: #151822;
-      --edge: #252a38;
-      --mist: #9aa3b5;
-      --paper: #eef0f6;
-      --paper-dim: #c5cad6;
-      --signal: #7c9cff;
-      --live: #4ad4b5;
-      --brass: #c4a574;
-      --font: "Inter", system-ui, sans-serif;
-      --mono: "IBM Plex Mono", ui-monospace, monospace;
-      --display: "Syne", system-ui, sans-serif;
-      --row-h: 22px;
-    }
-    [data-theme="light"] {
-      --void: #f2f3f7;
-      --ink: #ffffff;
-      --panel: #eef0f5;
-      --edge: #d5d9e3;
-      --mist: #6b7385;
-      --paper: #1a1d26;
-      --paper-dim: #3d4454;
-      --signal: #3d6ef5;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: var(--font);
-      font-size: 14px;
-      line-height: 1.5;
-      background: var(--void);
-      color: var(--paper);
-      -webkit-font-smoothing: antialiased;
-    }
-    a { color: var(--signal); text-decoration: none; }
-    a:hover { text-decoration: underline; }
-    .wrap { width: min(100% - 2rem, 1280px); margin: 0 auto; }
-    header.bar {
-      position: sticky; top: 0; z-index: 20;
-      backdrop-filter: blur(14px);
-      background: color-mix(in srgb, var(--void) 82%, transparent);
-      border-bottom: 1px solid color-mix(in srgb, var(--edge) 80%, transparent);
-    }
-    .bar-inner {
-      display: flex; align-items: center; justify-content: space-between;
-      gap: 1rem; min-height: 56px; padding: 0.5rem 0;
-    }
-    .brand {
-      font-family: var(--display); font-weight: 800; font-size: 1.05rem;
-      letter-spacing: -0.02em; color: var(--paper); text-decoration: none;
-    }
-    .bar-actions { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
-    .btn {
-      font: inherit; font-size: 0.85rem; font-weight: 600;
-      padding: 0.4rem 0.75rem; border-radius: 8px; border: 1px solid var(--edge);
-      background: transparent; color: var(--paper-dim); cursor: pointer;
-    }
-    .btn:hover { color: var(--paper); border-color: var(--signal); }
-    .btn.on { background: color-mix(in srgb, var(--signal) 16%, transparent); color: var(--signal); border-color: color-mix(in srgb, var(--signal) 40%, var(--edge)); }
-    .hero { padding: 2.25rem 0 1.25rem; }
-    .hero h1 {
-      font-family: var(--display); font-weight: 800; font-size: clamp(1.6rem, 3vw, 2.2rem);
-      letter-spacing: -0.03em; margin: 0 0 0.6rem; line-height: 1.1;
-    }
-    .hero p { margin: 0; max-width: 62ch; color: var(--paper-dim); }
-    .legend {
-      display: flex; flex-wrap: wrap; gap: 0.5rem 1rem;
-      margin: 1.25rem 0 0; color: var(--mist); font-size: 0.82rem;
-    }
-    .legend code { font-family: var(--mono); font-size: 0.78rem; color: var(--signal); }
-    .controls {
-      display: flex; flex-wrap: wrap; gap: 0.75rem 1.25rem;
-      align-items: center; padding: 0.75rem 0 1.25rem;
-      border-bottom: 1px solid var(--edge); margin-bottom: 1.5rem;
-    }
-    .controls label {
-      display: inline-flex; align-items: center; gap: 0.4rem;
-      font-size: 0.85rem; color: var(--paper-dim); cursor: pointer;
-    }
-    .controls input[type="checkbox"] { accent-color: var(--signal); }
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-      gap: 1rem;
-      padding-bottom: 3rem;
-    }
-    .card {
-      background: var(--ink);
-      border: 1px solid var(--edge);
-      border-radius: 12px;
-      overflow: hidden;
-      display: flex; flex-direction: column;
-      transition: border-color 0.15s, box-shadow 0.15s;
-    }
-    .card:hover { border-color: color-mix(in srgb, var(--signal) 35%, var(--edge)); }
-    .card.picked {
-      border-color: var(--signal);
-      box-shadow: 0 0 0 1px color-mix(in srgb, var(--signal) 40%, transparent), 0 12px 40px -20px rgba(124,156,255,0.35);
-    }
-    .card-head {
-      padding: 0.9rem 1rem 0.75rem;
-      border-bottom: 1px solid color-mix(in srgb, var(--edge) 80%, transparent);
-    }
-    .card-head .meta {
-      display: flex; justify-content: space-between; gap: 0.5rem; align-items: flex-start;
-    }
-    .card-head h2 {
-      margin: 0; font-size: 0.98rem; font-weight: 700; letter-spacing: -0.02em;
-    }
-    .tag {
-      font-family: var(--mono); font-size: 0.65rem; letter-spacing: 0.04em;
-      text-transform: uppercase; padding: 0.2rem 0.45rem; border-radius: 4px;
-      white-space: nowrap;
-    }
-    .tag.shipped { color: var(--live); background: color-mix(in srgb, var(--live) 12%, transparent); }
-    .tag.proposal { color: var(--brass); background: color-mix(in srgb, var(--brass) 12%, transparent); }
-    .tag.current { color: var(--signal); background: color-mix(in srgb, var(--signal) 14%, transparent); }
-    .card-head p {
-      margin: 0.45rem 0 0; font-size: 0.8rem; color: var(--mist); line-height: 1.4;
-    }
-    .stats {
-      display: flex; flex-wrap: wrap; gap: 0.35rem 0.75rem;
-      margin-top: 0.55rem; font-family: var(--mono); font-size: 0.68rem; color: var(--mist);
-    }
-    .tree-pane {
-      padding: 0.55rem 0.5rem 0.7rem;
-      background: color-mix(in srgb, var(--void) 55%, var(--ink));
-      flex: 1;
-      min-height: 320px;
-    }
-    .tree-row {
-      display: flex; align-items: center; gap: 4px;
-      height: var(--row-h);
-      padding-right: 6px;
-      border-radius: 3px;
-      font-size: 12px;
-      color: var(--paper-dim);
-      font-family: var(--font);
-      white-space: nowrap;
-    }
-    .tree-row:hover { background: color-mix(in srgb, var(--paper) 5%, transparent); }
-    .tree-row .indent { display: flex; height: 100%; flex-shrink: 0; }
-    .tree-row .indent i { width: 12px; border-right: 1px solid transparent; display: block; }
-    .tree-row .chev {
-      width: 12px; height: 12px; flex: 0 0 12px;
-      display: grid; place-items: center; color: var(--mist); font-size: 8px;
-    }
-    .tree-row .chev.empty { visibility: hidden; }
-    .tree-row .ico {
-      width: 16px; height: 16px; flex: 0 0 16px;
-      display: grid; place-items: center; position: relative;
-    }
-    .tree-row .ico svg { width: 16px; height: 16px; display: block; }
-    .tree-row .name { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
-    .tree-row .badge {
-      margin-left: auto; font-family: var(--mono); font-size: 10px; font-weight: 700;
-      color: #e3b341;
-    }
-    .tree-row.symlink .ico::after {
-      content: "";
-      position: absolute; right: -1px; bottom: -1px;
-      width: 7px; height: 7px;
-      background: var(--ink);
-      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 8 8'%3E%3Cpath d='M1.5 5.5 L1.5 1.5 L5.5 1.5 M1.5 1.5 L6.5 6.5' fill='none' stroke='%239aa3b5' stroke-width='1.2' stroke-linecap='round'/%3E%3C/svg%3E");
-      background-size: 6px; background-repeat: no-repeat; background-position: center;
-      border-radius: 1px;
-    }
-    .card-foot {
-      display: flex; gap: 0.5rem; padding: 0.65rem 1rem;
-      border-top: 1px solid color-mix(in srgb, var(--edge) 80%, transparent);
-    }
-    .card-foot button {
-      flex: 1; font: inherit; font-size: 0.82rem; font-weight: 600;
-      padding: 0.45rem; border-radius: 7px; cursor: pointer;
-      border: 1px solid var(--edge); background: transparent; color: var(--paper-dim);
-    }
-    .card-foot button.primary {
-      background: linear-gradient(180deg, #8eabff, var(--signal));
-      color: #0a0c14; border-color: transparent;
-    }
-    .card-foot button:hover { filter: brightness(1.05); }
-    .pick-bar {
-      position: sticky; bottom: 0; z-index: 15;
-      border-top: 1px solid var(--edge);
-      background: color-mix(in srgb, var(--void) 90%, transparent);
-      backdrop-filter: blur(12px);
-      padding: 0.85rem 0;
-    }
-    .pick-bar .inner {
-      display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center;
-      justify-content: space-between;
-    }
-    .pick-bar strong { color: var(--paper); }
-    .pick-bar span { color: var(--mist); font-size: 0.88rem; }
-    footer { padding: 1.5rem 0 2.5rem; color: var(--mist); font-size: 0.85rem; }
-    .swatch-row {
-      display: flex; gap: 3px; margin-top: 0.5rem; flex-wrap: wrap;
-    }
-    .swatch {
-      width: 14px; height: 14px; border-radius: 3px;
-      border: 1px solid color-mix(in srgb, var(--paper) 12%, transparent);
-    }
-  </style>
-</head>
-<body>
-  <header class="bar">
-    <div class="wrap bar-inner">
-      <a class="brand" href="index.html">mille · icons</a>
-      <div class="bar-actions">
-        <button type="button" class="btn" id="theme-toggle">Light</button>
-        <a class="btn" href="index.html">Docs</a>
-        <a class="btn" href="api.html">API</a>
-      </div>
-    </div>
-  </header>
-
-  <main class="wrap">
-    <section class="hero">
-      <h1>Icon set options</h1>
-      <p>
-        Same sample tree under each candidate. Default monoline is too sparse for fast type scanning;
-        Material is rich but heavy. These proposals sit between: scannable type/folder cues without
-        full Material noise. Pick one as the playground (or product) default.
-      </p>
-      <div class="legend">
-        <span>Sample includes folders, open/closed, symlink-to-dir, VCS mark, common langs.</span>
-        <span>Shipped = in repo today · Proposal = preview only</span>
-      </div>
-    </section>
-
-    <div class="controls">
-      <label><input type="checkbox" id="show-lib" checked /> Library-root band demo</label>
-      <label><input type="checkbox" id="show-symlink" checked /> Symlink arrow badge</label>
-      <label><input type="checkbox" id="show-vcs" checked /> VCS “M” mark</label>
-      <span style="color:var(--mist);font-size:0.82rem;margin-left:auto">Click a card or “Select” to choose</span>
-    </div>
-
-    <div class="grid" id="grid"></div>
-  </main>
-
-  <div class="pick-bar">
-    <div class="wrap inner">
-      <div>
-        <strong id="pick-name">No selection</strong>
-        <span id="pick-desc"> — choose a set above</span>
-      </div>
-      <div style="display:flex;gap:0.5rem;flex-wrap:wrap">
-        <button type="button" class="btn" id="copy-id">Copy theme id</button>
-        <button type="button" class="btn on" id="print-note">How to adopt</button>
-      </div>
-    </div>
-  </div>
-
-  <footer class="wrap">
-    Preview-only SVG mockups (except Default / Stage / Material notes). Implementation can map any
-    selection to a real <code style="font-family:var(--mono);font-size:0.85em;color:var(--signal)">IconTheme</code>
-    for <code style="font-family:var(--mono);font-size:0.85em;color:var(--signal)">FileTree</code>.
-  </footer>
-
-  <dialog id="adopt" style="
-    border:1px solid var(--edge); border-radius:12px; background:var(--ink); color:var(--paper);
-    max-width:36rem; padding:1.25rem 1.4rem; font-family:var(--font);
-  ">
-    <h3 style="margin:0 0 0.5rem;font-size:1.05rem">How to adopt</h3>
-    <p id="adopt-body" style="margin:0 0 1rem;color:var(--paper-dim);font-size:0.9rem;line-height:1.5"></p>
-    <form method="dialog" style="text-align:right">
-      <button class="btn on" value="ok">Close</button>
-    </form>
-  </dialog>
-
-  <script>
-    const SAMPLE = [
-      { depth: 0, name: 'playground', kind: 'folder', open: true },
-      { depth: 1, name: 'node_modules', kind: 'folder', open: true, library: true },
-      { depth: 2, name: '@vibecook', kind: 'folder', open: true, library: true },
-      { depth: 3, name: 'mille', kind: 'folder', open: true, symlink: true, library: true },
-      { depth: 4, name: 'src', kind: 'folder', open: false, library: true },
-      { depth: 4, name: 'package.json', kind: 'json', library: true },
-      { depth: 4, name: 'index.d.ts', kind: 'ts', library: true },
-      { depth: 3, name: 'mille-ui', kind: 'folder', open: false, symlink: true, library: true },
-      { depth: 1, name: 'src', kind: 'folder', open: true },
-      { depth: 2, name: 'main', kind: 'folder', open: false },
-      { depth: 2, name: 'renderer', kind: 'folder', open: false },
-      { depth: 2, name: 'App.tsx', kind: 'tsx' },
-      { depth: 2, name: 'index.css', kind: 'css' },
-      { depth: 1, name: 'electron.vite.config.ts', kind: 'ts' },
-      { depth: 1, name: 'package.json', kind: 'json' },
-      { depth: 1, name: 'README.md', kind: 'md', vcs: 'M' },
-      { depth: 1, name: 'Cargo.toml', kind: 'toml' },
-      { depth: 1, name: 'main.rs', kind: 'rs' },
-      { depth: 1, name: 'script.py', kind: 'py' },
-      { depth: 1, name: 'index.html', kind: 'html' },
-      { depth: 1, name: '.gitignore', kind: 'git' },
-      { depth: 1, name: 'yarn.lock', kind: 'lock' },
-      { depth: 1, name: 'logo.png', kind: 'image' },
-    ];
-
-    // ── SVG helpers ───────────────────────────────────────────────
-    const svg = (inner, attrs = '') =>
-      `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16" ${attrs}>${inner}</svg>`;
-
-    const stroke = (color = 'currentColor', w = 1.2) =>
-      `fill="none" stroke="${color}" stroke-width="${w}" stroke-linecap="round" stroke-linejoin="round"`;
-
-    // ── Theme icon factories: (kind, {open}) => svg html ──────────
-
-    /** 1 — Shipped Default monoline (currentColor) */
-    function iconDefault(kind, { open } = {}) {
-      const c = 'currentColor';
-      if (kind === 'folder') {
-        return open
-          ? svg(`<path d="M1.5 4.5h4l1.5 1.5h7.5v2.5h-13z"/><path d="M1.5 13.5l1.5-5h12.5l-1.5 5z" ${stroke(c)}/>`)
-          : svg(`<path d="M1.5 4.5h4l1.5 1.5h7.5v7.5h-13z" ${stroke(c)}/>`);
-      }
-      const page = `<path d="M3.5 1.5h6l3 3v10h-9z"/><path d="M9.5 1.5v3h3"/>`;
-      const marks = {
-        ts: '<path d="M5 11h4m-2 0v-3"/>',
-        tsx: '<path d="M5 11h4m-2 0v-3"/>',
-        js: '<path d="M8 8v3a1 1 0 0 1-1 1"/>',
-        json: '<path d="M6 8c-1 0-1 1-1 1.5s0 1-1 1 1 .5 1 1 0 1.5 1 1.5m4-5c1 0 1 1 1 1.5s0 1 1 1-1 .5-1 1 0 1.5-1 1.5"/>',
-        md: '<path d="M5 12v-3l1.5 2 1.5-2v3"/>',
-        rs: '<path d="M5 11h3m0 0v-2m0 2l1.5 1.5"/>',
-        py: '<circle cx="7" cy="9.5" r="1"/><circle cx="9" cy="12" r="1"/>',
-        css: '<path d="M5 9.5h4m-4 2h4"/>',
-        html: '<path d="M7 8.5l-1.5 2L7 12.5m2-4l1.5 2L9 12.5"/>',
-        toml: '<path d="M5 9h4M7 9v3"/>',
-        git: '<circle cx="8" cy="10" r="1.5"/>',
-        lock: '<path d="M6 10h4v2H6zM7 10V8.5a1 1 0 0 1 2 0V10"/>',
-        image: '<path d="M5 12l2-2.5 1.5 1.5L11 8"/>',
-      };
-      return svg(`<g ${stroke(c)}>${page}${marks[kind] || ''}</g>`);
-    }
-
-    /** 2 — Soft duotone: muted fills + language accent corner */
-    function iconDuotone(kind, { open } = {}) {
-      if (kind === 'folder') {
-        const fill = open ? '#5b8def' : '#4a6ad4';
-        const tab = open ? '#7aa2ff' : '#6b8cff';
-        return open
-          ? svg(`<path d="M1.5 4h4l1.2 1.4H14.5v1.6H1.5z" fill="${fill}" opacity=".85"/><path d="M1.5 7l1.4 5.75a1 1 0 0 0 .97.75H14.2a1 1 0 0 0 .97-1.25L14.5 7z" fill="${tab}"/>`)
-          : svg(`<path d="M1.5 3.25h4.1l1.15 1.35H14.5v8.15a1 1 0 0 1-1 1H2.5a1 1 0 0 1-1-1V3.25z" fill="${fill}"/><path d="M1.5 3.25h4.1l1.15 1.35H1.5z" fill="${tab}" opacity=".9"/>`);
-      }
-      const accents = {
-        ts: '#3178c6', tsx: '#3178c6', js: '#c9a227', json: '#c4a574',
-        md: '#8b9bb4', rs: '#dea584', py: '#4b8bbe', css: '#563d7c',
-        html: '#e34c26', toml: '#9c4221', git: '#f05033', lock: '#a78bfa',
-        image: '#3fb950',
-      };
-      const a = accents[kind] || '#6b738a';
-      return svg(
-        `<rect x="3" y="1.75" width="10" height="12.5" rx="1.5" fill="#2a3040" stroke="#4a5268" stroke-width="1"/>
-         <path d="M9.5 1.75v3h3" fill="none" stroke="#4a5268" stroke-width="1"/>
-         <rect x="8.5" y="9.5" width="3.2" height="3.2" rx="0.6" fill="${a}"/>`
-      );
-    }
-
-    /** 3 — Language strip: monoline file + left color rail */
-    function iconStrip(kind, { open } = {}) {
-      if (kind === 'folder') {
-        const c = open ? '#7c9cff' : '#9aa3b5';
-        return open
-          ? svg(`<path d="M1.5 4.5h4l1.5 1.5h7.5v2.5h-13z M1.5 13.5l1.5-5h12.5l-1.5 5z" ${stroke(c, 1.3)}/>`)
-          : svg(`<path d="M1.5 4.5h4l1.5 1.5h7.5v7.5h-13z" ${stroke(c, 1.3)}/>`);
-      }
-      const colors = {
-        ts: '#3178c6', tsx: '#3178c6', js: '#e3b341', json: '#c4a574',
-        md: '#8b9bb4', rs: '#dea584', py: '#4b8bbe', css: '#9b6dff',
-        html: '#e34c26', toml: '#c4a574', git: '#f05033', lock: '#a78bfa',
-        image: '#3fb950',
-      };
-      const col = colors[kind] || '#6b738a';
-      return svg(
-        `<path d="M4 1.5h6l3 3v10H4z" ${stroke('currentColor', 1.15)}/>
-         <path d="M10 1.5v3h3" ${stroke('currentColor', 1.15)}/>
-         <rect x="4.2" y="1.7" width="1.6" height="12.1" fill="${col}" opacity="0.95"/>`
-      );
-    }
-
-    /** 4 — JetBrains quiet: gray folders, soft language tints on file glyphs */
-    function iconJBQuiet(kind, { open } = {}) {
-      if (kind === 'folder') {
-        const fill = open ? '#8a9099' : '#7a808a';
-        return open
-          ? svg(`<path d="M1.5 4h4l1.2 1.4H14.5v1.6H1.5z" fill="${fill}" opacity=".75"/><path d="M1.5 7l1.3 5.5a.9.9 0 0 0 .88.7h10.4a.9.9 0 0 0 .88-1.15L14.5 7z" fill="${fill}"/>`)
-          : svg(`<path d="M1.5 3.5h4l1.2 1.3H14.5v8.2a.9.9 0 0 1-.9.9H2.4a.9.9 0 0 1-.9-.9V3.5z" fill="${fill}"/>`);
-      }
-      // Soft filled page with monochrome mark in language color
-      const marks = {
-        ts: { c: '#4a90d9', d: 'M5.5 11h3.5M7.25 11V8.2' },
-        tsx: { c: '#4a90d9', d: 'M5.5 11h3.5M7.25 11V8.2' },
-        js: { c: '#c9a227', d: 'M8 8.2v2.6a.9.9 0 0 1-.9.9' },
-        json: { c: '#b8956a', d: 'M6.2 8.5c-.7 0-.7.7-.7 1s0 .7-.7.7.7.3.7.7 0 1 .7 1m3-3.4c.7 0 .7.7.7 1s0 .7.7.7-.7.3-.7.7 0 1-.7 1' },
-        md: { c: '#8b95a8', d: 'M5.5 11.5V8.5l1.3 1.6 1.3-1.6v3' },
-        rs: { c: '#c9956c', d: 'M5.5 11h2.5m0 0V9m0 2 1.2 1.2' },
-        py: { c: '#5b9bd4', d: '' },
-        css: { c: '#8b6cc1', d: 'M5.5 9.2h3.5M5.5 11h3.5' },
-        html: { c: '#d35a3c', d: 'M6.5 8.5 5.2 10.5 6.5 12.5m2.2-4 1.3 2-1.3 2' },
-        toml: { c: '#b8956a', d: 'M5.5 9.5h3.5M7.25 9.5v2.5' },
-        git: { c: '#d35a3c', d: '' },
-        lock: { c: '#9a8fd4', d: 'M6 10.2h3.2v1.8H6zM6.8 10.2V9a1 1 0 0 1 2 0v1.2' },
-        image: { c: '#5aaf6a', d: 'M5.2 11.5 6.8 9.5l1.3 1.3 2-2.5' },
-      };
-      const m = marks[kind] || { c: '#8a9099', d: '' };
-      let extra = m.d ? `<path d="${m.d}" fill="none" stroke="${m.c}" stroke-width="1.15" stroke-linecap="round"/>` : '';
-      if (kind === 'py') extra = `<circle cx="6.8" cy="9.5" r="1" fill="${m.c}"/><circle cx="9" cy="11.5" r="1" fill="${m.c}" opacity=".75"/>`;
-      if (kind === 'git') extra = `<circle cx="8" cy="10.2" r="1.4" fill="none" stroke="${m.c}" stroke-width="1.15"/>`;
-      return svg(
-        `<path d="M3.5 1.8h6l2.8 2.8v9.1a.7.7 0 0 1-.7.7h-8.1a.7.7 0 0 1-.7-.7V2.5a.7.7 0 0 1 .7-.7z" fill="#3a3f4a" stroke="#5a6170" stroke-width="0.9"/>
-         <path d="M9.5 1.8v2.8h2.8" fill="none" stroke="#5a6170" stroke-width="0.9"/>
-         ${extra}`
-      );
-    }
-
-    /** 5 — Glyph chips: rounded square + letter (high scan, still compact) */
-    function iconChips(kind, { open } = {}) {
-      if (kind === 'folder') {
-        const bg = open ? '#3d5a99' : '#2f4578';
-        return svg(
-          `<rect x="1.5" y="3" width="13" height="10.5" rx="2" fill="${bg}"/>
-           <path d="M1.5 6.2h13" stroke="rgba(255,255,255,.15)" stroke-width="1"/>
-           <path d="M4 3V2.2a.6.6 0 0 1 .6-.6h2.2L8 3" fill="${bg}" stroke="rgba(255,255,255,.2)" stroke-width=".5"/>`
-        );
-      }
-      const map = {
-        ts: ['#2b4acb', 'TS'], tsx: ['#2b4acb', 'TX'], js: ['#a68b12', 'JS'],
-        json: ['#8a7040', '{}'], md: ['#5a6578', 'MD'], rs: ['#a66a45', 'RS'],
-        py: ['#3d6f9c', 'PY'], css: ['#6b4ea3', '#'], html: ['#a84530', '<>'],
-        toml: ['#8a7040', 'T'], git: ['#a84530', 'G'], lock: ['#6b5ca3', 'L'],
-        image: ['#3d8a55', '◻'],
-      };
-      const [bg, label] = map[kind] || ['#4a5060', '·'];
-      const fs = label.length > 2 ? 5 : 6;
-      return svg(
-        `<rect x="2" y="2" width="12" height="12" rx="2.5" fill="${bg}"/>
-         <text x="8" y="10.6" text-anchor="middle" font-family="ui-monospace,monospace" font-size="${fs}" font-weight="700" fill="#fff">${label}</text>`
-      );
-    }
-
-    /** 6 — Outline accent: thin outline + colored glyph only (no fill noise) */
-    function iconOutlineAccent(kind, { open } = {}) {
-      const folderC = open ? '#8eb0ff' : '#9aa3b5';
-      if (kind === 'folder') {
-        return open
-          ? svg(`<path d="M1.5 4.5h4l1.5 1.5h7.5v2.5h-13zM1.5 13.5l1.5-5h12.5l-1.5 5z" ${stroke(folderC, 1.25)}/>`)
-          : svg(`<path d="M1.5 4.5h4l1.5 1.5h7.5v7.5h-13z" ${stroke(folderC, 1.25)}/>`);
-      }
-      const colors = {
-        ts: '#5b9fd4', tsx: '#5b9fd4', js: '#d4b84a', json: '#c4a574',
-        md: '#9aa3b5', rs: '#e0a882', py: '#6aa8d8', css: '#a78bfa',
-        html: '#e07a5f', toml: '#c4a574', git: '#e07a5f', lock: '#a78bfa',
-        image: '#6bcf8e',
-      };
-      const col = colors[kind] || '#9aa3b5';
-      const glyphs = {
-        ts: 'M5.5 10.8h4M7.5 10.8V8',
-        tsx: 'M5.5 10.8h4M7.5 10.8V8',
-        js: 'M8 8v2.8a1 1 0 0 1-1 1',
-        json: 'M6.2 8.5c-.8 0-.8.8-.8 1.1s0 .8-.7.8.7.4.7.8 0 1.1.8 1.1m3-3.8c.8 0 .8.8.8 1.1s0 .8.7.8-.7.4-.7.8 0 1.1-.8 1.1',
-        md: 'M5.5 11.5V8.5l1.4 1.8L8.3 8.5v3',
-        rs: 'M5.5 11h2.8m0 0V9m0 2 1.3 1.3',
-        py: null,
-        css: 'M5.5 9.2h4M5.5 11h4',
-        html: 'M6.5 8.5 5 10.5 6.5 12.5m2.2-4 1.5 2-1.5 2',
-        toml: 'M5.5 9.5h4M7.5 9.5v2.5',
-        git: null,
-        lock: 'M6.2 10.2h3v2h-3zM6.9 10.2V9a1 1 0 0 1 2 0v1.2',
-        image: 'M5.2 11.5 6.8 9.4l1.3 1.4 2.1-2.6',
-      };
-      let g = glyphs[kind];
-      let extra = '';
-      if (kind === 'py') extra = `<circle cx="6.8" cy="9.4" r="1.1" fill="none" stroke="${col}" stroke-width="1.15"/><circle cx="9.1" cy="11.6" r="1.1" fill="none" stroke="${col}" stroke-width="1.15"/>`;
-      else if (kind === 'git') extra = `<circle cx="8" cy="10.2" r="1.5" fill="none" stroke="${col}" stroke-width="1.15"/>`;
-      else if (g) extra = `<path d="${g}" fill="none" stroke="${col}" stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round"/>`;
-      return svg(
-        `<path d="M3.5 1.5h6l3 3v10h-9z" ${stroke('currentColor', 1.15)}/>
-         <path d="M9.5 1.5v3h3" ${stroke('currentColor', 1.15)}/>
-         ${extra}`
-      );
-    }
-
-    /** 7 — Material-ish (approximation for preview — colored rich) */
-    function iconMaterialish(kind, { open } = {}) {
-      if (kind === 'folder') {
-        // Approximate Material folder names: src green, etc. Sample uses generic
-        const fill = open ? '#90caf9' : '#42a5f5';
-        return open
-          ? svg(`<path d="M1 4h4.2l1.3 1.3H15v1.5H1z" fill="#64b5f6"/><path d="M1 6.8 2.2 13a1 1 0 0 0 1 .8h9.6a1 1 0 0 0 1-.85L15 6.8z" fill="${fill}"/>`)
-          : svg(`<path d="M1.2 3.2h4l1.3 1.4H14.8v8.2a1 1 0 0 1-1 1H2.2a1 1 0 0 1-1-1V3.2z" fill="${fill}"/>`);
-      }
-      // Simplified colored blobs reminiscent of Material
-      const styles = {
-        ts: { bg: '#0288d1', t: 'TS' },
-        tsx: { bg: '#0288d1', t: 'TSX' },
-        js: { bg: '#ffca28', t: 'JS', fg: '#333' },
-        json: { bg: '#fbc02d', t: '{ }', fg: '#333' },
-        md: { bg: '#42a5f5', t: 'MD' },
-        rs: { bg: '#ff8a65', t: 'Rs' },
-        py: { bg: '#ffd54f', t: 'Py', fg: '#333' },
-        css: { bg: '#42a5f5', t: '#' },
-        html: { bg: '#e57373', t: '<>' },
-        toml: { bg: '#a1887f', t: 'T' },
-        git: { bg: '#e57373', t: 'git' },
-        lock: { bg: '#b39ddb', t: 'L' },
-        image: { bg: '#81c784', t: 'img' },
-      };
-      const s = styles[kind] || { bg: '#90a4ae', t: 'f' };
-      const fg = s.fg || '#fff';
-      const fs = s.t.length > 2 ? 4.5 : 5.5;
-      return svg(
-        `<rect x="2" y="1.5" width="12" height="13" rx="1.5" fill="${s.bg}"/>
-         <text x="8" y="10.4" text-anchor="middle" font-family="system-ui,sans-serif" font-size="${fs}" font-weight="700" fill="${fg}">${s.t}</text>`
-      );
-    }
-
-    /** 8 — Stage (playground mock tiles) */
-    function iconStage(kind, { open } = {}) {
-      if (kind === 'folder') {
-        return open
-          ? svg(`<path d="M1.5 4h4l1.2 1.4H14.5v1.6H1.5z" fill="#5a7aef"/><path d="M1.5 7l1.4 5.75a1 1 0 0 0 .97.75H14.2a1 1 0 0 0 .97-1.25L14.5 7z" fill="#6b8cff"/>`)
-          : svg(`<path d="M1.5 3.25h4.1l1.15 1.35H14.5v8.15a1 1 0 0 1-1 1H2.5a1 1 0 0 1-1-1V3.25z" fill="#6b8cff"/><path d="M1.5 3.25h4.1l1.15 1.35H1.5z" fill="#8aa4ff" opacity=".9"/>`);
-      }
-      const tiles = {
-        ts: ['#1a2438', '#7c9cff', 'TS'],
-        tsx: ['#1a2438', '#7c9cff', 'TX'],
-        js: ['#2a2618', '#e3b341', 'JS'],
-        json: ['#2a2618', '#c4a574', '{}'],
-        md: ['#1c2430', '#9aa3b5', 'MD'],
-        rs: ['#2a1c16', '#e07a4c', 'RS'],
-        py: ['#1c2430', '#4ad4b5', 'PY'],
-        css: ['#1a2234', '#82aaff', '#'],
-        html: ['#2a1c18', '#e07a5f', '<>'],
-        toml: ['#242018', '#c4a574', 'T'],
-        git: ['#2a1c1c', '#f85149', 'G'],
-        lock: ['#241c28', '#a78bfa', 'L'],
-        image: ['#1c2820', '#3fb950', '◻'],
-      };
-      const [fill, strokeCol, mark] = tiles[kind] || ['#2a3040', '#4a5268', '·'];
-      return svg(
-        `<rect x="3" y="1.75" width="10" height="12.5" rx="1.6" fill="${fill}" stroke="${strokeCol}" stroke-width="1.15"/>
-         <text x="8" y="10.6" text-anchor="middle" font-family="ui-monospace,monospace" font-size="5.5" font-weight="700" fill="${strokeCol}">${mark}</text>`
-      );
-    }
-
-    const THEMES = [
-      {
-        id: 'default',
-        name: 'Default monoline',
-        status: 'shipped',
-        statusLabel: 'Shipped',
-        summary: 'What mille-ui ships today. currentColor strokes, ~20 types. Very light bundle — too sparse for quick type ID.',
-        size: '~4 KB',
-        coverage: '~20 types',
-        icon: iconDefault,
-        swatches: ['#9aa3b5', '#c5cad6', '#eef0f6'],
-        adopt: 'import { defaultIconTheme } from "@vibecook/mille-ui/icons/default" and pass iconTheme={defaultIconTheme}. Already the library default when no theme is set.',
-      },
-      {
-        id: 'material',
-        name: 'Material Icon Theme',
-        status: 'current',
-        statusLabel: 'Playground now',
-        summary: 'Full Material pack. Maximum type literacy and folder naming (src, components…). Heavy and colorful.',
-        size: '~large async',
-        coverage: '~150 types',
-        icon: iconMaterialish,
-        swatches: ['#42a5f5', '#ffca28', '#e57373', '#81c784', '#b39ddb'],
-        adopt: 'loadMaterialIconTheme() from @vibecook/mille-ui/icons/material. Current playground default.',
-      },
-      {
-        id: 'stage',
-        name: 'Stage tiles',
-        status: 'shipped',
-        statusLabel: 'Playground option',
-        summary: 'Docs-mock solid blue folders + letter tiles. Clear at a glance; more “demo product” than IDE chrome.',
-        size: 'tiny',
-        coverage: '~12 types',
-        icon: iconStage,
-        swatches: ['#6b8cff', '#7c9cff', '#e3b341', '#e07a4c'],
-        adopt: 'Playground stageIconTheme.ts — promote to packages/mille-ui if chosen.',
-      },
-      {
-        id: 'jb-quiet',
-        name: 'Quiet IDE',
-        status: 'proposal',
-        statusLabel: 'Proposal',
-        summary: 'Gray filled folders + soft language tints on a dim file body. Closest calm “WebStorm-adjacent” scan without rainbow Material.',
-        size: 'small',
-        coverage: '~15 types',
-        icon: iconJBQuiet,
-        swatches: ['#7a808a', '#4a90d9', '#c9a227', '#c9956c', '#d35a3c'],
-        adopt: 'New IconTheme in mille-ui (e.g. icons/quiet). Recommended default candidate for product + playground.',
-      },
-      {
-        id: 'outline-accent',
-        name: 'Outline + accent',
-        status: 'proposal',
-        statusLabel: 'Proposal',
-        summary: 'Default monoline structure, language marks only in color. Minimal chrome, still type-scannable.',
-        size: 'tiny',
-        coverage: '~15 types',
-        icon: iconOutlineAccent,
-        swatches: ['#9aa3b5', '#5b9fd4', '#d4b84a', '#e0a882', '#a78bfa'],
-        adopt: 'Extend default-theme SVGs: keep page outline currentColor, color only the badge paths.',
-      },
-      {
-        id: 'duotone',
-        name: 'Soft duotone',
-        status: 'shipped',
-        statusLabel: 'Chosen · shipped',
-        summary: 'Filled blue folders + dark file body with a language color chip. Balanced weight; reads well on dark UI. Playground default.',
-        size: 'small',
-        coverage: '~15 types',
-        icon: iconDuotone,
-        swatches: ['#4a6ad4', '#6b8cff', '#3178c6', '#e07a4c', '#3fb950'],
-        adopt: 'import { duotoneIconTheme } from "@vibecook/mille-ui/icons/duotone" (or from @vibecook/mille-ui/icons). Playground default.',
-      },
-      {
-        id: 'strip',
-        name: 'Color strip',
-        status: 'proposal',
-        statusLabel: 'Proposal',
-        summary: 'Monoline page with a vertical language-color rail. Extremely fast left-edge scanning; still sparse overall.',
-        size: 'tiny',
-        coverage: '~15 types',
-        icon: iconStrip,
-        swatches: ['#3178c6', '#e3b341', '#dea584', '#9b6dff', '#e34c26'],
-        adopt: 'Single page outline SVG + per-type rail color; trivial to implement.',
-      },
-      {
-        id: 'chips',
-        name: 'Glyph chips',
-        status: 'proposal',
-        statusLabel: 'Proposal',
-        summary: 'Rounded color chips with short labels (TS, JS, RS…). Highest scan speed of the compact options; more “badge” than “file”.',
-        size: 'tiny',
-        coverage: '~15 types',
-        icon: iconChips,
-        swatches: ['#2b4acb', '#a68b12', '#a66a45', '#6b4ea3', '#3d8a55'],
-        adopt: 'Pure geometric + text SVG theme; great for dense trees.',
-      },
-    ];
-
-    let selectedId = null;
-
-    function renderTree(theme) {
-      const showLib = document.getElementById('show-lib').checked;
-      const showSym = document.getElementById('show-symlink').checked;
-      const showVcs = document.getElementById('show-vcs').checked;
-
-      return SAMPLE.map((row) => {
-        const open = !!row.open;
-        const isFolder = row.kind === 'folder';
-        const pad = row.depth * 12;
-        const ico = theme.icon(row.kind, { open });
-        const chev = isFolder
-          ? (open ? '▼' : '▶')
-          : '';
-        const lib = showLib && row.library;
-        const sym = showSym && row.symlink;
-        const vcs = showVcs && row.vcs ? row.vcs : '';
-        const bg = lib
-          ? 'background:color-mix(in srgb,#5c5240 45%,transparent);'
-          : '';
-        return `<div class="tree-row${sym ? ' symlink' : ''}" style="padding-left:${pad}px;${bg}">
-          <span class="chev${isFolder ? '' : ' empty'}">${chev}</span>
-          <span class="ico">${ico}</span>
-          <span class="name">${row.name}${lib && row.depth === 1 && row.name === 'node_modules' ? '<span style="opacity:.65;font-size:11px;margin-left:6px">library root</span>' : ''}</span>
-          ${vcs ? `<span class="badge">${vcs}</span>` : ''}
-        </div>`;
-      }).join('');
-    }
-
-    function renderCard(theme) {
-      const statusClass = theme.status === 'shipped' ? 'shipped' : theme.status === 'current' ? 'current' : 'proposal';
-      const swatches = theme.swatches.map((c) => `<span class="swatch" style="background:${c}"></span>`).join('');
-      return `<article class="card" data-id="${theme.id}" id="card-${theme.id}">
-        <div class="card-head">
-          <div class="meta">
-            <h2>${theme.name}</h2>
-            <span class="tag ${statusClass}">${theme.statusLabel}</span>
-          </div>
-          <p>${theme.summary}</p>
-          <div class="stats"><span>${theme.size}</span><span>${theme.coverage}</span></div>
-          <div class="swatch-row">${swatches}</div>
-        </div>
-        <div class="tree-pane">${renderTree(theme)}</div>
-        <div class="card-foot">
-          <button type="button" data-select="${theme.id}" class="primary">Select</button>
-        </div>
-      </article>`;
-    }
-
-    function paint() {
-      document.getElementById('grid').innerHTML = THEMES.map(renderCard).join('');
-      document.querySelectorAll('.card').forEach((card) => {
-        card.classList.toggle('picked', card.dataset.id === selectedId);
-        card.addEventListener('click', (e) => {
-          if (e.target.closest('button')) return;
-          select(card.dataset.id);
-        });
-      });
-      document.querySelectorAll('[data-select]').forEach((btn) => {
-        btn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          select(btn.getAttribute('data-select'));
-        });
-      });
-    }
-
-    function select(id) {
-      selectedId = id;
-      const t = THEMES.find((x) => x.id === id);
-      document.querySelectorAll('.card').forEach((c) => c.classList.toggle('picked', c.dataset.id === id));
-      document.getElementById('pick-name').textContent = t ? t.name : 'No selection';
-      document.getElementById('pick-desc').textContent = t ? ` — id: ${t.id}` : ' — choose a set above';
-      document.getElementById('adopt-body').textContent = t ? t.adopt : '';
-    }
-
-    document.getElementById('show-lib').addEventListener('change', paint);
-    document.getElementById('show-symlink').addEventListener('change', paint);
-    document.getElementById('show-vcs').addEventListener('change', paint);
-
-    document.getElementById('theme-toggle').addEventListener('click', () => {
-      const html = document.documentElement;
-      const next = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
-      html.setAttribute('data-theme', next);
-      document.getElementById('theme-toggle').textContent = next === 'dark' ? 'Light' : 'Dark';
-    });
-
-    document.getElementById('copy-id').addEventListener('click', async () => {
-      if (!selectedId) return;
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>mille file icon themes</title>
+    <meta name="description" content="Compare the file icon themes shipped in @vibecook/mille-ui and copy their import paths." />
+    <link rel="icon" href="assets/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="assets/site.css" />
+    <script>
       try {
-        await navigator.clipboard.writeText(selectedId);
-        const b = document.getElementById('copy-id');
-        const prev = b.textContent;
-        b.textContent = 'Copied';
-        setTimeout(() => { b.textContent = prev; }, 1200);
-      } catch { /* ignore */ }
-    });
-
-    document.getElementById('print-note').addEventListener('click', () => {
-      if (!selectedId) {
-        document.getElementById('adopt-body').textContent = 'Select a theme first.';
+        const t = localStorage.getItem('vibecook-theme');
+        if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+      } catch {}
+    </script>
+    <script src="assets/site.js" defer></script>
+    <style>
+      .themes { display: grid; grid-template-columns: repeat(auto-fit,minmax(min(100%, 20rem),1fr)); gap: 2rem; margin: 2.5rem 0; }
+      .themes section { min-width: 0; padding-block-start: .75rem; border-top: 1px solid var(--rule); }
+      .themes h2 { font-size: 1.5rem; margin: 0 0 1rem; }
+      .themes ul { list-style: none; margin: 0; padding: .75rem; background: var(--ground-sunken); }
+      .themes li { display: flex; align-items: center; gap: .4rem; font: .85rem/1.8 var(--font-mono); }
+      .themes .nested { padding-inline-start: 1.1rem; }
+      .themes .arrow { width: 1.5em; text-align: center; }
+      .themes .glyph, .themes .glyph svg { width: 16px; height: 16px; display: block; }
+      .themes pre { font: .75rem/1.6 var(--font-mono); padding: .75rem 0; overflow: auto; }
+      @media (max-width: 420px) {
+        .bar nav { gap: 10px; }
+        .bar nav .ext { display: none; }
       }
-      document.getElementById('adopt').showModal();
-    });
+    </style>
+  </head>
+  <body>
+    <a class="skip" href="#main">Skip to the content</a>
+    <header class="bar">
+      <div class="sheet">
+        <a class="lockup" href="./" aria-label="mille home"><svg viewBox="70.57 75 120.63 107.34" aria-hidden="true"><path d="M128.651 75C131.634 75.6963 177.883 133.951 183.236 141.676L182.39 143.16C174.875 146.964 142.347 143.352 131.518 143.016C111.446 142.892 91.469 144.227 71.3885 143.567C80.4137 131.043 91.0678 118.833 101.109 107.046C109.988 96.6225 119.374 84.9839 128.651 75Z"/><path d="M167.846 154.381C185.143 154.085 191.201 172.394 175.234 180.899C156.801 182.342 152.991 159.248 167.846 154.381Z"/><path d="M79.8215 156.238C91.3465 155.191 98.2357 162.371 95.0299 174.588C94.0348 178.379 89.9894 179.932 86.5509 181.46C84.6362 181.589 81.6823 181.454 79.8997 180.847C76.6053 179.752 73.8849 177.388 72.3402 174.28C70.7738 171.143 70.5714 167.499 71.781 164.208C73.4846 159.473 75.7031 158.27 79.8215 156.238Z"/><path d="M125.393 154.309C141.945 154.48 145.686 171.751 130.892 179.889C111.89 178.768 110.897 163.247 125.393 154.309Z"/></svg><span>mille</span></a>
+        <nav aria-label="Site">
+          <a href="./">Guide</a>
+          <a href="api.html">API</a>
+          <a href="icons-preview.html" aria-current="page">Icons</a>
+          <a class="ext" href="https://github.com/vibecook-dev/mille">GitHub</a>
+          <button class="theme" type="button" aria-label="Switch theme"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M20 12A8 8 0 1 1 4 12A8 8 0 1 1 20 12Z"/><path d="M12 4A8 8 0 0 0 12 20Z" fill="currentColor" stroke="none"/></svg></button>
+        </nav>
+      </div>
+    </header>
+    <main id="main" class="sheet">
+      <header class="ref-head"><h1>File icon themes</h1>
+      <p class="lede">Compare the themes exported by <code>@vibecook/mille-ui</code> on the same file tree.</p></header>
+      <div class="themes">
+<!-- generated icon previews -->
+<section id="default"><h2>Default monoline</h2>
+<ul><li><span class="arrow" aria-hidden="true">▾</span><span class="glyph" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><path d="M1.5 4.5h4l1.5 1.5h7.5v2.5h-13z"/><path d="M1.5 13.5l1.5-5h12.5l-1.5 5z"/></svg></span>src</li>
+<li class="nested"><span class="arrow" aria-hidden="true"></span><span class="glyph" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 1.5h6l3 3v10h-9z"/><path d="M9.5 1.5v3h3"/><path d="M5 11h4m-2 0v-3"/></svg></span>index.ts</li>
+<li class="nested"><span class="arrow" aria-hidden="true"></span><span class="glyph" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 1.5h6l3 3v10h-9z"/><path d="M9.5 1.5v3h3"/><path d="M5 9.5h4m-4 2h4m-3-4v5m2-5v5"/></svg></span>styles.css</li>
+<li><span class="arrow" aria-hidden="true">▸</span><span class="glyph" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><path d="M1.5 4.5h4l1.5 1.5h7.5v7.5h-13z"/></svg></span>assets</li>
+<li><span class="arrow" aria-hidden="true"></span><span class="glyph" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 1.5h6l3 3v10h-9z"/><path d="M9.5 1.5v3h3"/><path d="M6 8c-1 0-1 1-1 1.5 0 .5 0 1-1 1 1 0 1 .5 1 1 0 .5 0 1.5 1 1.5m4-5c1 0 1 1 1 1.5 0 .5 0 1 1 1-1 0-1 .5-1 1 0 .5 0 1.5-1 1.5"/></svg></span>package.json</li>
+<li><span class="arrow" aria-hidden="true"></span><span class="glyph" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 1.5h6l3 3v10h-9z"/><path d="M9.5 1.5v3h3"/><path d="M5 9h4m-4 2h4m-4 2h2.5"/></svg></span>README.md</li>
+<li><span class="arrow" aria-hidden="true"></span><span class="glyph" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 1.5h6l3 3v10h-9z"/><path d="M9.5 1.5v3h3"/><rect x="5.5" y="10" width="4" height="3" rx="0.5"/><path d="M6.25 10V9a1.25 1.25 0 0 1 2.5 0v1"/></svg></span>yarn.lock</li></ul>
+<pre><code>import { defaultIconTheme } from
+  '@vibecook/mille-ui/icons/default';</code></pre></section>
+<section id="duotone"><h2>Soft duotone</h2>
+<ul><li><span class="arrow" aria-hidden="true">▾</span><span class="glyph" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16" fill="none"><path d="M1.5 4h4l1.2 1.4H14.5v1.6H1.5z" fill="#3d5bb8" opacity="0.9"/>
+   <path d="M1.5 7l1.4 5.75a1 1 0 0 0 .97.75H14.2a1 1 0 0 0 .97-1.25L14.5 7z" fill="#5b8def"/></svg></span>src</li>
+<li class="nested"><span class="arrow" aria-hidden="true"></span><span class="glyph" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16" fill="none"><rect x="3" y="1.75" width="10" height="12.5" rx="1.5" fill="#2a3040" stroke="#4a5268" stroke-width="1"/>
+     <path d="M9.5 1.75v3h3" stroke="#4a5268" stroke-width="1"/>
+     <rect x="8.5" y="9.5" width="3.2" height="3.2" rx="0.6" fill="#3178c6"/></svg></span>index.ts</li>
+<li class="nested"><span class="arrow" aria-hidden="true"></span><span class="glyph" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16" fill="none"><rect x="3" y="1.75" width="10" height="12.5" rx="1.5" fill="#2a3040" stroke="#4a5268" stroke-width="1"/>
+     <path d="M9.5 1.75v3h3" stroke="#4a5268" stroke-width="1"/>
+     <rect x="8.5" y="9.5" width="3.2" height="3.2" rx="0.6" fill="#563d7c"/></svg></span>styles.css</li>
+<li><span class="arrow" aria-hidden="true">▸</span><span class="glyph" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16" fill="none"><path d="M1.5 3.25h4.1l1.15 1.35H14.5v8.15a1 1 0 0 1-1 1H2.5a1 1 0 0 1-1-1V3.25z" fill="#4a6ad4"/>
+   <path d="M1.5 3.25h4.1l1.15 1.35H1.5z" fill="#6b8cff" opacity="0.95"/></svg></span>assets</li>
+<li><span class="arrow" aria-hidden="true"></span><span class="glyph" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16" fill="none"><rect x="3" y="1.75" width="10" height="12.5" rx="1.5" fill="#2a3040" stroke="#4a5268" stroke-width="1"/>
+     <path d="M9.5 1.75v3h3" stroke="#4a5268" stroke-width="1"/>
+     <rect x="8.5" y="9.5" width="3.2" height="3.2" rx="0.6" fill="#c4a574"/></svg></span>package.json</li>
+<li><span class="arrow" aria-hidden="true"></span><span class="glyph" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16" fill="none"><rect x="3" y="1.75" width="10" height="12.5" rx="1.5" fill="#2a3040" stroke="#4a5268" stroke-width="1"/>
+     <path d="M9.5 1.75v3h3" stroke="#4a5268" stroke-width="1"/>
+     <rect x="8.5" y="9.5" width="3.2" height="3.2" rx="0.6" fill="#42a5f5"/></svg></span>README.md</li>
+<li><span class="arrow" aria-hidden="true"></span><span class="glyph" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16" fill="none"><rect x="3" y="1.75" width="10" height="12.5" rx="1.5" fill="#2a3040" stroke="#4a5268" stroke-width="1"/>
+     <path d="M9.5 1.75v3h3" stroke="#4a5268" stroke-width="1"/>
+     <rect x="8.5" y="9.5" width="3.2" height="3.2" rx="0.6" fill="#a78bfa"/></svg></span>yarn.lock</li></ul>
+<pre><code>import { duotoneIconTheme } from
+  '@vibecook/mille-ui/icons/duotone';</code></pre></section>
+<section id="material"><h2>Material Icon Theme</h2>
+<ul><li><span class="arrow" aria-hidden="true">▾</span><span class="glyph" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><path fill="#4caf50" d="M28.967 12H9.442a2 2 0 0 0-1.898 1.368L4 24V10h24a2 2 0 0 0-2-2H15.124a2 2 0 0 1-1.28-.464l-1.288-1.072A2 2 0 0 0 11.276 6H4a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h22l4.805-11.212A2 2 0 0 0 28.967 12"></path><path fill="#c8e6c9" d="M18.473 30a1 1 0 0 1-.238-.028 1.137 1.137 0 0 1-.828-1.323L20.5 12.905a1.13 1.13 0 0 1 .507-.744 1.06 1.06 0 0 1 .8-.134 1.14 1.14 0 0 1 .828 1.324l-3.101 15.744a1.12 1.12 0 0 1-.504.743 1.06 1.06 0 0 1-.557.162m6.2-2h-.077a1.08 1.08 0 0 1-.762-.412 1.164 1.164 0 0 1 .113-1.548l5.319-4.967-5.296-4.623a1.165 1.165 0 0 1-.162-1.544 1.08 1.08 0 0 1 .754-.437 1.06 1.06 0 0 1 .81.258l6.244 5.455a1.156 1.156 0 0 1 .003 1.723l-6.218 5.808a1.07 1.07 0 0 1-.729.289Zm-9.31 0a1.07 1.07 0 0 1-.728-.292l-6.226-5.811a1.16 1.16 0 0 1-.01-1.692l.02-.018 6.246-5.454a1.03 1.03 0 0 1 .8-.26 1.08 1.08 0 0 1 .76.436 1.165 1.165 0 0 1-.16 1.547l-5.294 4.62 5.32 4.964a1.156 1.156 0 0 1 .112 1.548 1.07 1.07 0 0 1-.762.412Z"></path></svg></span>src</li>
+<li class="nested"><span class="arrow" aria-hidden="true"></span><span class="glyph" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path fill="#0288d1" d="M2 2v12h12V2zm4 6h3v1H8v4H7V9H6zm5 0h2v1h-2v1h1a1.003 1.003 0 0 1 1 1v1a1.003 1.003 0 0 1-1 1h-2v-1h2v-1h-1a1.003 1.003 0 0 1-1-1V9a1.003 1.003 0 0 1 1-1"></path></svg></span>index.ts</li>
+<li class="nested"><span class="arrow" aria-hidden="true"></span><span class="glyph" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><path fill="#7e57c2" d="M20 18h-2v-2h-2v2c0 .193 0 .703 1.254 1.033A3.345 3.345 0 0 1 20 22h2v2h2v-2c0-.388-.562-.851-1.254-1.034C20.356 20.34 20 18.84 20 18m-3.254 2.966C14.356 20.34 14 18.84 14 18h-2v-2h-2v8h2v-2h4v2h2v-2c0-.388-.562-.851-1.254-1.034"></path><path fill="#7e57c2" d="M24 4H4v20a4 4 0 0 0 4 4h16.16A3.84 3.84 0 0 0 28 24.16V8a4 4 0 0 0-4-4m2 14h-2v-2h-2v2c0 .193 0 .703 1.254 1.033A3.345 3.345 0 0 1 26 22v2a2 2 0 0 1-2 2h-2a2 2 0 0 1-2-2 2 2 0 0 1-2 2h-2a2 2 0 0 1-2-2 2 2 0 0 1-2 2h-2a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2 2 2 0 0 1 2-2h2a2 2 0 0 1 2 2 2 2 0 0 1 2-2h2a2 2 0 0 1 2 2Z"></path></svg></span>styles.css</li>
+<li><span class="arrow" aria-hidden="true">▸</span><span class="glyph" aria-hidden="true"><svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg"><path d="m6.922 3.768-.644-.536A1 1 0 0 0 5.638 3H2a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V5a1 1 0 0 0-1-1H7.562a1 1 0 0 1-.64-.232" fill="#90a4ae"></path></svg></span>assets</li>
+<li><span class="arrow" aria-hidden="true"></span><span class="glyph" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><path fill="#8bc34a" d="M16 20.003v2h4a2 2 0 0 0 2-2v-2a2 2 0 0 0-2-2h-2v-2h4v-2h-4a2 2 0 0 0-2 2v2a2 2 0 0 0 2 2h2v2Z"></path><path fill="#8bc34a" d="m16 3.003-12 7v14l4 2h6v-13.5a.5.5 0 0 0-.5-.5h-1a.5.5 0 0 0-.5.5v11.5H8l-2-1.034V11.15l10-5.833 10 5.833v11.703l-10 5.833-1.745-1.022L13 29.253l3 1.75 12-7v-14Z"></path></svg></span>package.json</li>
+<li><span class="arrow" aria-hidden="true"></span><span class="glyph" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 16 16"><path d="M0 0h24v24H0z"></path><path fill="#42a5f5" d="M8 1C4.136 1 1 4.136 1 8s3.136 7 7 7 7-3.136 7-7-3.136-7-7-7m1 11H7V7.5h2zm0-6H7V4h2z"></path></svg></span>README.md</li>
+<li><span class="arrow" aria-hidden="true"></span><span class="glyph" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><path fill="#0288d1" d="M27.575 23.967a9.9 9.9 0 0 0-3.751 1.726 22.6 22.6 0 0 1-5.537 2.504 1.55 1.55 0 0 1-.931.52 59 59 0 0 1-6.11.548c-1.102.008-1.777-.282-1.965-.735a1.49 1.49 0 0 1 .82-1.965 3.6 3.6 0 0 1-.486-.359c-.163-.162-.334-.487-.385-.367-.213.52-.324 1.794-.897 2.366-.786.795-2.273.53-3.153.069-.965-.513.069-1.718.069-1.718a.69.69 0 0 1-.94-.324 4.6 4.6 0 0 1-.632-2.794 5.2 5.2 0 0 1 1.674-2.76 8.84 8.84 0 0 1 .624-4.17 9.9 9.9 0 0 1 3-3.469S7.136 11.015 7.82 9.177c.444-1.196.623-1.187.769-1.239a3.44 3.44 0 0 0 1.375-.811 4.99 4.99 0 0 1 4.178-1.607s1.094-3.357 2.12-2.7a17.4 17.4 0 0 1 1.452 2.735s1.213-.71 1.35-.445a10.74 10.74 0 0 1 .495 5.81 13.3 13.3 0 0 1-2.46 5.127c-.129.214 1.47.889 2.477 3.683.932 2.554.103 4.699.248 4.938.026.043.034.06.034.06s1.068.085 3.213-1.24a8.05 8.05 0 0 1 4.05-1.52 1.026 1.026 0 0 1 .453 2Z"></path></svg></span>yarn.lock</li></ul>
+<pre><code>import { loadMaterialIconTheme } from
+  '@vibecook/mille-ui/icons/material';
+const iconTheme = await loadMaterialIconTheme();</code></pre></section>
+<section id="minimal"><h2>Minimal</h2>
+<ul><li><span class="arrow" aria-hidden="true">[-]</span>src</li>
+<li class="nested"><span class="arrow" aria-hidden="true"></span>index.ts</li>
+<li class="nested"><span class="arrow" aria-hidden="true"></span>styles.css</li>
+<li><span class="arrow" aria-hidden="true">[+]</span>assets</li>
+<li><span class="arrow" aria-hidden="true"></span>package.json</li>
+<li><span class="arrow" aria-hidden="true"></span>README.md</li>
+<li><span class="arrow" aria-hidden="true"></span>yarn.lock</li></ul>
+<pre><code>import { minimalIconTheme } from
+  '@vibecook/mille-ui/icons/minimal';
+import '@vibecook/mille-ui/theme/minimal.css';</code></pre></section>
+<section id="vibefield"><h2>VibeField</h2>
+<ul><li><span class="arrow" aria-hidden="true">▾</span><span class="glyph" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.2 12V5.1a1.3 1.3 0 0 1 1.3-1.3h2.9l1.7 1.7h4.4a1.3 1.3 0 0 1 1.3 1.3v1"/><path d="M2.4 12.6 4 8.5a1.2 1.2 0 0 1 1.1-.7h8.6a1.2 1.2 0 0 1 1.1 1.6l-1.4 3.6a1.2 1.2 0 0 1-1.1.8H3.5a1.2 1.2 0 0 1-1.1-1.2Z"/></svg></span>src</li>
+<li class="nested"><span class="arrow" aria-hidden="true"></span><span class="glyph" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6.6 5 3.4 8l3.2 3M9.4 5l3.2 3-3.2 3"/></svg></span>index.ts</li>
+<li class="nested"><span class="arrow" aria-hidden="true"></span><span class="glyph" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.4c2.7 3.1 4.1 5.3 4.1 6.9a4.1 4.1 0 0 1-8.2 0c0-1.6 1.4-3.8 4.1-6.9Z"/></svg></span>styles.css</li>
+<li><span class="arrow" aria-hidden="true">▸</span><span class="glyph" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.2 5.1a1.3 1.3 0 0 1 1.3-1.3h2.9l1.7 1.7h4.4a1.3 1.3 0 0 1 1.3 1.3v5.3a1.3 1.3 0 0 1-1.3 1.3H3.5a1.3 1.3 0 0 1-1.3-1.3Z"/></svg></span>assets</li>
+<li><span class="arrow" aria-hidden="true"></span><span class="glyph" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3.2 6h9.6M3.2 10h9.6"/><circle cx="6.4" cy="6" r="1.6" fill="currentColor" stroke="none"/><circle cx="9.6" cy="10" r="1.6" fill="currentColor" stroke="none"/></svg></span>package.json</li>
+<li><span class="arrow" aria-hidden="true"></span><span class="glyph" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5.4 2.2h3.4l3 3v7.9a.9.9 0 0 1-.9.9H5.4a.9.9 0 0 1-.9-.9V3.1a.9.9 0 0 1 .9-.9Z"/><path d="M8.8 2.2v2.1a.9.9 0 0 0 .9.9h2.1"/><path d="M6.5 8.8h3.9M6.5 11.6h3.9"/></svg></span>README.md</li>
+<li><span class="arrow" aria-hidden="true"></span><span class="glyph" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4.2 7.5h7.6a.9.9 0 0 1 .9.9v4.1a.9.9 0 0 1-.9.9H4.2a.9.9 0 0 1-.9-.9V8.4a.9.9 0 0 1 .9-.9Z"/><path d="M5.9 7.5V5.9a2.1 2.1 0 0 1 4.2 0v1.6"/></svg></span>yarn.lock</li></ul>
+<pre><code>import { vibefieldIconTheme } from
+  '@vibecook/mille-ui/icons/vibefield';
+import '@vibecook/mille-ui/theme/vibefield.css';</code></pre></section>
+<!-- Material Icon Theme
+Copyright (c) Material Extensions and contributors.
 
-    paint();
-    // Product choice: soft duotone
-    select('duotone');
-  </script>
-</body>
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+-->
+<!-- end icon previews -->
+      </div>
+      <p>Material icons © Material Extensions and contributors. <a href="https://github.com/vibecook-dev/mille/blob/main/packages/mille-ui/NOTICES.md">License and notices</a>.</p>
+    </main>
+  </body>
 </html>

@@ -20,7 +20,7 @@ minimum-viable Node usage, the Electron UtilityProcess + MessagePort pattern
 `@tanstack/react-virtual` viewports, decoration providers, error handling,
 `electron-builder` packaging, performance tuning, and troubleshooting.
 
-The public API surface is declared in [`api.d.ts`](./api.d.ts).
+The package exports generated TypeScript declarations from `dist/index.d.ts`. See the [API reference](https://vibecook-dev.github.io/mille/api.html).
 
 ## Remote sessions over a WebSocket
 

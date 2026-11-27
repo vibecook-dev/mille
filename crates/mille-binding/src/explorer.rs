@@ -46,45 +46,6 @@ fn entry_from_walked(walked: &mille_core::WalkedEntry, parent_id: Option<EntryId
     }
 }
 
-/// Publish every directory whose immediate listing was actually covered by a
-/// completed walk. Directories exactly on a bounded walk's depth frontier are
-/// entries only—their children were not read—and ignored/excluded descendants
-/// may have had traversal pruned. The walk root is the exception: expanding an
-/// ignored folder explicitly is allowed and does read its direct children.
-/// A directory whose read did not answer (M10: timed out, stuck, dataless)
-/// is never complete, whatever its depth.
-fn mark_walked_directory_listings(
-    store: &EntryStore,
-    walked: &[mille_core::WalkedEntry],
-    walk_root: &Path,
-    max_depth: Option<usize>,
-    repository_ignore: Option<&mille_core::IgnoreMatcher>,
-    excludes: Option<&mille_core::IgnoreMatcher>,
-    unread: &[mille_core::UnreadDirectory],
-) -> std::result::Result<Vec<EntryId>, FxError> {
-    let ids: Vec<EntryId> = walked
-        .iter()
-        .filter(|entry| !unread.iter().any(|dir| dir.path == entry.path))
-        .filter(|entry| {
-            let directory_like =
-                entry.kind == EntryKind::Directory || entry.symlink_target_is_dir == Some(true);
-            // Smart/Never traversal records descendant directory symlinks but
-            // does not read through them. Only an explicitly walked symlink
-            // root can claim listing completion.
-            let listing_covered = entry.kind == EntryKind::Directory
-                || (entry.path == walk_root && entry.symlink_target_is_dir == Some(true));
-            let below_frontier = max_depth.is_none_or(|limit| (entry.depth as usize) < limit);
-            let traversal_complete = entry.path == walk_root
-                || (!repository_ignore
-                    .is_some_and(|matcher| matcher.is_ignored(&entry.path, directory_like))
-                    && !excludes
-                        .is_some_and(|matcher| matcher.is_ignored(&entry.path, directory_like)));
-            listing_covered && below_frontier && traversal_complete
-        })
-        .filter_map(|entry| store.get_by_path(&entry.path).map(|stored| stored.id))
-        .collect();
-    store.mark_directories_children_loaded(&ids)
-}
 use crate::events::{Channel, EventBus};
 use crate::journal::{
     capture_fs_identity, directory_is_empty, ensure_managed_recycle_base, path_is_under,
@@ -147,6 +108,7 @@ pub struct ExplorerOptionsJs {
     pub compact_folders: Option<bool>,
     pub exclude_globs: Option<Vec<String>>,
     pub snapshot_path: Option<String>,
+    pub initial_walk: Option<String>,
     pub max_cached_entries: Option<u32>,
     pub sort_by: Option<String>,
     pub case_sensitive: Option<bool>,
@@ -177,6 +139,16 @@ pub(crate) struct ResolvedOptions {
     pub max_cached_entries: usize,
 }
 
+impl ResolvedOptions {
+    fn checkpoint_policy(&self, exclude_globs: &[String]) -> mille_core::resume::CheckpointPolicy {
+        mille_core::resume::CheckpointPolicy {
+            follow_symlinks: self.follow_symlinks,
+            respect_ignore: self.respect_ignore,
+            exclude_globs: exclude_globs.to_vec(),
+        }
+    }
+}
+
 /// The in-process FileExplorer. Phase 5 builds it out method by method.
 #[derive(Clone)]
 #[napi]
@@ -189,6 +161,8 @@ pub struct FileExplorer {
     disposed: Arc<AtomicBool>,
     pub(crate) roots: Arc<parking_lot::RwLock<Vec<PathBuf>>>,
     pub(crate) options: ResolvedOptions,
+    checkpoint: Arc<parking_lot::Mutex<crate::checkpoint::Checkpoint>>,
+    smart_links: Arc<parking_lot::Mutex<crate::watch_runtime::SmartLinks>>,
     /// Runtime-configurable exclude rules shared by initial/lazy walks and
     /// watcher reconciliation.
     pub(crate) exclude_globs: Arc<parking_lot::RwLock<Vec<String>>>,
@@ -271,12 +245,32 @@ impl FileExplorer {
                 .unwrap_or_else(num_cpus_or_8),
             watch_debounce_ms: options.watch_debounce_ms.unwrap_or(75) as u64,
             compact_folders: options.compact_folders.unwrap_or(true),
-            snapshot_path: options.snapshot_path.map(PathBuf::from),
+            snapshot_path: options
+                .snapshot_path
+                .map(|p| {
+                    std::path::absolute(&p).map_err(|e| fx_error_to_napi(io_to_fx(e, p.into())))
+                })
+                .transpose()?,
             max_cached_entries: options
                 .max_cached_entries
                 .map(|n| n as usize)
                 .unwrap_or(500_000),
         };
+
+        if resolved
+            .snapshot_path
+            .as_ref()
+            .is_some_and(|p| roots.contains(p))
+        {
+            return Err(fx_error_to_napi(FxError::InvalidInput(
+                "snapshotPath must be separate from the workspace roots".into(),
+            )));
+        }
+        if resolved.max_cached_entries < roots.len() {
+            return Err(fx_error_to_napi(FxError::InvalidInput(
+                "maxCachedEntries must allow at least one entry per workspace root".into(),
+            )));
+        }
 
         let sibling_order = mille_core::sort::SiblingOrder::try_new(
             match options.sort_by.as_deref() {
@@ -308,15 +302,27 @@ impl FileExplorer {
             concurrency: resolved.walker_concurrency.max(1),
             materialize_dataless: options.materialize_dataless.unwrap_or(false),
             hook: crate::read_probe::hook(),
-        });
+        })
+        .with_checkpoint_file(resolved.snapshot_path.clone());
 
+        let mut store = EntryStore::with_projection_settings(
+            sibling_order,
+            visibility,
+            resolved.compact_folders,
+            file_nesting,
+        )
+        .with_cache_limit(resolved.max_cached_entries);
+        let checkpoint = crate::checkpoint::Checkpoint::open(
+            resolved.snapshot_path.as_deref(),
+            &roots,
+            &mut store,
+            !matches!(options.initial_walk.as_deref(), Some("roots-only" | "none")),
+            &resolved.checkpoint_policy(&exclude_globs),
+        );
         Ok(Self {
-            store: Arc::new(EntryStore::with_projection_settings(
-                sibling_order,
-                visibility,
-                resolved.compact_folders,
-                file_nesting,
-            )),
+            store: Arc::new(store),
+            checkpoint: Arc::new(parking_lot::Mutex::new(checkpoint)),
+            smart_links: Arc::default(),
             watcher: Arc::new(std::sync::Mutex::new(None)),
             intents: Arc::new(parking_lot::Mutex::new(IntentCache::new())),
             disposed: Arc::new(AtomicBool::new(false)),
@@ -397,7 +403,7 @@ impl FileExplorer {
     /// For now: returns the current store tree-version.
     #[napi(js_name = "getTreeVersion", catch_unwind)]
     pub fn get_tree_version(&self) -> u32 {
-        self.store.tree_version() as u32
+        self.store.resident_snapshot().tree_version() as u32
     }
 
     /// Resolve an indexed entry identity to its exact absolute path. This is
@@ -426,6 +432,7 @@ impl FileExplorer {
             return Ok(None);
         }
 
+        let _policy_guard = self.policy_gate.lock();
         let roots = self.roots.read().clone();
         let mut candidates: Vec<(PathBuf, PathBuf)> = Vec::new();
         for root in &roots {
@@ -450,7 +457,11 @@ impl FileExplorer {
         }
 
         for (root, candidate) in candidates {
+            if self.reads.is_checkpoint_file(&candidate) {
+                continue;
+            }
             if let Some(entry) = self.store.get_by_path(&candidate) {
+                self.store.trim_cache(Some(entry.id), &[]);
                 return Ok(Some(entry.id.raw() as i64));
             }
 
@@ -471,6 +482,9 @@ impl FileExplorer {
                 Error::from_reason("resolved path escaped its configured workspace root")
             })?;
 
+            if relative.components().count() + roots.len() > self.options.max_cached_entries {
+                return Err(crate::directory_page::cache_full());
+            }
             // The root itself may not have been seeded yet (`initialWalk:
             // 'none'`). Insert it first, then hydrate exactly the requested
             // descendant chain.
@@ -526,7 +540,7 @@ impl FileExplorer {
                 if inserted_ids.is_empty() {
                     return Ok(Some(entry.id.raw() as i64));
                 }
-                let _policy_guard = self.policy_gate.lock();
+                self.store.trim_cache(Some(entry.id), &[]);
                 self.reclassify_current_excludes()
                     .map_err(fx_error_to_napi)?;
                 let version = self.store.tree_version() as u32;
@@ -568,7 +582,7 @@ impl FileExplorer {
     #[napi(js_name = "populateFromRoots", catch_unwind)]
     pub async fn populate_from_roots(&self) -> Result<u32> {
         use mille_core::{
-            populate_store_with_provenance, walk_bounded, IgnoreMatcher, WalkOptions,
+            populate_store_with_provenance, walk_bounded_limited, IgnoreMatcher, WalkOptions,
         };
 
         self.ensure_watcher()?;
@@ -576,7 +590,14 @@ impl FileExplorer {
         let exclude_globs = self.exclude_globs.read().clone();
         let roots = self.roots.read().clone();
         let mut total: u32 = 0;
+        // Reserve one slot for each root, including unavailable ones.
+        let mut remaining = self.options.max_cached_entries.saturating_sub(roots.len());
+        let mut truncated = false;
+        let has_baseline = self.checkpoint.lock().has_baseline();
+        let mut completed = std::collections::HashSet::new();
+        let mut observed = std::collections::HashSet::new();
         for root in &roots {
+            let limit = remaining.saturating_add(1);
             let options = WalkOptions {
                 max_depth: None,
                 follow_symlinks: self.options.follow_symlinks,
@@ -606,7 +627,8 @@ impl FileExplorer {
                     }
                     add_exclude_globs(&mut traversal, root, &exclude_globs)?;
                     add_exclude_globs(&mut excludes, root, &exclude_globs)?;
-                    let report = walk_bounded(root, options, Some(&traversal), &self.reads)?;
+                    let report =
+                        walk_bounded_limited(root, options, Some(&traversal), &self.reads, limit)?;
                     if self.options.respect_ignore {
                         // The walk already read every ignore file it emitted.
                         for (path, contents) in &report.ignore_files {
@@ -619,18 +641,62 @@ impl FileExplorer {
                         (!exclude_globs.is_empty()).then_some(excludes),
                     ))
                 } else {
-                    Ok((walk_bounded(root, options, None, &self.reads)?, None, None))
+                    Ok((
+                        walk_bounded_limited(root, options, None, &self.reads, limit)?,
+                        None,
+                        None,
+                    ))
                 }
             })();
             let (report, repository_ignore, excludes) = match walk_result {
                 Ok(result) => result,
                 Err(error) if matches!(&error, FxError::Io { .. }) => {
+                    if has_baseline && error.code() == mille_core::ErrorCode::ENOENT {
+                        observed.insert(root.clone());
+                        completed.insert(root.clone());
+                    }
                     self.root_read_failed(root, &error)
                         .map_err(fx_error_to_napi)?;
                     continue;
                 }
                 Err(error) => return Err(fx_error_to_napi(error)),
             };
+            if has_baseline {
+                completed.extend(report.completed_directories.iter().cloned());
+                observed.extend(report.entries.iter().map(|w| w.path.clone()));
+                // A warm snapshot is provisional. Refresh observed rows and
+                // discard unverified cache entries before publishing readiness.
+                let disk: std::collections::HashMap<_, _> = report
+                    .entries
+                    .iter()
+                    .map(|w| (w.path.as_path(), w.kind))
+                    .collect();
+                for (path, id) in self.store.paths_under(root) {
+                    if path != *root
+                        && !report.unread.iter().any(|dir| path.starts_with(&dir.path))
+                        && disk.get(path.as_path()).is_none_or(|kind| {
+                            self.store.get_by_id(id).is_some_and(|e| e.kind != *kind)
+                        })
+                    {
+                        self.store.remove_subtree(id);
+                    }
+                }
+                for walked in &report.entries {
+                    if let Some(existing) = self.store.get_by_path(&walked.path) {
+                        let refreshed = crate::watch_runtime::entry_from_walked(
+                            walked,
+                            existing.parent_id,
+                            repository_ignore.as_ref(),
+                            excludes.as_ref(),
+                        );
+                        self.store
+                            .update(existing.id, refreshed)
+                            .map_err(fx_error_to_napi)?;
+                    }
+                }
+            }
+            truncated |= report.truncated;
+            remaining = remaining.saturating_sub(report.entries.len().saturating_sub(1));
             let walked = report.entries;
             if let Some(walked_root) = walked.iter().find(|entry| entry.path == *root) {
                 if let Some(existing) = self.store.get_by_path(root) {
@@ -661,18 +727,34 @@ impl FileExplorer {
                 excludes.as_ref(),
             )
             .map_err(fx_error_to_napi)?;
-            mark_walked_directory_listings(
-                &self.store,
-                &walked,
-                root,
-                None,
-                repository_ignore.as_ref(),
-                excludes.as_ref(),
-                &report.unread,
-            )
-            .map_err(fx_error_to_napi)?;
+            self.store
+                .mark_listed_paths(&report.completed_directories)
+                .map_err(fx_error_to_napi)?;
+            self.watch_config()
+                .remember_links(&self.store, &report.followed_links);
+            if report.truncated {
+                self.store
+                    .invalidate_truncated_walk(root, &report.completed_directories);
+            }
             total = total.saturating_add(ids.len() as u32);
         }
+        let evicted = self.store.trim_cache(None, &[]);
+        if let Some(path) = &self.options.snapshot_path {
+            self.persist_checkpoint(path).map_err(fx_error_to_napi)?;
+            self.checkpoint
+                .lock()
+                .complete(&self.store, &self.events, &completed, &observed, path);
+        }
+        if truncated || evicted != 0 {
+            self.events.emit_warning(WarningPayloadJs {
+                code: "ENTRY_CAP_REACHED".into(),
+                detail: Some(format!(
+                    "{} cached entries; additional directories load on demand",
+                    self.options.max_cached_entries
+                )),
+            });
+        }
+        self.events.emit_ready();
         Ok(total)
     }
 
@@ -744,6 +826,8 @@ impl FileExplorer {
             self.events.emit_change(Channel::Change, notice());
             self.events.emit_change(Channel::ChangeTree, notice());
         }
+        self.checkpoint.lock().seeded(version, &self.events);
+        self.events.emit_ready();
         Ok(version as u32)
     }
 
@@ -964,6 +1048,8 @@ impl FileExplorer {
             depth,
         )
         .map_err(fx_error_to_napi)?;
+        self.store
+            .trim_cache(self.store.get_by_path(&scope).map(|e| e.id), &[]);
         self.emit_reconcile_notice(previous_version, &outcome);
         Ok(self.store.tree_version() as u32)
     }
@@ -1009,7 +1095,7 @@ impl FileExplorer {
             crate::cancel::check_cancelled(&operation.token)?;
             let path = explorer.resolve_path_for_id(id)?;
             let mut previous_version = explorer.store.tree_version();
-            crate::watch_runtime::reconcile_directory_progressive(
+            let result = crate::watch_runtime::reconcile_directory_progressive(
                 &explorer.store,
                 &explorer.watch_config(),
                 &path,
@@ -1019,10 +1105,30 @@ impl FileExplorer {
                     explorer.emit_reconcile_notice(previous_version, outcome);
                     previous_version = explorer.store.tree_version();
                 },
-            )
-            .map_err(fx_error_to_napi)?;
+            );
+            explorer.store.trim_cache(Some(EntryId(id as u64)), &[]);
+            result.map_err(fx_error_to_napi)?;
             Ok(explorer.store.tree_version() as u32)
         })
+    }
+
+    /// Backing read for list() when a complete folder cannot stay resident.
+    #[napi(js_name = "openDirectoryPage", catch_unwind)]
+    pub async fn open_directory_page(
+        &self,
+        id: i64,
+    ) -> Result<crate::directory_page::DirectoryPage> {
+        let _guard = self.policy_gate.lock();
+        let path = self.resolve_path_for_id(id)?;
+        let parent = EntryId(id as u64);
+        let mut rows = crate::watch_runtime::directory_rows(&self.watch_config(), &path, parent)
+            .map_err(fx_error_to_napi)?;
+        self.store.sort_siblings(&mut rows);
+        Ok(crate::directory_page::DirectoryPage::new(
+            self.clone(),
+            parent,
+            rows,
+        ))
     }
 
     /// Authoritatively reconcile every configured root and all descendants.
@@ -1040,6 +1146,7 @@ impl FileExplorer {
                 crate::watch_runtime::reconcile_directory(&self.store, &config, &root, None)
                     .map_err(fx_error_to_napi)?;
             outcome.merge(root_outcome);
+            self.store.trim_cache(None, &[]);
         }
         self.emit_reconcile_notice(previous_version, &outcome);
         Ok(self.store.tree_version() as u32)
@@ -1069,7 +1176,7 @@ impl FileExplorer {
         include_root: Option<bool>,
     ) -> Result<u32> {
         use mille_core::{
-            populate_store_with_provenance, walk_bounded, IgnoreMatcher, WalkOptions,
+            populate_store_with_provenance, walk_bounded_limited, IgnoreMatcher, WalkOptions,
         };
 
         self.ensure_watcher()?;
@@ -1095,6 +1202,14 @@ impl FileExplorer {
                 Error::from_reason(format!("path {:?} is not under any configured root", p))
             })?;
 
+        let config = self.watch_config();
+        if config
+            .deduplicate_link(&self.store, &p)
+            .map_err(fx_error_to_napi)?
+            .is_some()
+        {
+            return Ok(0);
+        }
         let options = WalkOptions {
             max_depth: max_depth.map(|n| n as usize),
             follow_symlinks: self.options.follow_symlinks,
@@ -1140,7 +1255,13 @@ impl FileExplorer {
                         &mut [&mut traversal, &mut repository_ignore],
                     )?;
                 }
-                let report = walk_bounded(&p, options, Some(&traversal), &self.reads)?;
+                let report = walk_bounded_limited(
+                    &p,
+                    options,
+                    Some(&traversal),
+                    &self.reads,
+                    self.options.max_cached_entries,
+                )?;
                 if self.options.respect_ignore {
                     for (path, contents) in &report.ignore_files {
                         let _ = repository_ignore.add_from_contents(path, contents);
@@ -1152,7 +1273,17 @@ impl FileExplorer {
                     (!exclude_globs.is_empty()).then_some(excludes),
                 ))
             } else {
-                Ok((walk_bounded(&p, options, None, &self.reads)?, None, None))
+                Ok((
+                    walk_bounded_limited(
+                        &p,
+                        options,
+                        None,
+                        &self.reads,
+                        self.options.max_cached_entries,
+                    )?,
+                    None,
+                    None,
+                ))
             }
         })();
         let (report, repository_ignore, excludes) = match walk_result {
@@ -1206,16 +1337,16 @@ impl FileExplorer {
             excludes.as_ref(),
         )
         .map_err(fx_error_to_napi)?;
-        mark_walked_directory_listings(
-            &self.store,
-            &walked,
-            &p,
-            max_depth.map(|depth| depth as usize),
-            repository_ignore.as_ref(),
-            excludes.as_ref(),
-            &report.unread,
-        )
-        .map_err(fx_error_to_napi)?;
+        self.store
+            .mark_listed_paths(&report.completed_directories)
+            .map_err(fx_error_to_napi)?;
+        self.store
+            .trim_cache(self.store.get_by_path(&p).map(|entry| entry.id), &[]);
+        if report.truncated {
+            self.store
+                .invalidate_truncated_walk(&p, &report.completed_directories);
+        }
+        config.remember_links(&self.store, &report.followed_links);
         Ok(ids.len() as u32)
     }
 
@@ -1224,7 +1355,7 @@ impl FileExplorer {
     #[napi(js_name = "getSnapshot", catch_unwind)]
     pub fn get_snapshot(&self) -> MirrorSnapshot {
         MirrorSnapshot {
-            inner: self.store.snapshot(),
+            inner: self.store.resident_snapshot(),
         }
     }
 
@@ -1352,6 +1483,11 @@ impl FileExplorer {
     /// validated and statted before watcher/store/config state changes.
     #[napi(js_name = "updateWorkspaceRoots", catch_unwind)]
     pub async fn update_workspace_roots(&self, roots: Vec<String>) -> Result<u32> {
+        if roots.len() > self.options.max_cached_entries {
+            return Err(fx_error_to_napi(FxError::InvalidInput(
+                "workspace root count exceeds maxCachedEntries".into(),
+            )));
+        }
         if self.disposed.load(Ordering::Acquire) {
             return Err(Error::from_reason("FileExplorer is disposed"));
         }
@@ -1490,9 +1626,10 @@ impl FileExplorer {
             }
         };
         *self.roots.write() = paths;
+        self.store.trim_cache(None, &[]);
         drop(watcher_guard);
 
-        let version = version as u32;
+        let version = self.store.tree_version().max(version) as u32;
         if version == previous_version {
             return Ok(version);
         }
@@ -1551,6 +1688,9 @@ impl FileExplorer {
         })?;
 
         validate_entry_name(&name).map_err(fx_error_to_napi)?;
+        if self.store.child_capacity(parent_eid) == 0 {
+            return Err(crate::directory_page::cache_full());
+        }
         let new_path = parent_path.join(&name);
 
         // Refuse to clobber an existing path (including case-only siblings).
@@ -1648,7 +1788,7 @@ impl FileExplorer {
         let mut identity = identity;
         identity.entry_id = new_id;
         self.journal.lock().push_create(identity);
-        Ok(EntryJs::from_core(arc.as_ref()))
+        Ok(self.cache_entry(&arc))
     }
 
     /// Rename an entry in place while preserving its identity and any known
@@ -1675,7 +1815,7 @@ impl FileExplorer {
                 .store
                 .get_by_id(eid)
                 .ok_or_else(|| Error::from_reason("rename target vanished"))?;
-            return Ok(EntryJs::from_core(arc.as_ref()));
+            return Ok(self.cache_entry(&arc));
         }
         // Never overwrite an existing destination.
         match tokio::fs::symlink_metadata(&new_path).await {
@@ -1741,7 +1881,7 @@ impl FileExplorer {
             .store
             .get_by_id(eid)
             .ok_or_else(|| Error::from_reason("rename succeeded but id vanished"))?;
-        Ok(EntryJs::from_core(arc.as_ref()))
+        Ok(self.cache_entry(&arc))
     }
 
     /// Move an entry under a new parent, optionally renaming in flight.
@@ -1836,7 +1976,10 @@ impl FileExplorer {
         .map_err(fx_error_to_napi)?;
         if paths_equal(&desired_path, &old_path) || new_parent_path.join(&desired_name) == old_path
         {
-            return Ok(EntryJs::from_core(source.as_ref()));
+            return Ok(self.cache_entry(source));
+        }
+        if self.store.child_capacity(new_parent_eid) == 0 {
+            return Err(crate::directory_page::cache_full());
         }
         let dest = resolve_transfer_destination(&new_parent_path, &desired_name, collision)
             .await
@@ -1845,11 +1988,11 @@ impl FileExplorer {
         join_under_root(&new_parent_path, &contained_parent, &dest.name, &root_canon)
             .map_err(fx_error_to_napi)?;
         if paths_equal(&dest.path, &old_path) {
-            return Ok(EntryJs::from_core(source.as_ref()));
+            return Ok(self.cache_entry(source));
         }
         if matches!(dest.action, DestAction::Skip) {
             // Destination already holds the name; treat as successful no-op.
-            return Ok(EntryJs::from_core(source.as_ref()));
+            return Ok(self.cache_entry(source));
         }
 
         let progress = self
@@ -1930,7 +2073,7 @@ impl FileExplorer {
             let arc = self.store.get_by_path(&dest.path).ok_or_else(|| {
                 Error::from_reason("merge-move succeeded but destination vanished")
             })?;
-            return Ok(EntryJs::from_core(arc.as_ref()));
+            return Ok(self.cache_entry(&arc));
         }
 
         let mut destroyed_destination = false;
@@ -1938,13 +2081,13 @@ impl FileExplorer {
             // File merge falls back to overwrite. Never delete the source.
             if paths_equal(&dest.path, &old_path) {
                 self.end_copy_progress(progress.as_ref(), "completed");
-                return Ok(EntryJs::from_core(source.as_ref()));
+                return Ok(self.cache_entry(source));
             }
             if let Some(existing) = self.store.get_by_path(&dest.path) {
                 let existing_id = existing.id;
                 if existing_id == eid {
                     self.end_copy_progress(progress.as_ref(), "completed");
-                    return Ok(EntryJs::from_core(source.as_ref()));
+                    return Ok(self.cache_entry(source));
                 }
                 let existing_kind = existing.kind;
                 let _policy_guard = self.policy_gate.lock();
@@ -2056,7 +2199,7 @@ impl FileExplorer {
             .store
             .get_by_id(eid)
             .ok_or_else(|| Error::from_reason("move succeeded but id vanished"))?;
-        Ok(EntryJs::from_core(arc.as_ref()))
+        Ok(self.cache_entry(&arc))
     }
 
     /// Delete an entry. Directories with children require recursive: true.
@@ -2593,6 +2736,9 @@ impl FileExplorer {
             &root_canon,
         )
         .map_err(fx_error_to_napi)?;
+        if self.store.child_capacity(new_parent_eid) == 0 {
+            return Err(crate::directory_page::cache_full());
+        }
         let dest = resolve_transfer_destination(&new_parent_path, &desired_name, collision)
             .await
             .map_err(fx_error_to_napi)?;
@@ -2610,7 +2756,7 @@ impl FileExplorer {
 
         if matches!(dest.action, DestAction::Skip) {
             if let Some(existing) = self.store.get_by_path(&dst_path) {
-                return Ok(EntryJs::from_core(existing.as_ref()));
+                return Ok(self.cache_entry(&existing));
             }
             // Destination exists on disk but is not indexed yet — index it.
             let mut entry = stat_to_entry(&dst_path, Some(new_parent_eid), effective_name)
@@ -2627,7 +2773,7 @@ impl FileExplorer {
                 .store
                 .get_by_id(id)
                 .ok_or_else(|| Error::from_reason("skip target vanished"))?;
-            return Ok(EntryJs::from_core(arc.as_ref()));
+            return Ok(self.cache_entry(&arc));
         }
 
         // Directory self/descendant guard before any destructive collision action.
@@ -2737,7 +2883,7 @@ impl FileExplorer {
             let arc = self.store.get_by_path(&dst_path).ok_or_else(|| {
                 Error::from_reason("directory copy succeeded but path not indexed")
             })?;
-            return Ok(EntryJs::from_core(arc.as_ref()));
+            return Ok(self.cache_entry(&arc));
         }
 
         let progress = self
@@ -2784,7 +2930,7 @@ impl FileExplorer {
                 .store
                 .get_by_id(existing.id)
                 .ok_or_else(|| Error::from_reason("copy update succeeded but id vanished"))?;
-            return Ok(EntryJs::from_core(arc.as_ref()));
+            return Ok(self.cache_entry(&arc));
         }
         let new_id = self
             .store
@@ -2795,7 +2941,7 @@ impl FileExplorer {
             .store
             .get_by_id(new_id)
             .ok_or_else(|| Error::from_reason("copy succeeded but id vanished"))?;
-        Ok(EntryJs::from_core(arc.as_ref()))
+        Ok(self.cache_entry(&arc))
     }
 
     /// Copy a filesystem path that may live outside the workspace into a
@@ -2872,6 +3018,9 @@ impl FileExplorer {
         )
         .map_err(fx_error_to_napi)?;
 
+        if self.store.child_capacity(new_parent_eid) == 0 {
+            return Err(crate::directory_page::cache_full());
+        }
         let dest = resolve_transfer_destination(&new_parent_path, &desired_name, collision)
             .await
             .map_err(fx_error_to_napi)?;
@@ -2899,7 +3048,7 @@ impl FileExplorer {
 
         if matches!(dest.action, DestAction::Skip) {
             if let Some(existing) = self.store.get_by_path(&dst_path) {
-                return Ok(EntryJs::from_core(existing.as_ref()));
+                return Ok(self.cache_entry(&existing));
             }
             let mut entry = stat_to_entry(&dst_path, Some(new_parent_eid), effective_name)
                 .await
@@ -2915,7 +3064,7 @@ impl FileExplorer {
                 .store
                 .get_by_id(id)
                 .ok_or_else(|| Error::from_reason("skip target vanished"))?;
-            return Ok(EntryJs::from_core(arc.as_ref()));
+            return Ok(self.cache_entry(&arc));
         }
 
         if matches!(dest.action, DestAction::Overwrite) && paths_equal(&dst_path, &src_path) {
@@ -2997,7 +3146,7 @@ impl FileExplorer {
                 let arc = self.store.get_by_id(existing.id).ok_or_else(|| {
                     Error::from_reason("copyFromPath update succeeded but id vanished")
                 })?;
-                return Ok(EntryJs::from_core(arc.as_ref()));
+                return Ok(self.cache_entry(&arc));
             }
             let new_id = self
                 .store
@@ -3007,7 +3156,7 @@ impl FileExplorer {
                 .store
                 .get_by_id(new_id)
                 .ok_or_else(|| Error::from_reason("copyFromPath succeeded but id vanished"))?;
-            return Ok(EntryJs::from_core(arc.as_ref()));
+            return Ok(self.cache_entry(&arc));
         }
 
         // Directory: ensure root is indexed, then authoritatively reconcile
@@ -3042,7 +3191,7 @@ impl FileExplorer {
         let arc = self.store.get_by_path(&dst_path).ok_or_else(|| {
             Error::from_reason("copyFromPath directory copy succeeded but path not indexed")
         })?;
-        Ok(EntryJs::from_core(arc.as_ref()))
+        Ok(self.cache_entry(&arc))
     }
 
     /// Preflight a transfer destination without mutating disk or the store.
@@ -3308,8 +3457,8 @@ impl FileExplorer {
         self.events.subscribe_error(listener)
     }
 
-    /// Subscribe to the `'ready'` channel. Fires once when the initial
-    /// scan settles; later phases may re-fire on root re-add.
+    /// Fires once after initial population or root seeding. Late subscribers
+    /// receive the completed state asynchronously.
     #[napi(js_name = "onReady", catch_unwind)]
     pub fn on_ready(
         &self,
@@ -3327,16 +3476,6 @@ impl FileExplorer {
         // since subscription churn is human-scale). Accept i64 here for
         // parity with the rest of the id surface.
         self.events.unsubscribe(subscription_id as u64)
-    }
-
-    /// Test-only: emit a synthetic 'ready' so the Wave 7 Node harness can
-    /// verify end-to-end delivery without spinning up a real watcher.
-    /// Gated under `#[cfg(feature = "test-hooks")]` would be cleaner but
-    /// the binding crate is cdylib-only; `pub(crate)` + a thin `#[napi]`
-    /// wrapper is enough for the integration tests to reach it.
-    #[napi(js_name = "emitReadyForTests", catch_unwind)]
-    pub fn emit_ready_for_tests(&self) {
-        self.events.emit_ready();
     }
 
     /// Filename fuzzy search via nucleo (Phase 10). Runs synchronously
@@ -3381,27 +3520,54 @@ impl FileExplorer {
             .collect()
     }
 
+    /// Save a consistent checkpoint at a caller-selected path.
+    #[napi(js_name = "writeSnapshot", catch_unwind)]
+    pub async fn write_snapshot(&self, path: String) -> Result<()> {
+        let _guard = self.policy_gate.lock();
+        self.persist_checkpoint(Path::new(&path))
+            .map_err(fx_error_to_napi)
+    }
+
     /// Idempotently stop the watcher and release its forwarding thread.
     #[napi(catch_unwind)]
     pub async fn dispose(&self) -> Result<()> {
-        if self.disposed.swap(true, Ordering::AcqRel) {
-            return Ok(());
+        if !self.disposed.swap(true, Ordering::AcqRel) {
+            // Wake stuck reads before joining the watcher's forwarding thread.
+            self.reads.close();
+            let watcher = self
+                .watcher
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            drop(watcher);
         }
-        // First, so a watcher batch or expansion waiting on a stuck read
-        // returns ECANCELED now; dropping the watcher below joins its thread.
-        // Helpers still in the kernel exit on their own when it returns.
-        self.reads.close();
-        let watcher = match self.watcher.lock() {
-            Ok(mut guard) => guard.take(),
-            Err(poisoned) => poisoned.into_inner().take(),
-        };
-        // Drop outside the mutex: Watcher::drop joins its forwarding thread.
-        drop(watcher);
+        if let Some(path) = &self.options.snapshot_path {
+            let _guard = self.policy_gate.lock();
+            let mut checkpoint = self.checkpoint.lock();
+            if checkpoint.should_save(&self.store)
+                && self.store.snapshot().roots().len() == self.roots.read().len()
+            {
+                self.persist_checkpoint(path).map_err(fx_error_to_napi)?;
+                checkpoint.saved(self.store.tree_version());
+            }
+        }
         Ok(())
     }
 }
 
 impl FileExplorer {
+    fn persist_checkpoint(&self, path: &Path) -> std::result::Result<(), FxError> {
+        self.store.write_checkpoint(
+            path,
+            &self.options.checkpoint_policy(&self.exclude_globs.read()),
+        )
+    }
+
+    fn cache_entry(&self, entry: &Entry) -> EntryJs {
+        self.store.trim_cache(Some(entry.id), &[]);
+        EntryJs::from_core(entry)
+    }
+
     /// Caller holds `policy_gate`. A root whose walk failed becomes
     /// Unavailable — unless its read only did not answer (M10) and the store
     /// already holds it: a timeout is not evidence the root is gone, so its
@@ -3522,12 +3688,14 @@ impl FileExplorer {
             policy_gate: Arc::clone(&self.policy_gate),
             follow_symlinks: self.options.follow_symlinks,
             walker_concurrency: self.options.walker_concurrency,
+            cache_limit: self.options.max_cached_entries,
+            smart_links: Arc::clone(&self.smart_links),
             debounce_ms: self.options.watch_debounce_ms,
             reads: self.reads.clone(),
         }
     }
 
-    fn emit_reconcile_notice(
+    pub(crate) fn emit_reconcile_notice(
         &self,
         previous_version: u64,
         outcome: &crate::watch_runtime::ReconcileOutcome,

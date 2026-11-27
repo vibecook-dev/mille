@@ -5,7 +5,7 @@ Node script to a production Electron + React integration. Every code sample is
 copy-pasteable; patterns assume v0.1 (see section 9 for what v0.1 deliberately
 does not ship).
 
-For the authoritative public type surface see `api.d.ts` at the package root.
+The package build generates its public TypeScript declarations in `dist/index.d.ts`.
 For architecture & design, see the monorepo `README.md`.
 
 ---
@@ -37,7 +37,7 @@ import { FileExplorer } from '@vibecook/mille';
 const fx = new FileExplorer({
   roots: ['/absolute/path/to/workspace'],
   respectIgnore: true, // parse .gitignore/.ignore/.rgignore
-  followSymlinks: 'smart', // canonicalize + dedupe; see api.d.ts
+  followSymlinks: 'smart', // follow each directory target once per walk
   watchDebounceMs: 75, // default
 });
 
@@ -697,10 +697,25 @@ profiling.
 - `watchDebounceMs` — default **75ms**. Lower (≈25ms) for editor-like latency;
   raise (≈200ms) on battery-sensitive laptops. The value caps how quickly a
   burst of filesystem events becomes observable on the wire.
-- `maxCachedEntries` — default **500_000**. Caps the EntryStore. When
-  exceeded, the least-recently-touched subtree becomes lazy-only — reads
-  still work; they just take an extra walk. Drop to ~50k for a background
-  indexer that only needs shallow metadata.
+- `maxCachedEntries` defaults to **500,000**. Full population stops at the
+  budget and sends an `ENTRY_CAP_REACHED` warning when it leaves a lazy tail.
+  Listing a folder reads it on demand and evicts cold entries elsewhere.
+  Each page fits in the slots left after the workspace roots and the path to
+  the listed directory. Advance the offset by the number of returned entries
+  while `hasMore` is true. `total` counts the full filtered listing. A budget
+  too small to hold even one requested row and its ancestors produces
+  `ENOSPC`. Resolving an evicted path can assign it a new ID. Existing
+  immutable snapshots remain valid.
+- `snapshotPath` saves a checkpoint after full population and on clean disposal.
+  With matching roots and traversal settings, full mode immediately exposes
+  the last saved rows.
+  Their child lists are provisional until read. `populateFromRoots()` verifies
+  them against disk using the current traversal settings, preserves matching
+  IDs and emits `changedSinceSnapshot` for confirmed differences before
+  signaling readiness. Roots-only and manual startup reserve the same IDs
+  for on-demand reads. A seeded lazy session saves its indexed rows on disposal. A missing checkpoint starts a fresh index. An invalid or
+  incompatible checkpoint also produces a `SNAPSHOT_STALE` warning.
+  Use `await fx.writeSnapshot(path)` to take an explicit checkpoint.
 - `walkerConcurrency` — defaults to `num_cpus`. Pin lower on shared CI.
 - `readTimeoutMs` — default **2000**. Every listing and stat runs on a small
   native helper pool, and a read that makes no progress for this long answers
@@ -846,7 +861,7 @@ The following are explicitly **deferred** for v0.1. Do not build around them
 yet — shape may change.
 
 - **Remote FS providers (native scheme dispatch)** — SSH, zip, S3, etc.
-  The `FileSystemProvider` + `registerProvider` surface in `api.d.ts` remains
+  The `FileSystemProvider` + `registerProvider` surface in the original design draft remains
   the long-term native contract. **Phase 6.1** ships a TypeScript provider
   runtime at `@vibecook/mille/provider` with:
   - `createMemoryFileSystemProvider` (non-local test/demo backend)
@@ -872,15 +887,13 @@ yet — shape may change.
 - **Full example Electron app** — a minimal `examples/electron` scaffold (the
   patterns in section 2 turned into a runnable app) lands in a post-v0.1 PR.
 - **Sort on the snapshot** — `sort`/`sortDir` on `VisibleRowsOptions` is
-  declared in `api.d.ts` but not yet honored by the client-side slice. Sort
+  declared in the original design draft but not yet honored by the client-side slice. Sort
   renderer-side in the meantime.
 - **Path-keyed lookups on the snapshot** — `getByPath` does not exist yet.
   Maintain your own path↔id map by listening to the delta stream.
 - **Decorations over the wire** — `PortFileExplorer.getSnapshot().getDecorations`
   always returns `[]`. Register providers in the same process that owns the
   `FileExplorer` (utility process or local Node).
-- **`writeSnapshot` / crash-resume** — `snapshotPath` is accepted on
-  `ExplorerOptions` but the resume path is a Phase 12 concern.
 
 ---
 

@@ -11,6 +11,8 @@
 // component via React 19's renderToString, and asserts an <svg>
 // tag is present in the output.
 
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { test, before, after } from 'node:test';
 import { strict as assert } from 'node:assert';
 import { Window } from 'happy-dom';
@@ -267,4 +269,10 @@ test('FileIcon: returns null when the theme cannot resolve and has no default', 
     createElement(FileIcon, { entry: { name: 'x', kind: 0 }, theme: bare }),
   );
   assert.equal(html, '');
+});
+
+
+test('the published icon preview matches every exported theme and its resolved icons', () => {
+  const generator = fileURLToPath(new URL('../scripts/build-icons-preview.mjs', import.meta.url));
+  execFileSync(process.execPath, [generator, '--check']);
 });

@@ -586,6 +586,7 @@ impl Drop for Owner {
 /// pool, its deadline and its stuck accounting.
 #[derive(Clone)]
 pub struct ReadBoundary {
+    checkpoint_file: Option<Arc<Path>>,
     shared: Arc<Shared>,
     _owner: Arc<Owner>,
 }
@@ -630,8 +631,27 @@ impl ReadBoundary {
         });
         Self {
             _owner: Arc::new(Owner(Arc::clone(&shared))),
+            checkpoint_file: None,
             shared,
         }
+    }
+
+    pub fn with_checkpoint_file(mut self, checkpoint: Option<PathBuf>) -> Self {
+        self.checkpoint_file = checkpoint.map(Arc::from);
+        self
+    }
+
+    /// Exclude the engine's own checkpoint and atomic staging files from
+    /// walker output and watcher events when the destination is in a root.
+    pub fn is_checkpoint_file(&self, path: &Path) -> bool {
+        self.checkpoint_file.as_deref().is_some_and(|target| {
+            path == target
+                || (path.parent() == target.parent()
+                    && path.file_name().is_some_and(|name| {
+                        name.as_encoded_bytes()
+                            .starts_with(crate::resume::CHECKPOINT_TEMP_PREFIX.as_bytes())
+                    }))
+        })
     }
 
     /// The process-wide boundary behind the plain `walk*` functions, with
@@ -1184,7 +1204,10 @@ fn list_dir(dir: &Path, options: ListOptions, progress: &ReadProgress) -> io::Re
                     }
                     child.metadata = Some(metadata);
                 }
-                Err(_) => child.follow_failed = true,
+                Err(_) => {
+                    child.follow_failed = true;
+                    child.metadata = std::fs::symlink_metadata(&path).ok();
+                }
             }
         } else {
             child.metadata = std::fs::symlink_metadata(&path).ok();

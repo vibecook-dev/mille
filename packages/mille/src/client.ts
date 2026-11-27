@@ -1,7 +1,7 @@
 // Typed FileExplorer wrapper — Phase 6 commit 6.5.
 //
 // Wraps the raw napi-rs `FileExplorer` class (from fx-binding) with the
-// typed surface declared in ../api.d.ts. The goals:
+// typed surface exposed by this module. The goals:
 //
 //  1. Every async native call routes through `wrap()` so rejections
 //     arrive as typed `FileSystemError` (code + path + message).
@@ -14,12 +14,6 @@
 //  4. `MirrorSnapshot` is wrapped so callers can pick between the
 //     struct-marshaled `visibleRows` (small viewports) and the
 //     bincode-bulk `visibleRowsBulk` (decoded via `decodeBulkRows`).
-//
-// api.d.ts is the package's public type surface; this module mirrors
-// only the subset it needs without importing from api.d.ts at runtime
-// — keeping the declaration file decoupled from the implementation.
-// The public `.d.ts` consumers see is the generated one from this
-// file plus api.d.ts at the package root.
 //
 // AbortSignal on async I/O: accepted in the signature to stay API-
 // compatible with api.d.ts, but currently ignored (napi-rs 3.x !Send
@@ -205,12 +199,15 @@ export interface Uri {
 export interface ExplorerOptions {
   readonly roots: readonly (Uri | string)[];
   readonly respectIgnore?: boolean;
+  /** Smart walks each reachable canonical directory once per walk, preferring ordinary paths. */
   readonly followSymlinks?: boolean | 'smart';
   readonly walkerConcurrency?: number;
   readonly watchDebounceMs?: number;
   readonly compactFolders?: boolean;
   readonly excludeGlobs?: readonly string[];
+  /** Checkpoint file for stable entry identities and offline changes on the next population. */
   readonly snapshotPath?: string;
+  /** Maximum live indexed entries, including workspace roots (default 500,000). Wide folders are paged. */
   readonly maxCachedEntries?: number;
   /** Initial progressive page size. Later pages grow to amortize large stores. Default: 256. */
   readonly directoryBatchSize?: number;
@@ -273,6 +270,47 @@ export type EventName =
   | 'error'
   | 'ready';
 
+function selectDirectoryPage(
+  candidates: Entry[],
+  options: ListOptions | undefined,
+  snapshot: MirrorSnapshot,
+) {
+  const entries = candidates.filter((entry) =>
+    isVisibleEntry(
+      entry,
+      options?.includeIgnored ?? false,
+      snapshot.showHiddenFiles,
+      snapshot.showIgnoredFiles,
+    ),
+  );
+  if (options?.sort !== undefined) {
+    const direction = options.sortDir === 'desc' ? -1 : 1;
+    const sort = options.sort;
+    entries.sort((a, b) => {
+      let result = 0;
+      if (sort === 'mtime') result = a.mtimeMs - b.mtimeMs;
+      else if (sort === 'size') result = a.size - b.size;
+      else if (sort === 'kindThenName') {
+        const aDirectory = a.kind === 1 || a.symlinkTargetIsDir === true;
+        const bDirectory = b.kind === 1 || b.symlinkTargetIsDir === true;
+        result = Number(bDirectory) - Number(aDirectory);
+      }
+      if (result === 0) result = a.name.localeCompare(b.name, undefined, { numeric: true });
+      if (result === 0) result = a.id - b.id;
+      return result * direction;
+    });
+  }
+  const total = entries.length;
+  const normalizePageNumber = (value: number | undefined, fallback: number): number =>
+    typeof value === 'number' && Number.isFinite(value)
+      ? Math.min(0xffff_ffff, Math.max(0, Math.trunc(value)))
+      : fallback;
+  const offset = normalizePageNumber(options?.offset, 0);
+  const limit = normalizePageNumber(options?.limit, total);
+  const page = entries.slice(offset, offset + limit);
+  return { entries: page, total, offset };
+}
+
 // napi `onChange*` returns bigint subscription ids; off() expects Number.
 type NativeFx = {
   readonly capabilities: number;
@@ -288,6 +326,10 @@ type NativeFx = {
   resync(id: number, recursive?: boolean): Promise<number>;
   resyncProgressive?(id: number, operationId: string, batchSize?: number): Promise<number>;
   resyncWorkspace(): Promise<number>;
+  openDirectoryPage?(id: number): Promise<{
+    candidates(): Entry[];
+    retain(indices: number[]): Entry[] | null;
+  }>;
   populateFromRoots(): Promise<number>;
   seedWorkspaceRoots(): number;
   startWatching(): Promise<number>;
@@ -361,7 +403,7 @@ type NativeFx = {
   onError(listener: (n: unknown) => void): bigint;
   onReady(listener: () => void): bigint;
   off(subscriptionId: number): boolean;
-  emitReadyForTests(): void;
+  writeSnapshot(path: string): Promise<void>;
   search(
     query: string,
     options?: {
@@ -523,7 +565,7 @@ function encodeProjectionSettings(settings: ExplorerProjectionSettings): NativeP
  * channel routing happens inside.
  */
 export class FileExplorer {
-  /** @internal — exposed so tests can reach `emitReadyForTests` etc. */
+  /** Native engine owned by this wrapper. */
   private readonly nativeFx: NativeFx;
   /** @internal — host-side decoration merge store (Phase 9). */
   private readonly decorations = new DecorationStore();
@@ -559,9 +601,25 @@ export class FileExplorer {
       ...new Set([...(options.excludeGlobs ?? []), ...(options.settings?.excludeGlobs ?? [])]),
     ];
     if (excludeGlobs.length > 0) nativeOpts.excludeGlobs = excludeGlobs;
-    if (options.snapshotPath !== undefined) nativeOpts.snapshotPath = options.snapshotPath;
-    if (options.maxCachedEntries !== undefined)
-      nativeOpts.maxCachedEntries = options.maxCachedEntries;
+    if (options.snapshotPath !== undefined) {
+      nativeOpts.snapshotPath = options.snapshotPath;
+      if (options.initialWalk !== undefined) nativeOpts.initialWalk = options.initialWalk;
+    }
+    if (options.maxCachedEntries !== undefined) {
+      const cap = options.maxCachedEntries;
+      if (
+        !Number.isSafeInteger(cap) ||
+        cap < options.roots.length ||
+        cap < 1 ||
+        cap > 0xffff_ffff
+      ) {
+        throw new FileSystemError(
+          'EINVAL',
+          'maxCachedEntries must be a positive uint32 with room for every root',
+        );
+      }
+      nativeOpts.maxCachedEntries = cap;
+    }
     if (options.readTimeoutMs !== undefined) nativeOpts.readTimeoutMs = options.readTimeoutMs;
     if (options.maxStuckReads !== undefined) nativeOpts.maxStuckReads = options.maxStuckReads;
     if (options.materializeDataless !== undefined)
@@ -869,6 +927,11 @@ export class FileExplorer {
     };
   }
 
+  /** Persist the currently indexed tree and its entry identities atomically. */
+  writeSnapshot(path: string): Promise<void> {
+    return wrap(this.nativeFx.writeSnapshot(path));
+  }
+
   /**
    * Walk every configured root and seed the EntryStore with the
    * discovered entries. Returns the total entry count.
@@ -936,7 +999,10 @@ export class FileExplorer {
   async list(parentId: EntryId, options?: ListOptions): Promise<ListPage> {
     const depth = options?.depth ?? 1;
     try {
-      await this.prefetch(parentId, { depth });
+      await this.prefetch(parentId, {
+        depth,
+        ...(options?.signal ? { signal: options.signal } : {}),
+      });
     } catch (e) {
       // Don't hard-fail the consumer — a missing native method should
       // surface as "no children known yet", matching how a slow walker
@@ -945,52 +1011,33 @@ export class FileExplorer {
         throw e;
       }
     }
-    const snap = this.getSnapshot();
-    // Listing returns physical children. Compaction and file nesting belong
-    // to row projection and can replace a child with a deeper descendant or
-    // hide siblings that still need to appear in a directory page.
-    const kids = snap.childrenOf(parentId);
-    const entries: Entry[] = [];
-    for (const kidId of kids) {
-      const e = snap.getById(kidId);
-      if (
-        e &&
-        isVisibleEntry(
-          e,
-          options?.includeIgnored ?? false,
-          snap.showHiddenFiles,
-          snap.showIgnoredFiles,
-        )
-      ) {
-        entries.push(e);
+    for (;;) {
+      const snap = this.getSnapshot();
+      const partial =
+        depth > 0 && !snap.directoryChildrenLoaded(parentId) && this.nativeFx.openDirectoryPage;
+      const source = partial ? await wrap(partial.call(this.nativeFx, parentId)) : undefined;
+      // Physical children are independent of row compaction and nesting.
+      const candidates =
+        source?.candidates() ??
+        snap
+          .childrenOf(parentId)
+          .map((id) => snap.getById(id))
+          .filter((entry): entry is Entry => entry !== null && entry !== undefined);
+      const selected = selectDirectoryPage(candidates, options, snap);
+      const entries =
+        source === undefined
+          ? selected.entries
+          : wrapSync(() => source.retain(selected.entries.map((entry) => entry.id)));
+      if (entries !== null) {
+        return {
+          entries,
+          total: selected.total,
+          hasMore: selected.offset + entries.length < selected.total,
+        };
       }
+      if (options?.signal?.aborted)
+        throw new FileSystemError('ECANCELED', 'directory listing cancelled');
     }
-    if (options?.sort !== undefined) {
-      const direction = options.sortDir === 'desc' ? -1 : 1;
-      const sort = options.sort;
-      entries.sort((a, b) => {
-        let result = 0;
-        if (sort === 'mtime') result = a.mtimeMs - b.mtimeMs;
-        else if (sort === 'size') result = a.size - b.size;
-        else if (sort === 'kindThenName') {
-          const aDirectory = a.kind === 1 || a.symlinkTargetIsDir === true;
-          const bDirectory = b.kind === 1 || b.symlinkTargetIsDir === true;
-          result = Number(bDirectory) - Number(aDirectory);
-        }
-        if (result === 0) result = a.name.localeCompare(b.name, undefined, { numeric: true });
-        if (result === 0) result = a.id - b.id;
-        return result * direction;
-      });
-    }
-    const total = entries.length;
-    const normalizePageNumber = (value: number | undefined, fallback: number): number =>
-      typeof value === 'number' && Number.isFinite(value)
-        ? Math.min(0xffff_ffff, Math.max(0, Math.trunc(value)))
-        : fallback;
-    const offset = normalizePageNumber(options?.offset, 0);
-    const limit = normalizePageNumber(options?.limit, total);
-    const page = entries.slice(offset, offset + limit);
-    return { entries: page, total, hasMore: offset + page.length < total };
   }
 
   /**
@@ -1373,11 +1420,18 @@ export class FileExplorer {
       throw new Error(`unknown event channel: ${String(event)}`);
     }
     // The native onX methods all take a single-arg listener; the shape
-    // of that arg depends on the channel. Public typings in api.d.ts
+    // of that arg depends on the channel. Public typings in dist/index.d.ts
     // enforce the right signature at call sites.
     const register = this.nativeFx[method] as (fn: (...args: unknown[]) => void) => bigint;
-    const subId = register.call(this.nativeFx, listener);
     let active = true;
+    const subId = register.call(
+      this.nativeFx,
+      event === 'ready'
+        ? () => {
+            if (active) listener();
+          }
+        : listener,
+    );
     return this.trackEventSubscription({
       dispose: () => {
         if (!active) return;

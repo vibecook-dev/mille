@@ -150,8 +150,7 @@ content writes as changes, not degraded renames`. PRs use Summary + Test Plan.
 - `crossbeam-channel` is declared in `Cargo.toml` and used nowhere.
 - `Fs`/`RealFs` in `mille-core/src/fs.rs` is aspirational — `RealFs` returns `Unsupported`; real I/O
   goes through `tokio::fs`/`std::fs` in the binding.
-- `SymlinkPolicy::Smart` is the default but is currently behaviorally identical to `Never`; the
-  dev/inode dedup it promises is a TODO at `walker.rs:32`.
+- `SymlinkPolicy::Smart` visits real directories first and follows each new directory target once per walk.
 - `EntryId` is capped at 2^53 so it survives as a JS number, and allocation fails rather than wraps.
 - Mille-core is entirely synchronous OS threads. tokio appears only in the binding.
 
