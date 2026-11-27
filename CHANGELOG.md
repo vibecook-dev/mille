@@ -1,5 +1,12 @@
 # mille changelog
 
+## [0.3.7](https://github.com/vibecook-dev/mille/compare/v0.3.6...v0.3.7) (2026-11-27)
+
+
+### Bug Fixes
+
+* **explorer:** enforce cache limits and restore saved snapshots ([#50](https://github.com/vibecook-dev/mille/issues/50)) ([0c15680](https://github.com/vibecook-dev/mille/commit/0c1568008dcd6e4f9b48ceb55a93bfde19b957af))
+
 ## [0.3.6](https://github.com/vibecook-dev/mille/compare/v0.3.5...v0.3.6) (2026-11-12)
 
 
