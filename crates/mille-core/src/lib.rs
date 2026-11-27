@@ -55,8 +55,8 @@ pub use history::{
 pub mod walker;
 pub use walker::{
     build_ignore_matcher_from_walk, populate_store, populate_store_with_provenance, walk,
-    walk_batched, walk_bounded, walk_bounded_batched, walk_with_ignore, walk_with_ignore_batched,
-    SymlinkPolicy, UnreadDirectory, WalkOptions, WalkReport, WalkedEntry,
+    walk_batched, walk_bounded, walk_bounded_batched, walk_bounded_limited, walk_with_ignore,
+    walk_with_ignore_batched, SymlinkPolicy, UnreadDirectory, WalkOptions, WalkReport, WalkedEntry,
 };
 
 // flux dogfood — streaming media-grade scan: `(dev, ino)`, birth time, ns

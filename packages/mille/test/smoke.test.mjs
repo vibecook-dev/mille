@@ -145,7 +145,7 @@ test('visibleRows/visibleRowCount work on an empty snapshot', () => {
   }
 });
 
-test('emitReadyForTests + onReady fire end-to-end through the TSFN', async () => {
+test('initial root population delivers onReady through the TSFN', async () => {
   const dir = mkTmp();
   const fx = new FileExplorer({ roots: [dir] });
   let subId;
@@ -159,7 +159,7 @@ test('emitReadyForTests + onReady fire end-to-end through the TSFN', async () =>
         resolve();
       });
     });
-    fx.emitReadyForTests();
+    await fx.populateFromRoots();
     // TSFN dispatch uses the event loop; a busy runner may not process it
     // within a fixed sleep even though delivery is correct.
     await ready;

@@ -151,7 +151,7 @@ Prebuilt for macOS, Windows and Linux, on x64 and arm64, with glibc and musl bui
 
 - **0.x.** The API can still change between releases.
 - **Git** badges come from the `git` on your `PATH`. The native git engine in `crates/mille-git` is not in the published binaries yet.
-- **Symlinked folders** are not walked into by default. `followSymlinks: true` walks them.
+- **Symlinked folders** use `followSymlinks: 'smart'` by default. Each walk prefers ordinary directories and visits each reachable directory target once. Set it to `false` to skip linked subtrees, or `true` to traverse each alias with ancestor-cycle protection.
 - **Remote workspaces** (`mille-truffle`) are experimental.
 
 <details>

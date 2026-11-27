@@ -1,13 +1,6 @@
 // Shared runtime types for the host/client split — Phase 7 commit 7.1.
 //
-// api.d.ts is the package's authoritative public type surface (including
-// `MessagePortLike` and `FileExplorerHost`). This module re-declares the
-// runtime-facing subset so src/host.ts and src/client.ts can reference
-// them without coupling to the .d.ts bundled at the package root.
-//
-// Keep these definitions compatible with api.d.ts. Phase 7 ships the
-// runtime; the two surfaces unify in Phase 8 when the decl file moves
-// under src/.
+// The package build generates public declarations from these exports.
 
 import type { FileExplorer } from './client.js';
 import type { ExplorerHostChannel, ExplorerSessionContext } from './channel/types.js';

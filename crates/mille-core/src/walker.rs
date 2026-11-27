@@ -20,6 +20,7 @@
 // stops the walker at the `node_modules` symlink entry itself, rather than
 // letting it follow the link into pnpm's 38k-file store.
 
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{FileType, Metadata};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -34,15 +35,15 @@ use crate::read_boundary::{
     ReadSignal, Ticket, WAIT_SLICE,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum SymlinkPolicy {
     /// Never descend into symlinked directories.
     Never,
     /// Always descend. Cycles are cut by comparing each followed link's
     /// canonical target with the directories above it.
     Always,
-    /// Phase 2.3: behaviorally equivalent to Never. PLAN 13.1 adds (dev,inode)
-    /// dedup + ancestor-cycle detection to make this the correct default.
+    /// Walk real directories first, then directory links whose canonical
+    /// targets have not been visited in this walk. Keep links as link rows.
     #[default]
     Smart,
 }
@@ -114,6 +115,14 @@ pub struct WalkReport {
     /// Walked entries in walk order. Empty for the batched form, whose
     /// entries went to `on_batch`.
     pub entries: Vec<WalkedEntry>,
+    /// Direct-child lists delivered completely, including empty directories
+    /// and Smart aliases whose targets were already represented elsewhere.
+    pub completed_directories: Vec<PathBuf>,
+    /// (logical link, canonical target) for directory links Smart descended.
+    pub followed_links: Vec<(PathBuf, PathBuf)>,
+    /// An eager population stopped at its entry budget. Unfinished directories
+    /// stay eligible for explicit lazy reads.
+    pub truncated: bool,
     /// Directories whose read did not answer. Never the walk root: a root
     /// that cannot be read fails the walk with the read's typed error.
     pub unread: Vec<UnreadDirectory>,
@@ -245,10 +254,25 @@ pub fn walk_bounded(
     ignore: Option<&IgnoreMatcher>,
     reads: &ReadBoundary,
 ) -> Result<WalkReport, FxError> {
+    walk_bounded_limited(root, options, ignore, reads, usize::MAX)
+}
+
+/// Eager walk with a bounded result. The first omitted entry ends the walk;
+/// only directories already delivered in full are marked complete.
+pub fn walk_bounded_limited(
+    root: &Path,
+    options: WalkOptions,
+    ignore: Option<&IgnoreMatcher>,
+    reads: &ReadBoundary,
+    limit: usize,
+) -> Result<WalkReport, FxError> {
     let mut entries = Vec::new();
     let mut report = walk_core(root, &options, ignore, reads, &mut || false, &mut |entry| {
+        if entries.len() >= limit {
+            return Ok(false);
+        }
         entries.push(entry);
-        Ok(())
+        Ok(true)
     })?;
     report.entries = entries;
     Ok(report)
@@ -285,7 +309,7 @@ where
                 // immutable snapshots and change notices produced by the batch.
                 std::thread::yield_now();
             }
-            Ok(())
+            Ok(true)
         },
     )?;
     if cancelled() {
@@ -355,6 +379,9 @@ struct Walk<'a> {
     reading: Vec<usize>,
     read_ahead: usize,
     listed_ahead: usize,
+    /// Delaying links lets ordinary paths win regardless of parallel read order.
+    deferred_links: BTreeMap<PathBuf, usize>,
+    visited: HashSet<PathBuf>,
 }
 
 fn walk_core(
@@ -363,17 +390,14 @@ fn walk_core(
     ignore: Option<&IgnoreMatcher>,
     reads: &ReadBoundary,
     cancelled: &mut dyn FnMut() -> bool,
-    visit: &mut dyn FnMut(WalkedEntry) -> Result<(), FxError>,
+    visit: &mut dyn FnMut(WalkedEntry) -> Result<bool, FxError>,
 ) -> Result<WalkReport, FxError> {
-    let follow = matches!(options.follow_symlinks, SymlinkPolicy::Always);
+    let follow = options.follow_symlinks != SymlinkPolicy::Never;
     let mut report = WalkReport::default();
 
-    let output = reads.stat(root, follow).map_err(|failure| match failure {
-        // `Path::exists`, which this replaced, called every OS failure
-        // "missing". Unanswered reads keep their own typed error.
-        ReadFailure::Io(_) => missing_root(root),
-        other => other.into_fx(root),
-    })?;
+    let output = reads
+        .stat(root, follow)
+        .map_err(|failure| failure.into_fx(root))?;
     let stat = output
         .as_stat()
         .ok_or_else(|| FxError::InternalBug("bounded stat returned no metadata".into()))?;
@@ -382,11 +406,16 @@ fn walk_core(
     }
 
     if options.include_root {
-        if let Some(entry) = root_entry(root, stat, follow) {
+        if let Some(entry) =
+            root_entry(root, stat, options.follow_symlinks == SymlinkPolicy::Always)
+        {
             if cancelled() {
                 return Err(FxError::Cancelled);
             }
-            visit(entry)?;
+            if !visit(entry)? {
+                report.truncated = true;
+                return Ok(report);
+            }
         }
     }
     let lists_root = options.max_depth.is_none_or(|limit| limit >= 1);
@@ -410,7 +439,13 @@ fn walk_core(
         reading: Vec::new(),
         read_ahead: options.parallelism.max(1),
         listed_ahead: 0,
+        deferred_links: BTreeMap::new(),
+        visited: HashSet::new(),
     };
+    if options.follow_symlinks == SymlinkPolicy::Smart {
+        walk.visited
+            .insert(stat.canonical.clone().unwrap_or_else(|| root.to_owned()));
+    }
     let root_dir = walk.add_dir(Dir {
         path: root.to_path_buf(),
         depth: 0,
@@ -429,24 +464,42 @@ fn walk_core(
     }
 
     let mut stack = vec![root_dir];
-    while let Some(&top) = stack.last() {
-        walk.pump(cancelled)?;
-        let Some(child) = walk.next_child(top) else {
-            stack.pop();
-            walk.dirs[top] = None;
-            continue;
-        };
-        if let Some(entry) = child.entry {
-            if cancelled() {
-                return Err(FxError::Cancelled);
+    loop {
+        let dir = if let Some(&top) = stack.last() {
+            walk.pump(cancelled)?;
+            let Some(child) = walk.next_child(top) else {
+                stack.pop();
+                report
+                    .completed_directories
+                    .push(walk.dirs[top].take().unwrap().path);
+                continue;
+            };
+            if let Some(entry) = child.entry {
+                if cancelled() {
+                    return Err(FxError::Cancelled);
+                }
+                if let Some(contents) = child.ignore {
+                    report.ignore_files.push((entry.path.clone(), contents));
+                }
+                if !visit(entry)? {
+                    report.truncated = true;
+                    break;
+                }
             }
-            if let Some(contents) = child.ignore {
-                report.ignore_files.push((entry.path.clone(), contents));
+            let Some(dir) = child.dir else { continue };
+            dir
+        } else if let Some((path, dir)) = walk.deferred_links.pop_first() {
+            let target = walk.dir(dir).canonical.clone();
+            if let Some(target) = target.filter(|target| walk.visited.insert(target.clone())) {
+                report.followed_links.push((path, target));
+            } else {
+                report.completed_directories.push(path);
+                walk.dirs[dir] = None;
+                continue;
             }
-            visit(entry)?;
-        }
-        let Some(dir) = child.dir else {
-            continue;
+            dir
+        } else {
+            break;
         };
         walk.await_dir(dir, cancelled)?;
         match walk.take_unlisted(dir) {
@@ -626,20 +679,26 @@ impl Walk<'_> {
         for listed in &listing.children {
             // A followed link that does not resolve is dropped entirely, as
             // jwalk dropped it.
-            if self.follow && listed.follow_failed {
+            if self.options.follow_symlinks == SymlinkPolicy::Always && listed.follow_failed {
                 continue;
             }
             let followed_dir =
                 self.follow && listed.file_type.is_symlink() && listed.effective_type.is_dir();
-            if followed_dir && self.is_cycle(id, listed.canonical.as_deref()) {
+            if self.options.follow_symlinks == SymlinkPolicy::Always
+                && followed_dir
+                && self.is_cycle(id, listed.canonical.as_deref())
+            {
                 continue;
             }
             let path = dir_path.join(&listed.name);
+            if self.reads.is_checkpoint_file(&path) {
+                continue;
+            }
             let descend =
                 reads_at_depth && listed.effective_type.is_dir() && !self.is_pruned(&path, listed);
             let entry = walked_entry(listed, &path, child_depth, self.options);
             let ignore = entry.as_ref().and(listed.ignore_contents.as_ref()).cloned();
-            let dir = descend.then(|| {
+            let dir = if descend && !listed.follow_failed {
                 let canonical = if !self.follow {
                     None
                 } else if followed_dir {
@@ -650,17 +709,34 @@ impl Walk<'_> {
                         .as_ref()
                         .map(|parent| parent.join(&listed.name))
                 };
-                let child = self.add_dir(Dir {
-                    path,
-                    depth: child_depth,
-                    canonical,
-                    parent: Some(id),
-                    dataless: listed.is_dataless(),
-                    state: DirState::Waiting,
-                });
-                descents.push(child);
-                child
-            });
+                let smart = self.options.follow_symlinks == SymlinkPolicy::Smart;
+                if smart
+                    && !followed_dir
+                    && canonical
+                        .as_ref()
+                        .is_some_and(|p| !self.visited.insert(p.clone()))
+                {
+                    None
+                } else {
+                    let child = self.add_dir(Dir {
+                        path: path.clone(),
+                        depth: child_depth,
+                        canonical,
+                        parent: (!smart).then_some(id),
+                        dataless: listed.is_dataless(),
+                        state: DirState::Waiting,
+                    });
+                    if smart && followed_dir {
+                        self.deferred_links.insert(path, child);
+                        None
+                    } else {
+                        descents.push(child);
+                        Some(child)
+                    }
+                }
+            } else {
+                None
+            };
             children.push(Child { entry, ignore, dir });
         }
         // First child on top: the order the depth-first emission needs them.
@@ -749,9 +825,17 @@ fn walked_entry(
         path.to_path_buf(),
         path.parent().map(Path::to_path_buf),
         name,
-        listed.effective_type,
+        if options.follow_symlinks == SymlinkPolicy::Smart {
+            listed.file_type
+        } else {
+            listed.effective_type
+        },
         metadata,
-        listed.target_is_dir,
+        if options.follow_symlinks == SymlinkPolicy::Smart && listed.file_type.is_symlink() {
+            Some(listed.effective_type.is_dir())
+        } else {
+            listed.target_is_dir
+        },
         is_hidden,
         depth,
     ))

@@ -1,5 +1,6 @@
 /**
- * @vibecook/mille — public API draft
+ * @vibecook/mille — historical API design draft (repository only).
+ * Published declarations are generated from src/index.ts and its exports.
  *
  * Design principles (from research):
  *  - Tree state lives in Rust; JS owns view state (expansion, selection, scroll)

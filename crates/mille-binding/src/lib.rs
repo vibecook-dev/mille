@@ -10,6 +10,8 @@ extern crate napi_derive;
 mod bounded;
 pub mod bulk;
 pub mod cancel;
+mod checkpoint;
+mod directory_page;
 // The drive engine (`crates/mille-drive`) — on by default; the `drive`
 // feature in Cargo.toml says why.
 #[cfg(feature = "drive")]

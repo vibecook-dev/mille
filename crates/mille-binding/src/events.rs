@@ -13,8 +13,7 @@
 //! no serde detour, no `Box<dyn Any>`.
 //!
 //! The live watcher and store reconciliation pipeline feed this bus. The
-//! smoke helper `emit_ready_for_tests` remains available for an isolated
-//! end-to-end binding check.
+//! initial root population or seeding also publishes readiness.
 //!
 //! Native (Rust) listeners ride the same bus: `subscribe_native_event` /
 //! `subscribe_native_change` register an `Arc<dyn Fn>` that runs
@@ -110,6 +109,7 @@ pub struct EventBus {
     warning: RwLock<Vec<Slot<WarningPayloadJs>>>,
     error: RwLock<Vec<Slot<ErrorPayloadJs>>>,
     ready: RwLock<Vec<Slot<()>>>,
+    ready_emitted: std::sync::atomic::AtomicBool,
     native_event: RwLock<Vec<NativeSlot<NativeEventListener>>>,
     native_change: RwLock<Vec<NativeSlot<NativeChangeListener>>>,
     native_change_tree: RwLock<Vec<NativeSlot<NativeChangeListener>>>,
@@ -128,6 +128,7 @@ impl EventBus {
             warning: RwLock::new(Vec::new()),
             error: RwLock::new(Vec::new()),
             ready: RwLock::new(Vec::new()),
+            ready_emitted: std::sync::atomic::AtomicBool::new(false),
             native_event: RwLock::new(Vec::new()),
             native_change: RwLock::new(Vec::new()),
             native_change_tree: RwLock::new(Vec::new()),
@@ -181,7 +182,15 @@ impl EventBus {
 
     pub fn subscribe_ready(&self, tsfn: Tsfn<()>) -> u64 {
         let id = self.alloc_id();
-        self.ready.write().push((id, Arc::new(tsfn)));
+        let listener = Arc::new(tsfn);
+        let already_ready = {
+            let mut listeners = self.ready.write();
+            listeners.push((id, Arc::clone(&listener)));
+            self.ready_emitted.load(Ordering::Relaxed)
+        };
+        if already_ready {
+            listener.call((), ThreadsafeFunctionCallMode::NonBlocking);
+        }
         id
     }
 
@@ -307,6 +316,11 @@ impl EventBus {
     pub fn emit_ready(&self) {
         let snapshot: Vec<Arc<Tsfn<()>>> = {
             let guard = self.ready.read();
+            // Registration takes the write lock. A racing subscriber either
+            // appears in this snapshot or observes the latch and queues itself.
+            if self.ready_emitted.swap(true, Ordering::Relaxed) {
+                return;
+            }
             guard.iter().map(|(_, t)| t.clone()).collect()
         };
         for tsfn in snapshot {
@@ -556,9 +570,4 @@ mod tests {
         bus.emit_event(blank_event("changed", "/r/b.ts"));
         assert_eq!(seen.lock().unwrap().len(), 2);
     }
-
-    // TSFN-level subscribe/emit smoke tests require a live JS environment
-    // and live in the Wave 7 Node integration harness. The pure-Rust
-    // plumbing above is covered by these unit tests plus the binding-level
-    // `emit_ready_for_tests` hook.
 }

@@ -7,6 +7,10 @@
 // Phase 1 keeps StoreSnapshot's entry map flat (BTreeMap); Phase 2 swaps in
 // a SumTree<EntryNode> behind the same API for O(log n) summary queries.
 
+mod cache;
+mod checkpoint;
+pub use checkpoint::SnapshotBaseline;
+
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,6 +34,12 @@ pub struct EntryStore {
     id_to_path: DashMap<EntryId, Arc<Path>>,
     id_counter: AtomicU64,
     write_lock: Mutex<()>,
+    cache_limit: usize,
+    // A writer may stage a batch before choosing its eviction victims.
+    // Readers continue to see the last in-budget snapshot throughout.
+    resident: Option<ArcSwap<StoreSnapshot>>,
+    resume_ids: Option<Mutex<checkpoint::ReservedIds>>,
+    cache_access: Mutex<cache::CacheAccess>,
     // Accumulated structural changes since the last take_pending_changes().
     // Guarded by its own mutex so writers can push under the write_lock without
     // tangling the main snapshot publish path.
@@ -80,10 +90,30 @@ impl EntryStore {
             id_to_path: DashMap::new(),
             id_counter: AtomicU64::new(0),
             write_lock: Mutex::new(()),
+            cache_limit: usize::MAX,
+            resident: None,
+            resume_ids: None,
+            cache_access: Mutex::default(),
             pending_changes: Mutex::new(ChangeSet::default()),
             sibling_order: RwLock::new(sibling_order),
             visibility: RwLock::new(visibility),
         }
+    }
+
+    fn publish(&self, next: StoreSnapshot) {
+        let next = Arc::new(next);
+        if let Some(resident) = &self.resident {
+            if next.entry_count() <= self.cache_limit {
+                resident.store(Arc::clone(&next));
+            }
+        }
+        self.inner.store(next);
+    }
+
+    pub fn resident_snapshot(&self) -> Arc<StoreSnapshot> {
+        self.resident
+            .as_ref()
+            .map_or_else(|| self.snapshot(), |view| view.load_full())
     }
 
     pub fn snapshot(&self) -> Arc<StoreSnapshot> {
@@ -165,13 +195,26 @@ impl EntryStore {
         let prev_tree_version = next.tree_version;
         next.tree_version += 1;
         let new_tree_version = next.tree_version;
-        self.inner.store(Arc::new(next));
+        self.publish(next);
         self.record_mutation(prev_tree_version, new_tree_version, |changes| {
             changes
                 .child_set_changed
                 .extend(newly_loaded.iter().copied());
         });
         Ok(newly_loaded)
+    }
+
+    /// Only the walker knows whether it reached the end of a directory.
+    pub fn mark_listed_paths(&self, paths: &[PathBuf]) -> Result<Vec<EntryId>, FxError> {
+        let ids: Vec<_> = paths
+            .iter()
+            .filter_map(|path| self.get_by_path(path))
+            .filter(|entry| {
+                entry.kind == EntryKind::Directory || entry.symlink_target_is_dir == Some(true)
+            })
+            .map(|entry| entry.id)
+            .collect();
+        self.mark_directories_children_loaded(&ids)
     }
 
     /// Atomically replace the display order of the current workspace roots.
@@ -206,7 +249,7 @@ impl EntryStore {
         let prev_tree_version = next.tree_version;
         next.tree_version += 1;
         let new_tree_version = next.tree_version;
-        self.inner.store(Arc::new(next));
+        self.publish(next);
         self.record_mutation(prev_tree_version, new_tree_version, |changes| {
             // Root rows themselves are unchanged, but marking their ids gives
             // the coalescer a bounded structural signal. The host separately
@@ -278,7 +321,7 @@ impl EntryStore {
                 continue;
             }
 
-            let id = EntryId::alloc_from(&self.id_counter)?;
+            let id = self.allocate_id(&path, &entry)?;
             entry.id = id;
             entry.parent_id = None;
             ordered_ids.push(id);
@@ -332,7 +375,7 @@ impl EntryStore {
         let prev_tree_version = next.tree_version;
         next.tree_version += 1;
         let new_tree_version = next.tree_version;
-        self.inner.store(Arc::new(next));
+        self.publish(next);
 
         for id in &removed_ids {
             if let Some((_, path)) = self.id_to_path.remove(id) {
@@ -421,7 +464,7 @@ impl EntryStore {
         let prev_tree_version = next.tree_version;
         next.tree_version += 1;
         let new_tree_version = next.tree_version;
-        self.inner.store(Arc::new(next));
+        self.publish(next);
 
         for id in &removed_ids {
             if let Some((_, path)) = self.id_to_path.remove(id) {
@@ -568,7 +611,7 @@ impl EntryStore {
         let prev_tree_version = next.tree_version;
         next.tree_version += 1;
         let new_tree_version = next.tree_version;
-        self.inner.store(Arc::new(next));
+        self.publish(next);
         self.record_mutation(prev_tree_version, new_tree_version, |cs| {
             cs.changed_ids.insert(id);
             cs.subtree_roots_changed
@@ -587,7 +630,7 @@ impl EntryStore {
         if let Some(existing) = self.path_to_id.get(path.as_path()) {
             return Ok(*existing.value());
         }
-        let id = EntryId::alloc_from(&self.id_counter)?;
+        let id = self.allocate_id(&path, &entry)?;
         entry.id = id;
         let parent = entry.parent_id;
         let size = entry.size;
@@ -657,7 +700,7 @@ impl EntryStore {
         let prev_tree_version = next.tree_version;
         next.tree_version += 1;
         let new_tree_version = next.tree_version;
-        self.inner.store(Arc::new(next));
+        self.publish(next);
 
         let indexed_path: Arc<Path> = Arc::from(path.into_boxed_path());
         self.path_to_id.insert(Arc::clone(&indexed_path), id);
@@ -717,7 +760,7 @@ impl EntryStore {
                     )));
                 }
             }
-            let id = EntryId::alloc_from(&self.id_counter)?;
+            let id = self.allocate_id(&path, &entry)?;
             entry.id = id;
             additions.push((path, id, Arc::new(entry)));
         }
@@ -809,7 +852,7 @@ impl EntryStore {
         let prev_tree_version = next.tree_version;
         next.tree_version += 1;
         let new_tree_version = next.tree_version;
-        self.inner.store(Arc::new(next));
+        self.publish(next);
 
         for (path, id, _) in &additions {
             let indexed_path: Arc<Path> = Arc::from(path.clone().into_boxed_path());
@@ -905,7 +948,7 @@ impl EntryStore {
         let prev_tree_version = next.tree_version;
         next.tree_version += 1;
         let new_tree_version = next.tree_version;
-        self.inner.store(Arc::new(next));
+        self.publish(next);
 
         if let Some((_, path)) = self.id_to_path.remove(&id) {
             self.path_to_id.remove(path.as_ref());
@@ -1007,7 +1050,7 @@ impl EntryStore {
         let prev_tree_version = next.tree_version;
         next.tree_version += 1;
         let new_tree_version = next.tree_version;
-        self.inner.store(Arc::new(next));
+        self.publish(next);
 
         let paths_to_remove: Vec<PathBuf> = self
             .path_to_id
@@ -1241,7 +1284,7 @@ impl EntryStore {
         let prev_tree_version = next.tree_version;
         next.tree_version += 1;
         let new_tree_version = next.tree_version;
-        self.inner.store(Arc::new(next));
+        self.publish(next);
 
         // path_to_id update trails snapshot publish, matching insert()'s
         // ordering. Remove the complete old prefix before installing the new
@@ -1430,7 +1473,7 @@ impl EntryStore {
         let changed_roots: Vec<EntryId> = next.roots.iter().copied().collect();
         *self.sibling_order.write() = sibling_order;
         *self.visibility.write() = visibility;
-        self.inner.store(Arc::new(next));
+        self.publish(next);
         self.record_mutation(prev_tree_version, new_tree_version, |changes| {
             changes.projection_changed = true;
             changes.changed_ids.extend(exclusion_changed);
@@ -1459,6 +1502,13 @@ impl EntryStore {
     /// is empty and ready to accumulate again.
     pub fn take_pending_changes(&self) -> ChangeSet {
         let mut cs = self.pending_changes.lock();
+        if self
+            .resident
+            .as_ref()
+            .is_some_and(|view| cs.to_version > view.load().tree_version())
+        {
+            return ChangeSet::default();
+        }
         std::mem::take(&mut *cs)
     }
 

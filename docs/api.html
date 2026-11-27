@@ -232,13 +232,13 @@
 <tbody>
 <tr><td>roots</td><td>readonly (Uri | string)[]</td><td>Required. Absolute paths or Uris.</td></tr>
 <tr><td>respectIgnore?</td><td>boolean</td><td><code>true</code> — parse .gitignore / .ignore / .rgignore</td></tr>
-<tr><td>followSymlinks?</td><td>boolean | 'smart'</td><td>Default <code>'smart'</code>, which today does not walk into symlinked folders (the same as <code>false</code>). <code>true</code> walks them.</td></tr>
+<tr><td>followSymlinks?</td><td>boolean | 'smart'</td><td>Default <code>'smart'</code> walks each canonical directory once per traversal, preferring ordinary paths. <code>false</code> skips linked subtrees. <code>true</code> follows aliases and cuts ancestor cycles.</td></tr>
 <tr><td>walkerConcurrency?</td><td>number</td><td>num_cpus</td></tr>
 <tr><td>watchDebounceMs?</td><td>number</td><td><code>75</code></td></tr>
 <tr><td>compactFolders?</td><td>boolean</td><td><code>true</code></td></tr>
 <tr><td>excludeGlobs?</td><td>string[]</td><td>Extra excludes layered on ignore</td></tr>
-<tr><td>snapshotPath?</td><td>string</td><td>Reserved. Crash-resume is not wired to JavaScript yet.</td></tr>
-<tr><td>maxCachedEntries?</td><td>number</td><td>Accepted, not enforced yet.</td></tr>
+<tr><td>snapshotPath?</td><td>string</td><td>Checkpoint file. Full mode starts with the saved rows, then verifies them against disk and reports offline changes during population. Lazy startup reuses saved identities as rows load.</td></tr>
+<tr><td>maxCachedEntries?</td><td>number</td><td>Maximum live indexed entries, including roots. Defaults to 500,000. Wide directory listings return pages that fit the available slots, with a full filtered total and a hasMore flag.</td></tr>
 <tr><td>readTimeoutMs?</td><td>number</td><td><code>2000</code> — a native read with no progress this long answers <code>ETIMEDOUT</code> for its folder; the kernel call finishes in the background</td></tr>
 <tr><td>maxStuckReads?</td><td>number</td><td><code>16</code> — reads allowed past the deadline; beyond it new reads answer <code>ETIMEDOUT</code> at once</td></tr>
 <tr><td>materializeDataless?</td><td>boolean</td><td><code>false</code> — macOS: list cloud-evicted folders by downloading them; off, they answer <code>EDATALESS</code></td></tr>
@@ -258,6 +258,8 @@
 <dd>The current immutable snapshot. This class returns a new wrapper on every call, so compare <code>treeVersion</code> and <code>decorationVersion</code>, not the object.</dd>
 <dt><code>populateFromRoots(): Promise&lt;number&gt;</code></dt>
 <dd>Parallel walk of configured roots. Returns total entry count. Call once after construction for full load.</dd>
+<dt><code>writeSnapshot(path): Promise&lt;void&gt;</code></dt>
+<dd>Atomically save the current index for a later explorer using <code>snapshotPath</code>.</dd>
 <dt><code>setExpanded(diff: { add?: EntryId[]; remove?: EntryId[] }): void</code></dt>
 <dd>A no-op on this class, kept so both classes have the same shape. On a <code>PortFileExplorer</code> it updates the session’s expansion, and the host may walk newly expanded folders.</dd>
 <dt><code>setViewport(opts: { offset; limit; overscan? }): void</code></dt>
@@ -273,7 +275,7 @@
 <dt><code>search(query, options?): readonly SearchHit[]</code></dt>
 <dd>Fuzzy filename search over the in-memory tree (nucleo). Synchronous on this class; see <a href="#search">search</a>.</dd>
 <dt><code>on(event, listener): Disposable</code></dt>
-<dd>Events: <code>change</code>, <code>change:tree</code>, <code>change:decorations</code>, <code>event</code>, <code>batch</code>, <code>warning</code>, <code>error</code>. (<code>ready</code> is reserved and never fires.)</dd>
+<dd>Events: <code>change</code>, <code>change:tree</code>, <code>change:decorations</code>, <code>event</code>, <code>batch</code>, <code>warning</code>, <code>error</code>. The <code>ready</code> event fires once after the first full population or root seeding. Late listeners receive it asynchronously.</dd>
 <dt><code>registerDecorationProvider(provider): Disposable</code></dt>
 <dd>SCM / lint / problems overlay. Reads via <code>snapshot.getDecorations(id)</code>.</dd>
 <dt><code>dispose(): Promise&lt;void&gt;</code></dt>
@@ -457,7 +459,7 @@ PortFileExplorer  search(query: string, options?: SearchOptions): Promise&lt;Por
 <tr><td>…/icons</td><td>The icon subsystem: <code>FileIcon</code>, <code>createIconResolver</code>, <code>loadIconTheme</code>, plus the default, duotone and minimal themes</td></tr>
 <tr><td>…/icons/default</td><td>Monoline folder + file icons</td></tr>
 <tr><td>…/icons/duotone</td><td>Soft-duotone set. <code>FileTree</code> itself falls back to <code>defaultIconTheme</code>.</td></tr>
-<tr><td>…/icons/minimal, …/icons/vibefield</td><td>Two more icon sets</td></tr>
+<tr><td>…/icons/minimal, …/icons/vibefield</td><td>Two more icon sets. <a href="icons-preview.html">Compare the shipped themes</a>.</td></tr>
 <tr><td>…/theme/minimal.css, …/theme/vibefield.css</td><td>Tree themes, used in place of the default tokens</td></tr>
 <tr><td>…/icons/material</td><td>Material Icon Theme bundle</td></tr>
 <tr><td>…/testing</td><td>createFakeEngine for unit tests</td></tr>

@@ -25,6 +25,8 @@ use crate::error::{ErrorCode, FxError};
 use crate::snapshot::StoreSnapshot;
 use crate::walker::WalkedEntry;
 
+pub(crate) const CHECKPOINT_TEMP_PREFIX: &str = ".mille-checkpoint-";
+
 /// Bump when the on-disk shape changes in a way that makes older readers
 /// unsafe. Callers get `FxError::Unsupported` on mismatch.
 pub const CURRENT_FORMAT_VERSION: u32 = 2;
@@ -120,8 +122,22 @@ fn now_ms() -> i64 {
     }
 }
 
+/// Policies that determine which paths an explorer may publish on warm open.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointPolicy {
+    pub follow_symlinks: crate::SymlinkPolicy,
+    pub respect_ignore: bool,
+    pub exclude_globs: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct CheckpointCoverage {
+    pub complete: Vec<EntryId>,
+    pub policy: Option<CheckpointPolicy>,
+}
+
 /// Serialize a `StoreSnapshot` to disk at `path`. Atomic: writes to
-/// `path.tmp`, fsyncs, renames over `path`. A crash mid-write leaves the
+/// a unique sibling, fsyncs, renames over `path`. A crash mid-write leaves the
 /// previous valid snapshot intact; the tmp file is best-effort cleaned up
 /// on any failure.
 pub fn write_snapshot(
@@ -130,8 +146,30 @@ pub fn write_snapshot(
     root_stats: &[RootStat],
     path: &Path,
 ) -> Result<(), FxError> {
+    write_snapshot_with_policy(snap, next_entry_id, root_stats, path, None)
+}
+
+pub(crate) fn write_snapshot_with_policy(
+    snap: &StoreSnapshot,
+    next_entry_id: u64,
+    root_stats: &[RootStat],
+    path: &Path,
+    policy: Option<&CheckpointPolicy>,
+) -> Result<(), FxError> {
     require_parent(path)?;
-    write_resume(&snapshot_to_resume(snap, next_entry_id, root_stats), path)
+    let resume = snapshot_to_resume(snap, next_entry_id, root_stats);
+    let mut bytes = bincode::serde::encode_to_vec(&resume, bincode_cfg())
+        .map_err(|e| FxError::InternalBug(format!("bincode encode: {e}")))?;
+    // v2 readers consume one bincode value. An optional tagged tail records
+    // which cached child sets were complete without invalidating v2 files.
+    let coverage = CheckpointCoverage {
+        complete: snap.loaded_directories.iter().collect(),
+        policy: policy.cloned(),
+    };
+    bytes.extend_from_slice(COVERAGE_TAG);
+    bincode::serde::encode_into_std_write(&coverage, &mut bytes, bincode_cfg())
+        .map_err(|e| FxError::InternalBug(format!("bincode encode: {e}")))?;
+    write_atomically(path, &bytes, Durability::Synced)
 }
 
 /// Require the parent to exist — creating it would silently mask a
@@ -377,15 +415,10 @@ pub(crate) fn resume_from_walked(
     })
 }
 
-/// Encode `resume` and write it to `path` atomically.
-fn write_resume(resume: &ResumeSnapshot, path: &Path) -> Result<(), FxError> {
-    let bytes = bincode::serde::encode_to_vec(resume, bincode_cfg())
-        .map_err(|e| FxError::InternalBug(format!("bincode encode: {e}")))?;
-    write_atomically(path, &bytes, Durability::Synced)
-}
+const COVERAGE_TAG: &[u8] = b"mille-listed-v1\0";
 
 /// Write `bytes` to `path` so a crash leaves either the old file or the new
-/// one: `path.tmp`, fsync, rename over `path`, fsync of the parent (the
+/// one: create a unique sibling, fsync, rename over `path`, fsync of the parent (the
 /// fsyncs only when `Synced`).
 pub(crate) fn write_atomically(
     path: &Path,
@@ -393,35 +426,25 @@ pub(crate) fn write_atomically(
     durability: Durability,
 ) -> Result<(), FxError> {
     let synced = durability == Durability::Synced;
-    let tmp_path = path.with_extension("tmp");
-
-    // Cleanup-on-failure closure: best-effort unlink of the tmp file.
-    let cleanup = || {
-        let _ = std::fs::remove_file(&tmp_path);
-    };
-
-    let write_result = (|| -> Result<(), FxError> {
-        let mut f =
-            File::create(&tmp_path).map_err(|e| ErrorCode::from_io_error(&e, tmp_path.clone()))?;
-        f.write_all(bytes)
-            .map_err(|e| ErrorCode::from_io_error(&e, tmp_path.clone()))?;
-        if synced {
-            f.sync_all()
-                .map_err(|e| ErrorCode::from_io_error(&e, tmp_path.clone()))?;
-        }
-        Ok(())
-    })();
-
-    if let Err(e) = write_result {
-        cleanup();
-        return Err(e);
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    // Separate writers, including separate explorer processes, must never
+    // share staging bytes. Persist replaces the destination atomically.
+    let mut temp = tempfile::Builder::new()
+        .prefix(CHECKPOINT_TEMP_PREFIX)
+        .tempfile_in(parent)
+        .map_err(|e| ErrorCode::from_io_error(&e, parent.to_owned()))?;
+    temp.write_all(bytes)
+        .map_err(|e| ErrorCode::from_io_error(&e, path.to_owned()))?;
+    if synced {
+        temp.as_file()
+            .sync_all()
+            .map_err(|e| ErrorCode::from_io_error(&e, path.to_owned()))?;
     }
-
-    if let Err(e) = std::fs::rename(&tmp_path, path) {
-        let err = ErrorCode::from_io_error(&e, path.to_path_buf());
-        cleanup();
-        return Err(err);
-    }
+    temp.persist(path)
+        .map_err(|e| ErrorCode::from_io_error(&e.error, path.to_owned()))?;
 
     // Durability: POSIX requires fsync on the parent directory to make the
     // rename itself durable against power loss. Without this, a crash
@@ -451,6 +474,19 @@ pub(crate) fn write_atomically(
 /// Load a `ResumeSnapshot` from disk. Returns `FxError::Unsupported` if the
 /// on-disk format_version doesn't match `CURRENT_FORMAT_VERSION`.
 pub fn read_snapshot(path: &Path) -> Result<ResumeSnapshot, FxError> {
+    read_checkpoint(path).map(|(saved, _)| saved)
+}
+
+pub(crate) fn read_checkpoint(
+    path: &Path,
+) -> Result<(ResumeSnapshot, Option<CheckpointCoverage>), FxError> {
+    let metadata =
+        std::fs::metadata(path).map_err(|e| ErrorCode::from_io_error(&e, path.to_owned()))?;
+    if !metadata.is_file() {
+        return Err(FxError::InvalidInput(format!(
+            "checkpoint is not a regular file: {path:?}"
+        )));
+    }
     let mut f = File::open(path).map_err(|e| ErrorCode::from_io_error(&e, path.to_path_buf()))?;
     let mut bytes = Vec::new();
     f.read_to_end(&mut bytes)
@@ -470,11 +506,25 @@ pub fn read_snapshot(path: &Path) -> Result<ResumeSnapshot, FxError> {
         )));
     }
 
-    let (resume, _used): (ResumeSnapshot, usize) =
+    let (resume, used): (ResumeSnapshot, usize) =
         bincode::serde::decode_from_slice(&bytes, bincode_cfg())
             .map_err(|e| FxError::InternalBug(format!("bincode decode: {e}")))?;
 
-    Ok(resume)
+    let coverage = if let Some(tail) = bytes[used..].strip_prefix(COVERAGE_TAG) {
+        let (ids, consumed) =
+            bincode::serde::decode_from_slice(tail, bincode_cfg()).map_err(|e| {
+                FxError::InvalidInput(format!("invalid checkpoint listing coverage: {e}"))
+            })?;
+        if consumed != tail.len() {
+            return Err(FxError::InvalidInput("invalid checkpoint tail".into()));
+        }
+        Some(ids)
+    } else if used == bytes.len() {
+        None
+    } else {
+        return Err(FxError::InvalidInput("invalid checkpoint tail".into()));
+    };
+    Ok((resume, coverage))
 }
 
 // ============================================================================

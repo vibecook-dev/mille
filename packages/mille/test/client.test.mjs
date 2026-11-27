@@ -121,31 +121,34 @@ test('visibleRowsBulk decodes the bincode payload (empty case)', () => {
   }
 });
 
-test('on("ready") fires via emitReadyForTests and disposes cleanly', async () => {
-  const dir = tempRoot();
-  try {
+test(
+  'ready fires after population, including for late listeners, once per subscription',
+  { timeout: 5000 },
+  async () => {
+    const dir = tempRoot();
     const fx = new FileExplorer({ roots: [dir] });
-    let fired = 0;
-    const sub = fx.on('ready', () => {
-      fired += 1;
-    });
-    // Reach through the private handle — `emitReadyForTests` is a
-    // cfg(test-hooks)-like escape hatch on the native, not public TS.
-    fx['nativeFx'].emitReadyForTests();
-    // TSFN dispatch is async — give libuv a couple of ticks.
-    await new Promise((r) => setTimeout(r, 50));
-    assert.equal(fired, 1);
-    sub.dispose();
-    // Double-dispose is idempotent on our wrapper.
-    sub.dispose();
-    // After dispose, another emit should not fire.
-    fx['nativeFx'].emitReadyForTests();
-    await new Promise((r) => setTimeout(r, 50));
-    assert.equal(fired, 1);
-  } finally {
-    removeTempDir(dir);
-  }
-});
+    try {
+      let calls = 0;
+      const observed = new Promise((resolve) =>
+        fx.on('ready', () => {
+          calls++;
+          resolve(fx.getSnapshot().roots().length);
+        }),
+      );
+      await Promise.all([fx.populateFromRoots(), fx.populateFromRoots()]);
+      assert.equal(await observed, 1);
+      let cancelledCalls = 0;
+      const cancelled = fx.on('ready', () => cancelledCalls++);
+      cancelled.dispose();
+      await new Promise((resolve) => fx.on('ready', resolve));
+      assert.equal(calls, 1);
+      assert.equal(cancelledCalls, 0);
+    } finally {
+      await fx.dispose();
+      removeTempDir(dir);
+    }
+  },
+);
 
 test('on() rejects unknown event names', () => {
   const dir = tempRoot();

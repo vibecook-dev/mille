@@ -5,15 +5,16 @@
 //! That makes duplicate echoes, atomic-save event shapes, and dropped
 //! intermediate notifications idempotent.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mille_core::{
-    coalesce_events, walk_bounded, walk_bounded_batched, Entry, EntryId, EntryKind, EntryStore,
-    FsChangeEvent, FxError, IgnoreMatcher, IntentCache, IntentKind, ReadBoundary, RenamePairer,
-    SymlinkPolicy, UnreadDirectory, WalkOptions, WalkedEntry, Watcher, WatcherOptions,
+    coalesce_events, walk_bounded_batched, walk_bounded_limited, Entry, EntryId, EntryKind,
+    EntryStore, FsChangeEvent, FxError, IgnoreMatcher, IntentCache, IntentKind, ReadBoundary,
+    RenamePairer, SymlinkPolicy, UnreadDirectory, WalkOptions, WalkedEntry, Watcher,
+    WatcherOptions,
 };
 
 use crate::bounded::{probe_exists, probe_is_dir, seed_ignore_files};
@@ -31,10 +32,116 @@ pub(crate) struct WatchConfig {
     pub policy_gate: Arc<Mutex<()>>,
     pub follow_symlinks: SymlinkPolicy,
     pub walker_concurrency: usize,
+    pub cache_limit: usize,
+    pub smart_links: Arc<Mutex<SmartLinks>>,
     pub debounce_ms: u64,
     /// The explorer's bounded read pool (M10). Reconciliation runs under
     /// `policy_gate`, so every probe and walk here goes through it.
     pub reads: ReadBoundary,
+}
+
+/// Retain the canonical targets represented by directory links across lazy
+/// expansions. An eviction, retarget or rename releases the old owner.
+#[derive(Default)]
+pub(crate) struct SmartLinks(HashMap<PathBuf, (PathBuf, EntryId)>);
+
+impl WatchConfig {
+    pub(crate) fn remember_links(&self, store: &EntryStore, links: &[(PathBuf, PathBuf)]) {
+        if links.is_empty() {
+            return;
+        }
+        let mut owners = self.smart_links.lock();
+        for (path, target) in links {
+            if let Some(entry) = store.get_by_path(path) {
+                owners.0.insert(target.clone(), (path.clone(), entry.id));
+            }
+        }
+        if owners.0.len() > self.cache_limit {
+            owners
+                .0
+                .retain(|_, (path, id)| store.get_by_path(path).is_some_and(|e| e.id == *id));
+        }
+    }
+
+    /// An explicit expansion starts a fresh walker. Seed its decision from
+    /// the containing workspace and the links already expanded in this store.
+    pub(crate) fn deduplicate_link(
+        &self,
+        store: &EntryStore,
+        path: &Path,
+    ) -> Result<Option<ReconcileOutcome>, FxError> {
+        if self.follow_symlinks != SymlinkPolicy::Smart {
+            return Ok(None);
+        }
+        let Some(entry) = store
+            .get_by_path(path)
+            .filter(|e| e.kind == EntryKind::Symlink && e.parent_id.is_some())
+        else {
+            return Ok(None);
+        };
+        let roots = self.roots.read().clone();
+        let canonical_dir = |p: &Path| -> Result<Option<PathBuf>, FxError> {
+            match self.reads.stat(p, true) {
+                Ok(out) => Ok(out
+                    .as_stat()
+                    .filter(|s| s.is_dir_like())
+                    .and_then(|s| s.canonical.clone())),
+                Err(mille_core::ReadFailure::Io(_)) => Ok(None),
+                Err(failure) => Err(failure.into_fx(p)),
+            }
+        };
+        let Some(target) = canonical_dir(path)? else {
+            return Ok(None);
+        };
+        let mut duplicate = false;
+        for root in &roots {
+            if let Some(canonical_root) = canonical_dir(root)? {
+                if let Ok(relative) = target.strip_prefix(canonical_root) {
+                    let physical = root.join(relative);
+                    if physical != path
+                        && store.get_by_path(&physical).is_some_and(|e| {
+                            e.kind == EntryKind::Directory || e.parent_id.is_none()
+                        })
+                    {
+                        duplicate = true;
+                        break;
+                    }
+                }
+            }
+        }
+        for ancestor in path
+            .ancestors()
+            .skip(1)
+            .take_while(|p| roots.iter().any(|r| p.starts_with(r)))
+        {
+            if !duplicate && canonical_dir(ancestor)?.as_ref() == Some(&target) {
+                duplicate = true;
+                break;
+            }
+        }
+        if !duplicate {
+            let owner = self.smart_links.lock().0.get(&target).cloned();
+            if let Some((other, id)) = owner {
+                duplicate = other != path
+                    && store.get_by_path(&other).is_some_and(|e| e.id == id)
+                    && canonical_dir(&other)?.as_ref() == Some(&target);
+            }
+        }
+        if !duplicate {
+            self.remember_links(store, &[(path.to_owned(), target)]);
+            return Ok(None);
+        }
+        let mut changes = ReconcileOutcome::default();
+        for child in store.snapshot().children_of(entry.id) {
+            changes
+                .changed_ids
+                .extend(store.remove_subtree(*child).iter().map(|e| e.id));
+        }
+        if store.mark_directory_children_loaded(entry.id)? || !changes.changed_ids.is_empty() {
+            changes.child_set_changed.insert(entry.id);
+        }
+        Ok(Some(changes))
+    }
 }
 
 #[derive(Default)]
@@ -125,6 +232,11 @@ fn process_batch(
     };
     let filtered: Vec<_> = high_level
         .into_iter()
+        .filter(|event| {
+            !event_paths(event)
+                .iter()
+                .any(|path| config.reads.is_checkpoint_file(path))
+        })
         .filter(|event| !consume_intent(event, intents, now))
         .collect();
     if filtered.is_empty() {
@@ -172,6 +284,7 @@ fn process_batch(
     }
     events.emit_batch(public_events);
 
+    store.trim_cache(None, &[]);
     let after_version = store.tree_version();
     if after_version != before_version || !outcome.coarse_ids.is_empty() {
         let notice = || ChangeNoticeJs {
@@ -433,7 +546,7 @@ fn read_rename_destination(
     };
     let scope = match scope {
         Some(scope) => {
-            let listing = read_directory(config, &scope, Some(1))?;
+            let listing = read_directory(config, &scope, Some(1), config.cache_limit)?;
             Some((scope, listing))
         }
         None => None,
@@ -471,13 +584,19 @@ pub(crate) fn reconcile_directory(
     directory: &Path,
     depth: Option<usize>,
 ) -> Result<ReconcileOutcome, FxError> {
-    let listing = read_directory(config, directory, depth)?;
+    if let Some(changes) = config.deduplicate_link(store, directory)? {
+        return Ok(changes);
+    }
+    let listing = read_directory(config, directory, depth, config.cache_limit)?;
     apply_directory(store, config, directory, depth, listing)
 }
 
 /// `directory` as [`reconcile_directory`] read it from disk.
 struct DiskListing {
     walked: Vec<WalkedEntry>,
+    completed: Vec<PathBuf>,
+    truncated: bool,
+    followed_links: Vec<(PathBuf, PathBuf)>,
     unread: Vec<UnreadDirectory>,
     repository_ignore: Option<IgnoreMatcher>,
     excludes: Option<IgnoreMatcher>,
@@ -490,6 +609,7 @@ fn read_directory(
     config: &WatchConfig,
     directory: &Path,
     depth: Option<usize>,
+    limit: usize,
 ) -> Result<Option<DiskListing>, FxError> {
     if !probe_exists(&config.reads, directory)? {
         return Ok(None);
@@ -501,14 +621,33 @@ fn read_directory(
         include_root: true,
         parallelism: config.walker_concurrency,
     };
-    let (walked, unread, repository_ignore, excludes) =
-        walk_for_reconcile(directory, walk_options, config)?;
-    Ok(Some(DiskListing {
-        walked,
-        unread,
-        repository_ignore,
-        excludes,
-    }))
+    walk_for_reconcile(directory, walk_options, config, limit).map(Some)
+}
+
+/// Physical children for an individually paged directory. Sorting, visibility,
+/// and pagination must see the whole directory even when only a page can fit.
+pub(crate) fn directory_rows(
+    config: &WatchConfig,
+    directory: &Path,
+    parent: EntryId,
+) -> Result<Vec<(PathBuf, Entry)>, FxError> {
+    let Some(listing) = read_directory(config, directory, Some(1), usize::MAX)? else {
+        return Ok(Vec::new());
+    };
+    Ok(listing
+        .walked
+        .into_iter()
+        .filter(|w| w.depth == 1)
+        .map(|w| {
+            let entry = entry_from_walked(
+                &w,
+                Some(parent),
+                listing.repository_ignore.as_ref(),
+                listing.excludes.as_ref(),
+            );
+            (w.path, entry)
+        })
+        .collect())
 }
 
 /// The store half of [`reconcile_directory`]: make the store say what
@@ -523,6 +662,9 @@ fn apply_directory(
     let mut out = ReconcileOutcome::default();
     let Some(DiskListing {
         mut walked,
+        completed,
+        truncated,
+        followed_links,
         unread,
         repository_ignore,
         excludes,
@@ -550,12 +692,14 @@ fn apply_directory(
     walked.sort_by(|a, b| a.depth.cmp(&b.depth).then_with(|| a.path.cmp(&b.path)));
     let disk_paths: HashSet<PathBuf> = walked.iter().map(|entry| entry.path.clone()).collect();
 
+    let complete: HashSet<_> = completed.iter().map(PathBuf::as_path).collect();
     // A subdirectory whose read did not answer (M10) has unknown children,
     // not none: keep everything the store knows below it.
     let known = store.paths_under(directory);
     let mut missing: Vec<_> = known
         .into_iter()
         .filter(|(path, _)| in_depth(directory, path, depth) && !disk_paths.contains(path))
+        .filter(|(path, _)| !truncated || path.parent().is_some_and(|p| complete.contains(p)))
         .filter(|(path, _)| !unread.iter().any(|dir| path.starts_with(&dir.path)))
         .collect();
     missing.sort_by_key(|(path, _)| path.components().count());
@@ -626,27 +770,12 @@ fn apply_directory(
     // directory produces no child records, and a previously URI-hydrated
     // directory may already contain only a partial chain. Without an explicit
     // completion marker both cases remain indistinguishable from "loading".
-    let completed_ids: Vec<EntryId> = walked
-        .iter()
-        .filter(|entry| !unread.iter().any(|dir| dir.path == entry.path))
-        .filter(|entry| {
-            let directory_like =
-                entry.kind == EntryKind::Directory || entry.symlink_target_is_dir == Some(true);
-            let listing_covered = entry.kind == EntryKind::Directory
-                || (entry.path == directory && entry.symlink_target_is_dir == Some(true));
-            let below_frontier = depth.is_none_or(|limit| (entry.depth as usize) < limit);
-            let traversal_complete = entry.path == directory
-                || (!repository_ignore
-                    .as_ref()
-                    .is_some_and(|matcher| matcher.is_ignored(&entry.path, directory_like))
-                    && !excludes
-                        .as_ref()
-                        .is_some_and(|matcher| matcher.is_ignored(&entry.path, directory_like)));
-            listing_covered && below_frontier && traversal_complete
-        })
-        .filter_map(|entry| store.get_by_path(&entry.path).map(|stored| stored.id))
-        .collect();
-    let newly_loaded = store.mark_directories_children_loaded(&completed_ids)?;
+    if truncated {
+        out.child_set_changed
+            .extend(store.invalidate_truncated_walk(directory, &completed));
+    }
+    config.remember_links(store, &followed_links);
+    let newly_loaded = store.mark_listed_paths(&completed)?;
     out.child_set_changed.extend(newly_loaded);
 
     Ok(out)
@@ -668,6 +797,10 @@ pub(crate) fn reconcile_directory_progressive<F>(
 where
     F: FnMut(&ReconcileOutcome),
 {
+    if let Some(changes) = config.deduplicate_link(store, directory)? {
+        publish(&changes);
+        return Ok(changes);
+    }
     if !probe_exists(&config.reads, directory)? {
         let outcome = reconcile_directory(store, config, directory, Some(1))?;
         publish(&outcome);
@@ -687,6 +820,11 @@ where
     let mut disk_paths = HashSet::new();
     let mut total = ReconcileOutcome::default();
     let mut pending_walked = Vec::with_capacity(batch_size);
+    let mut remaining = store
+        .get_by_path(directory)
+        .map_or(config.cache_limit, |e| {
+            store.child_capacity(e.id).saturating_add(1)
+        });
     let mut publication_target = batch_size;
     // Keep the first paint small, then amortize immutable-snapshot cloning as
     // a pathological directory grows. The ceiling preserves cancellation and
@@ -707,6 +845,7 @@ where
                     repository_ignore.as_ref(),
                     excludes.as_ref(),
                 )?;
+                store.trim_cache(store.get_by_path(directory).map(|e| e.id), &[]);
                 publish(&batch);
                 total.merge(batch);
                 *target = target.saturating_mul(2).min(publication_ceiling);
@@ -715,11 +854,13 @@ where
             };
 
         {
-            let mut consume = |walked: Vec<WalkedEntry>| -> Result<(), FxError> {
+            let mut consume = |mut walked: Vec<WalkedEntry>| -> Result<(), FxError> {
                 if token.is_cancelled() {
                     return Err(FxError::Cancelled);
                 }
                 disk_paths.extend(walked.iter().map(|entry| entry.path.clone()));
+                walked.truncate(remaining);
+                remaining -= walked.len();
                 pending_walked.extend(walked);
                 if pending_walked.len() >= publication_target {
                     flush_pending(&mut pending_walked, &mut publication_target)?;
@@ -778,8 +919,15 @@ where
     }
 
     if let Some(root) = store.get_by_path(directory) {
-        if store.mark_directory_children_loaded(root.id)? {
-            final_outcome.child_set_changed.insert(root.id);
+        let retained = store.snapshot().children_of(root.id).len();
+        if retained == disk_paths.len().saturating_sub(1) {
+            if store.mark_directory_children_loaded(root.id)? {
+                final_outcome.child_set_changed.insert(root.id);
+            }
+        } else {
+            final_outcome
+                .child_set_changed
+                .extend(store.invalidate_listings([root.id]));
         }
     }
     publish(&final_outcome);
@@ -851,27 +999,24 @@ fn in_depth(root: &Path, path: &Path, depth: Option<usize>) -> bool {
     }
 }
 
-// The walk hands back its entries, the directories it could not read, and
-// the two matchers it resolved; naming the tuple would not make the signature
-// easier to read at the call site.
-#[allow(clippy::type_complexity)]
 fn walk_for_reconcile(
     directory: &Path,
     options: WalkOptions,
     config: &WatchConfig,
-) -> Result<
-    (
-        Vec<WalkedEntry>,
-        Vec<UnreadDirectory>,
-        Option<IgnoreMatcher>,
-        Option<IgnoreMatcher>,
-    ),
-    FxError,
-> {
+    limit: usize,
+) -> Result<DiskListing, FxError> {
     let exclude_globs = config.exclude_globs.read().clone();
     if !config.respect_ignore && exclude_globs.is_empty() {
-        let report = walk_bounded(directory, options, None, &config.reads)?;
-        return Ok((report.entries, report.unread, None, None));
+        let report = walk_bounded_limited(directory, options, None, &config.reads, limit)?;
+        return Ok(DiskListing {
+            walked: report.entries,
+            completed: report.completed_directories,
+            truncated: report.truncated,
+            followed_links: report.followed_links,
+            unread: report.unread,
+            repository_ignore: None,
+            excludes: None,
+        });
     }
 
     let root =
@@ -906,7 +1051,7 @@ fn walk_for_reconcile(
             &mut [&mut traversal, &mut repository_ignore],
         )?;
     }
-    let report = walk_bounded(directory, options, Some(&traversal), &config.reads)?;
+    let report = walk_bounded_limited(directory, options, Some(&traversal), &config.reads, limit)?;
     // Keep ancestor rules that were seeded above the bounded walk, while
     // adding nested ignore files discovered during this reconciliation. The
     // walk already read them, so nothing is opened twice.
@@ -915,12 +1060,15 @@ fn walk_for_reconcile(
             let _ = repository_ignore.add_from_contents(path, contents);
         }
     }
-    Ok((
-        report.entries,
-        report.unread,
-        config.respect_ignore.then_some(repository_ignore),
-        (!exclude_globs.is_empty()).then_some(excludes),
-    ))
+    Ok(DiskListing {
+        walked: report.entries,
+        completed: report.completed_directories,
+        truncated: report.truncated,
+        followed_links: report.followed_links,
+        unread: report.unread,
+        repository_ignore: config.respect_ignore.then_some(repository_ignore),
+        excludes: (!exclude_globs.is_empty()).then_some(excludes),
+    })
 }
 
 type ReconcileMatchers = (
@@ -977,7 +1125,7 @@ fn build_reconcile_matchers(
     ))
 }
 
-fn entry_from_walked(
+pub(crate) fn entry_from_walked(
     walked: &WalkedEntry,
     parent_id: Option<EntryId>,
     repository_ignore: Option<&IgnoreMatcher>,
@@ -1021,7 +1169,7 @@ fn event_paths(event: &FsChangeEvent) -> Vec<&Path> {
     }
 }
 
-fn to_public_event(
+pub(crate) fn to_public_event(
     store: &EntryStore,
     event: &FsChangeEvent,
     before: Option<&Entry>,
